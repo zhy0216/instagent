@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "bundled",
+  "version": "0.1.0",
+  "description": "Instagent bundled plugin: built-in provider definitions (placeholders until TODO(10) generates the full set)",
+  "license": "Apache-2.0",
+  "extensions": {
+    "dev.instagent": { "minKernel": "0.1" }
+  }
+}

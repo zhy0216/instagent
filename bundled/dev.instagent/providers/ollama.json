@@ -1,0 +1,11 @@
+{
+  "name": "ollama",
+  "engine": "openai",
+  "display_name": "Ollama",
+  "base_url": "http://localhost:11434/v1",
+  "headers": {},
+  "timeout_seconds": 600,
+  "models": [
+    { "name": "llama3.1", "context_limit": 131072, "max_tokens": 8192 }
+  ]
+}

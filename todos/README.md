@@ -68,7 +68,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 5. [done/04-plugin-manifest.md](done/04-plugin-manifest.md) — ✅ 完成。依赖：00
 6. [done/05-plugin-discovery.md](done/05-plugin-discovery.md) — ✅ 完成。依赖：00、04、01
 7. [done/06-plugin-mcp-config.md](done/06-plugin-mcp-config.md) — ✅ 完成。依赖：00、04
-8. [07-plugin-install-bundled.md](07-plugin-install-bundled.md) — 依赖：00、04、05
+8. [done/07-plugin-install-bundled.md](done/07-plugin-install-bundled.md) — ✅ 完成。依赖：00、04、05
 9. [done/08-provider-core-http.md](done/08-provider-core-http.md) — ✅ 完成。依赖：00
 10. [done/09-provider-openai.md](done/09-provider-openai.md) — ✅ 完成。依赖：00、08
 11. [10-provider-registry.md](10-provider-registry.md) — 依赖：00、08、09、07

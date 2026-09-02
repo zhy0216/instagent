@@ -1,0 +1,12 @@
+{
+  "name": "openai",
+  "engine": "openai",
+  "display_name": "OpenAI",
+  "api_key_env": "OPENAI_API_KEY",
+  "base_url": "https://api.openai.com/v1",
+  "headers": {},
+  "timeout_seconds": 600,
+  "models": [
+    { "name": "gpt-5", "context_limit": 400000, "max_tokens": 32000 }
+  ]
+}
