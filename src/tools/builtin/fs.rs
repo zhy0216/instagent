@@ -5,6 +5,8 @@
 //! `get_line_context` / `find_similar_context` / `build_file_preview`
 //! 与 `resolve_path` 精简搬运（本文件标注处注明）。
 
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -13,6 +15,9 @@ use crate::tools::ToolOutput;
 
 /// read 默认最多 2000 行。
 pub const READ_DEFAULT_LIMIT: u32 = 2000;
+
+/// read 拒绝超过此字节数的文件。
+pub const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
 
 /// 无匹配时给的文件预览行数（goose edit.rs:8）。
 const NO_MATCH_PREVIEW_LINES: usize = 20;
@@ -27,6 +32,9 @@ pub fn resolve_path(path: &Path, working_dir: &Path) -> PathBuf {
 }
 
 /// 带行号输出（read 标 read_only = true）。
+///
+/// 流式按行读取：只把窗口行留在内存，窗口之后的行仅计数，
+/// 保证 "(N more lines)" 与旧行为一致而不整读文件。
 pub async fn read_file(
     path: &Path,
     line: Option<u32>,
@@ -34,40 +42,104 @@ pub async fn read_file(
     ctx: &ToolCtx,
 ) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);
-    let content = match std::fs::read_to_string(&full) {
-        Ok(content) => content,
-        Err(e) => return ToolOutput::err(format!("Failed to read {}: {e}", full.display())),
-    };
+    let fail =
+        |e: std::io::Error| ToolOutput::err(format!("Failed to read {}: {e}", full.display()));
 
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return ToolOutput::ok(format!("{}: (file is empty)", full.display()));
+    if line == Some(0) {
+        return ToolOutput::err(
+            "`line` is 1-based, got line=0; use line=1 for the first line".to_string(),
+        );
+    }
+    if limit == Some(0) {
+        return ToolOutput::err(
+            "`limit` must be positive, got limit=0; omit it for the default window".to_string(),
+        );
     }
 
-    let start = line.map(|l| (l as usize).saturating_sub(1)).unwrap_or(0);
-    if start >= lines.len() {
+    let meta = match std::fs::metadata(&full) {
+        Ok(meta) => meta,
+        Err(e) => return fail(e),
+    };
+    if meta.len() > MAX_READ_BYTES {
         return ToolOutput::err(format!(
-            "Line {} is past end of file ({} lines total)",
-            start + 1,
-            lines.len()
+            "Failed to read {}: file too large ({} bytes, limit {} bytes); use shell tools (head/grep) to inspect it",
+            full.display(),
+            meta.len(),
+            MAX_READ_BYTES
         ));
     }
-    let count = limit.unwrap_or(READ_DEFAULT_LIMIT) as usize;
-    let end = (start + count).min(lines.len());
+    let file = match std::fs::File::open(&full) {
+        Ok(file) => file,
+        Err(e) => return fail(e),
+    };
 
+    let start = line.unwrap_or(1) as usize - 1;
+    let count = limit.unwrap_or(READ_DEFAULT_LIMIT) as usize;
     let mut text = String::new();
-    for (i, file_line) in lines[start..end].iter().enumerate() {
-        text.push_str(&format!("{:>4}: {}\n", start + i + 1, file_line));
+    let mut total = 0usize;
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        total = i + 1;
+        let file_line = match line {
+            Ok(line) => line,
+            Err(e) => return fail(e),
+        };
+        if i >= start && i - start < count {
+            text.push_str(&format!("{:>4}: {}\n", i + 1, file_line));
+        }
     }
-    if end < lines.len() {
-        text.push_str(&format!("... ({} more lines)\n", lines.len() - end));
+
+    if total == 0 {
+        return ToolOutput::ok(format!("{}: (file is empty)", full.display()));
+    }
+    if start >= total {
+        return ToolOutput::err(format!(
+            "Line {} is past end of file ({total} lines total)",
+            start + 1
+        ));
+    }
+    if total > start + count {
+        text.push_str(&format!("... ({} more lines)\n", total - start - count));
     }
     ToolOutput::ok(text)
 }
 
-/// 建父目录，覆盖写。
+/// 写路径符号链接防护：目标是符号链接时拒绝（不跟随、不写穿）。
+fn reject_symlink(full: &Path) -> Option<ToolOutput> {
+    match std::fs::symlink_metadata(full) {
+        Ok(meta) if meta.file_type().is_symlink() => Some(ToolOutput::err(format!(
+            "Refusing to write through symlink: {} (write the link target directly instead)",
+            full.display()
+        ))),
+        _ => None,
+    }
+}
+
+/// 同目录临时文件 + rename 原子替换，失败路径清理临时文件。
+/// 跨设备 rename 会失败，所以临时文件不放系统临时目录。
+fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
+    let Some(name) = full.file_name() else {
+        return std::fs::write(full, content);
+    };
+    let tmp = full.with_file_name(format!(
+        "{}.{}.tmp",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    match std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, full)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 建父目录，原子覆盖写。
 pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);
+    if let Some(out) = reject_symlink(&full) {
+        return out;
+    }
     if let Some(parent) = full.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return ToolOutput::err(format!(
@@ -76,7 +148,7 @@ pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput
             ));
         }
     }
-    match std::fs::write(&full, content) {
+    match atomic_write(&full, content) {
         Ok(()) => ToolOutput::ok(format!(
             "Wrote {} bytes to {}",
             content.len(),
@@ -87,16 +159,19 @@ pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput
 }
 
 /// `before` 必须唯一精确匹配，否则报错并给出匹配次数和相近上下文；
-/// `after` 为空即删除。
+/// `after` 为空即删除。写回走原子替换。
 pub async fn edit_file(path: &Path, before: &str, after: &str, ctx: &ToolCtx) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);
+    if let Some(out) = reject_symlink(&full) {
+        return out;
+    }
     let content = match std::fs::read_to_string(&full) {
         Ok(content) => content,
         Err(e) => return ToolOutput::err(format!("Failed to read {}: {e}", full.display())),
     };
 
     match string_replace(&content, before, after) {
-        Ok(new_content) => match std::fs::write(&full, &new_content) {
+        Ok(new_content) => match atomic_write(&full, &new_content) {
             Ok(()) => {
                 let old_lines = content.lines().count();
                 let new_lines = new_content.lines().count();
@@ -350,6 +425,111 @@ mod tests {
 
         let out = edit_file(&file, "", "x", &ctx(dir.path())).await;
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn write_atomic_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = write_file(Path::new("a.txt"), "content", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["a.txt".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_and_edit_fail_on_readonly_dir_without_touching_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("ro");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("a.txt");
+        std::fs::write(&file, "orig\n").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let out = write_file(&file, "new", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        let out = edit_file(&file, "orig", "new", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "orig\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&sub)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(leftovers.len(), 1);
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_and_edit_reject_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "secret\n").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let out = write_file(&link, "owned", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("symlink"), "{}", out.text);
+        let out = edit_file(&link, "secret", "owned", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("symlink"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "secret\n");
+    }
+
+    #[tokio::test]
+    async fn write_creates_new_file_through_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = write_file(Path::new("brand/new.txt"), "x", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("huge.bin");
+        let f = std::fs::File::create(&file).unwrap();
+        // 稀疏文件：metadata 报告超大长度，读取前就被字节上限拦截。
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+
+        let out = read_file(&file, None, None, &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("too large"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_streams_window_of_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("many.txt");
+        let content: String = (1..=50_000).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(&file, content).unwrap();
+
+        let out = read_file(&file, Some(2), Some(3), &ctx(dir.path())).await;
+        assert!(!out.is_error);
+        assert_eq!(
+            out.text,
+            "   2: line2\n   3: line3\n   4: line4\n... (49996 more lines)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_rejects_zero_line_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+
+        let out = read_file(&file, Some(0), None, &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("1-based"), "{}", out.text);
+
+        let out = read_file(&file, None, Some(0), &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("positive"), "{}", out.text);
     }
 
     #[test]

@@ -251,6 +251,13 @@ fn save_full_output(output: &str, label: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{label}-{}", uuid::Uuid::new_v4()));
     std::fs::write(&path, output)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 全量输出可能含敏感信息：目录 0700、文件 0600，同机其他用户不可读。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(path)
 }
 
@@ -366,6 +373,21 @@ mod tests {
             "pwd should report session cwd: {}",
             out.text
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_output_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = save_full_output("secret output", "perm-test").unwrap();
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(dir_mode & 0o777, 0o700, "dir perms: {dir_mode:#o}");
+        assert_eq!(file_mode & 0o777, 0o600, "file perms: {file_mode:#o}");
     }
 
     #[cfg(unix)]

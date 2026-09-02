@@ -7,8 +7,15 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::Component;
 use std::path::Path;
+
+/// 单文件行数统计的读取上限，超限显示占位 `[?]`。
+const MAX_COUNTED_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 超限哨兵：文件行数未知时用它，目录汇总 saturating 累加后整目录也降级 `[?]`。
+const OVER_CAP: usize = usize::MAX;
 
 use ignore::WalkBuilder;
 
@@ -74,9 +81,13 @@ impl DirectoryNode {
             .dirs
             .values_mut()
             .map(DirectoryNode::compute_total_lines)
-            .sum();
-        let file_lines: usize = self.files.values().copied().sum();
-        self.total_lines = dir_lines + file_lines;
+            .fold(0usize, usize::saturating_add);
+        let file_lines: usize = self
+            .files
+            .values()
+            .copied()
+            .fold(0usize, usize::saturating_add);
+        self.total_lines = dir_lines.saturating_add(file_lines);
         self.total_lines
     }
 
@@ -151,15 +162,46 @@ fn relative_components(path: &Path) -> Option<Vec<String>> {
     }
 }
 
+/// 按字节块流式统计 `\n`，不整读文件；超过 `MAX_COUNTED_BYTES` 直接返回占位哨兵。
+/// 行数语义与 `str::lines().count()` 一致（非空且末尾无换行符补 1）。
 fn count_file_lines(path: &Path) -> usize {
-    match fs::read_to_string(path) {
-        Ok(content) => content.lines().count(),
-        Err(_) => 0,
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if meta.len() > MAX_COUNTED_BYTES {
+        return OVER_CAP;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = [0u8; 16 * 1024];
+    let mut newlines = 0usize;
+    let mut bytes = 0u64;
+    let mut last = b'\n';
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes += n as u64;
+                let chunk = &buf[..n];
+                newlines += chunk.iter().filter(|&&b| b == b'\n').count();
+                last = chunk[n - 1];
+            }
+            Err(_) => return 0,
+        }
+    }
+    if bytes == 0 {
+        0
+    } else {
+        newlines + usize::from(last != b'\n')
     }
 }
 
 fn format_lines(lines: usize) -> String {
-    if lines >= 1000 {
+    if lines == OVER_CAP {
+        "[?]".to_string()
+    } else if lines >= 1000 {
         format!("[{}K]", lines / 1000)
     } else {
         format!("[{lines}]")
@@ -244,5 +286,35 @@ mod tests {
         let out = build_tree(Path::new("."), 2, &ctx(dir.path())).await;
         assert!(!out.is_error);
         assert_eq!(out.text, "(empty directory)");
+    }
+
+    #[tokio::test]
+    async fn tree_marks_oversized_files_and_keeps_no_trailing_newline_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(
+            dir.path().join("d/big.bin"),
+            vec![b'a'; MAX_COUNTED_BYTES as usize + 1],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("no-newline.txt"), "a\nb").unwrap();
+
+        let out = build_tree(Path::new("."), 2, &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("big.bin  [?]"), "{}", out.text);
+        assert!(
+            out.text.contains("d/  [?]"),
+            "超限文件应让所在目录降级: {}",
+            out.text
+        );
+        assert!(out.text.contains("no-newline.txt  [2]"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn tree_empty_file_counts_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e.txt"), "").unwrap();
+        let out = build_tree(Path::new("."), 2, &ctx(dir.path())).await;
+        assert!(out.text.contains("e.txt  [0]"), "{}", out.text);
     }
 }
