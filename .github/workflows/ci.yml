@@ -10,16 +10,27 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # 依赖漏洞扫描（cargo-audit/RUSTSEC）。必须不阻断：修复通告需要升级依赖，
+      # 违反 AGENTS.md「不加依赖、不升级依赖」锁定，此步只暴露问题供维护者决策。
+      - uses: rustsec/audit-check@v2.0.0
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       # todo 12 已合并：anthropic 原生 engine 走独立 feature，两步全量校验。
       - run: cargo clippy --all-targets --features anthropic-engine -- -D warnings
       - run: cargo test --features anthropic-engine
+      # 与 scripts/ci.sh 对齐的 --help smoke。
+      - run: cargo run -q -- --help
