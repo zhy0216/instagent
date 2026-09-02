@@ -4,17 +4,21 @@
 //! 的每个 server 一个实例）、[`CommandTools`]（`dev.instagent/tools/*.json`）、
 //! [`SkillsSource`]（只暴露 load_skill）。
 //!
-//! TODO(13)：填 Registry 的路由与命名（内置不加前缀；MCP `<server>__<tool>`；
-//! command tools `<plugin>__<tool>`；冲突再加插件名；超 64 字符截断 + 6 位哈希，
-//! 双向映射表同一会话内稳定）。
+//! 命名规则：内置不加前缀；MCP `<server>__<tool>`；command tools
+//! `<plugin>__<tool>`（前缀由各来源在 `list()` 里拼好）；同名冲突时 Registry
+//! 再给后来者加插件名前缀。OpenAI 函数名只允许 `[A-Za-z0-9_-]{1,64}`：非法字符
+//! 替换成 `_`，超 64 截断到 58 + 6 位 FNV-1a 哈希；双向映射表在 [`Registry`]
+//! 里，来源注册顺序与内容不变时映射稳定。
 
 pub mod builtin;
 pub mod command;
 pub mod mcp;
 pub mod skills;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -46,17 +50,23 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    pub fn ok(_text: String) -> Self {
-        todo!("TODO(13)")
+    pub fn ok(text: String) -> Self {
+        Self {
+            text,
+            is_error: false,
+        }
     }
 
-    pub fn err(_text: String) -> Self {
-        todo!("TODO(13)")
+    pub fn err(text: String) -> Self {
+        Self {
+            text,
+            is_error: true,
+        }
     }
 
-    /// 审批拒绝：以 is_error 结果回给模型（"user denied: <reason>"）。TODO(13)
-    pub fn denied(_reason: &str) -> Self {
-        todo!("TODO(13)")
+    /// 审批拒绝：以 is_error 结果回给模型（"user denied: <reason>"）。
+    pub fn denied(reason: &str) -> Self {
+        Self::err(format!("user denied: {reason}"))
     }
 }
 
@@ -88,10 +98,25 @@ pub trait ToolSource: Send + Sync {
     async fn shutdown(&self) {}
 }
 
+/// 模型可见名 → 真实路由（来源下标 + 来源 `list()` 里报出的原名）。
+#[derive(Debug, Clone)]
+struct Route {
+    source: usize,
+    name: String,
+}
+
+/// 双向映射表：visible → route，(source, real) → visible。
+#[derive(Default)]
+struct Routes {
+    forward: HashMap<String, Route>,
+    reverse: HashMap<(usize, String), String>,
+}
+
 /// 汇总多个来源，按模型可见名路由（名字映射表在实现里，双向且会话内稳定）。
 #[derive(Default)]
 pub struct Registry {
     pub sources: Vec<Arc<dyn ToolSource>>,
+    routes: Mutex<Routes>,
 }
 
 impl Registry {
@@ -99,27 +124,283 @@ impl Registry {
         Self::default()
     }
 
-    pub fn register(&mut self, _source: Arc<dyn ToolSource>) {
-        todo!("TODO(13)")
+    pub fn register(&mut self, source: Arc<dyn ToolSource>) {
+        self.sources.push(source);
     }
 
-    /// 汇总各来源 spec，套命名规则 + 64 字符映射。TODO(13)
+    /// 汇总各来源 spec，解决同名冲突（后来者加插件名前缀），再套
+    /// [`model_visible_name`] 生成模型可见名，并刷新双向映射表。
     pub async fn list(&self) -> Vec<ToolSpec> {
-        todo!("TODO(13)")
+        let mut specs = Vec::new();
+        let mut routes = Routes::default();
+
+        for (idx, source) in self.sources.iter().enumerate() {
+            let prefix = conflict_prefix(source.id());
+            for spec in source.list().await {
+                let mut candidate = spec.name.clone();
+                let mut retry = 0usize;
+                let visible = loop {
+                    let visible = model_visible_name(&candidate);
+                    let taken = routes
+                        .forward
+                        .get(&visible)
+                        .is_some_and(|route| !(route.source == idx && route.name == spec.name));
+                    if !taken {
+                        break visible;
+                    }
+                    retry += 1;
+                    candidate = if retry == 1 {
+                        format!("{prefix}{NAME_SEP}{}", spec.name)
+                    } else {
+                        format!("{prefix}{NAME_SEP}{}{NAME_SEP}{retry}", spec.name)
+                    };
+                };
+                routes.forward.insert(
+                    visible.clone(),
+                    Route {
+                        source: idx,
+                        name: spec.name.clone(),
+                    },
+                );
+                routes
+                    .reverse
+                    .insert((idx, spec.name.clone()), visible.clone());
+                let mut spec = spec;
+                spec.name = visible;
+                specs.push(spec);
+            }
+        }
+
+        *self.routes.lock().expect("registry routes lock") = routes;
+        specs
     }
 
-    /// 按映射表路由回真实 (source, name)。TODO(13)
-    pub async fn call(&self, _call: &ToolCall, _ctx: &ToolCtx) -> ToolOutput {
-        todo!("TODO(13)")
+    /// 按映射表路由回真实 (source, name)；未命中时先重建一次映射再试。
+    pub async fn call(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolOutput {
+        let route = self.lookup(&call.name).await;
+        match route {
+            Some(route) => {
+                self.sources[route.source]
+                    .call(&route.name, call.input.clone(), ctx)
+                    .await
+            }
+            None => ToolOutput::err(format!("unknown tool: {}", call.name)),
+        }
+    }
+
+    /// 反查：模型可见名 → (来源 id, 来源内真实工具名)。
+    pub async fn route_of(&self, visible: &str) -> Option<(String, String)> {
+        let route = self.lookup(visible).await?;
+        Some((self.sources[route.source].id().to_string(), route.name))
+    }
+
+    async fn lookup(&self, visible: &str) -> Option<Route> {
+        if let Some(route) = self.lookup_cached(visible) {
+            return Some(route);
+        }
+        self.list().await;
+        self.lookup_cached(visible)
+    }
+
+    fn lookup_cached(&self, visible: &str) -> Option<Route> {
+        let routes = self.routes.lock().expect("registry routes lock");
+        routes.forward.get(visible).cloned()
     }
 
     pub async fn shutdown(&self) {
-        todo!("TODO(13)")
+        for source in &self.sources {
+            source.shutdown().await;
+        }
     }
 }
 
-/// OpenAI 函数名只允许 `[A-Za-z0-9_-]{1,64}`：非法字符替换、超长截断后
-/// 加 6 位哈希（映射表由 Registry 维护）。TODO(13)
-pub fn model_visible_name(_name: &str) -> String {
-    todo!("TODO(13)")
+/// 从来源 id 提取插件名，用于冲突时再加一层前缀：
+/// `"mcp:<plugin>/<server>"` / `"cmd:<plugin>"` → `<plugin>`；其余原样。
+fn conflict_prefix(id: &str) -> String {
+    let rest = id.split_once(':').map_or(id, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// FNV-1a 64 位取低 24 位，输出 6 位十六进制（不加依赖的最小稳定哈希）。
+fn short_hash(input: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
+}
+
+/// OpenAI 函数名只允许 `[A-Za-z0-9_-]{1,64}`：非法字符替换成 `_`，超长截断到
+/// 58 字符再接原名的 6 位哈希（共 64）。纯函数、确定性，映射表由 Registry 维护。
+pub fn model_visible_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.len() > 64 {
+        let mut truncated: String = sanitized.chars().take(58).collect();
+        truncated.push_str(&short_hash(name));
+        truncated
+    } else if sanitized.is_empty() {
+        "tool".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct DummySource {
+        id: String,
+        names: Vec<String>,
+    }
+
+    impl DummySource {
+        fn new(id: &str, names: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                names: names.iter().map(|name| name.to_string()).collect(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolSource for DummySource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            self.names
+                .iter()
+                .map(|name| ToolSpec {
+                    name: name.clone(),
+                    description: format!("dummy {name}"),
+                    input_schema: json!({"type": "object"}),
+                    read_only: false,
+                })
+                .collect()
+        }
+
+        async fn call(&self, name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput::ok(format!("{}::{name}", self.id))
+        }
+    }
+
+    fn ctx_in(dir: &std::path::Path) -> ToolCtx {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn model_visible_name_sanitizes_invalid_chars() {
+        assert_eq!(model_visible_name("web.search:v1"), "web_search_v1");
+        assert_eq!(model_visible_name("ok-name_1"), "ok-name_1");
+    }
+
+    #[test]
+    fn model_visible_name_truncates_with_hash_and_is_stable() {
+        let long = "a".repeat(100);
+        let visible = model_visible_name(&long);
+        assert_eq!(visible.len(), 64);
+        assert!(visible.starts_with(&"a".repeat(58)));
+        assert_eq!(visible, model_visible_name(&long), "同一会话内稳定不变");
+
+        // 前缀相同、后缀不同的两个超长名字不会撞车。
+        let other = format!("{}b", "a".repeat(99));
+        assert_ne!(visible, model_visible_name(&other));
+    }
+
+    #[tokio::test]
+    async fn registry_resolves_name_conflicts_with_plugin_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+
+        let mut registry = Registry::new();
+        registry.register(DummySource::new("mcp:alpha/tools", &["dup"]));
+        registry.register(DummySource::new("cmd:beta", &["dup"]));
+        registry.register(DummySource::new("cmd:gamma", &["dup"]));
+        // 插件名恰好也叫 beta：加前缀后仍撞 "beta__dup" → 再挂序号。
+        registry.register(DummySource::new("mcp:beta/tools2", &["dup"]));
+
+        let specs = registry.list().await;
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["dup", "beta__dup", "gamma__dup", "beta__dup__2"],
+            "先到先得，后来者加插件名前缀"
+        );
+
+        let call = |name: &str| ToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            input: json!({}),
+        };
+        assert_eq!(
+            registry.call(&call("dup"), &ctx).await,
+            ToolOutput::ok("mcp:alpha/tools::dup".to_string())
+        );
+        assert_eq!(
+            registry.call(&call("beta__dup"), &ctx).await,
+            ToolOutput::ok("cmd:beta::dup".to_string())
+        );
+        assert_eq!(
+            registry.call(&call("beta__dup__2"), &ctx).await,
+            ToolOutput::ok("mcp:beta/tools2::dup".to_string()),
+            "加前缀后的可见名要能路由回未加前缀的真名"
+        );
+        assert!(registry.call(&call("nope"), &ctx).await.is_error);
+
+        assert_eq!(
+            registry.route_of("gamma__dup").await,
+            Some(("cmd:gamma".to_string(), "dup".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_mapping_is_stable_across_lists() {
+        let mut registry = Registry::new();
+        registry.register(DummySource::new("mcp:p/srv", &["weird tool.name"]));
+        registry.register(Arc::new(BuiltinTools::new(None)));
+
+        let first = registry.list().await;
+        let second = registry.list().await;
+        assert_eq!(first, second);
+        assert!(first.iter().any(|spec| spec.name == "weird_tool_name"));
+        assert!(first.iter().any(|spec| spec.name == "shell"));
+    }
+
+    #[tokio::test]
+    async fn registry_call_without_list_yet_resolves_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+
+        let mut registry = Registry::new();
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        let output = registry
+            .call(
+                &ToolCall {
+                    id: "t".to_string(),
+                    name: "shell".to_string(),
+                    input: json!({"command": "echo routed"}),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(!output.is_error);
+        assert!(output.text.contains("routed"));
+    }
 }

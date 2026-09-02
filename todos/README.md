@@ -74,7 +74,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 11. [10-provider-registry.md](10-provider-registry.md) — 依赖：00、08、09、07
 12. [11-provider-proxy.md](11-provider-proxy.md) — 依赖：00、08、03、10
 13. [12-provider-anthropic.md](12-provider-anthropic.md) — 依赖：00、08、10（可选）
-14. [13-tools-core-builtin.md](13-tools-core-builtin.md) — 依赖：00、03
+14. [done/13-tools-core-builtin.md](done/13-tools-core-builtin.md) — ✅ 完成。依赖：00、03
 15. [14-tools-mcp.md](14-tools-mcp.md) — 依赖：00、03、13、06
 16. [15-tools-command-skills.md](15-tools-command-skills.md) — 依赖：00、13、05
 17. [16-agent-loop.md](16-agent-loop.md) — 依赖：00、02、08、13、01
