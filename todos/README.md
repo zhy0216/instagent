@@ -63,7 +63,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 
 1. [done/00-skeleton.md](done/00-skeleton.md) — ✅ 完成。依赖：无。串行第一个。
 2. [done/01-config-settings.md](done/01-config-settings.md) — ✅ 完成。依赖：00
-3. [02-message-session.md](02-message-session.md) — 依赖：00
+3. [done/02-message-session.md](done/02-message-session.md) — ✅ 完成。依赖：00
 4. [03-subprocess.md](03-subprocess.md) — 依赖：00
 5. [04-plugin-manifest.md](04-plugin-manifest.md) — 依赖：00
 6. [05-plugin-discovery.md](05-plugin-discovery.md) — 依赖：00、04、01
