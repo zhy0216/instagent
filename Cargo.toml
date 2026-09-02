@@ -3,6 +3,9 @@ name = "instagent"
 version = "0.1.0"
 edition = "2021"
 description = "插件为核心的最小 agent（Rust 从零实现）"
+# 18：fixture bin（mcp-fixture-server / fake-proxy-server）加入后 `cargo run`
+# 有歧义；验收命令 `cargo run -- --help` 需要默认 bin 指向主 CLI。
+default-run = "instagent"
 
 [features]
 default = []
