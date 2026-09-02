@@ -77,7 +77,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 14. [done/13-tools-core-builtin.md](done/13-tools-core-builtin.md) — ✅ 完成。依赖：00、03
 15. [done/14-tools-mcp.md](done/14-tools-mcp.md) — ✅ 完成。依赖：00、03、13、06
 16. [done/15-tools-command-skills.md](done/15-tools-command-skills.md) — ✅ 完成。依赖：00、13、05
-17. [16-agent-loop.md](16-agent-loop.md) — 依赖：00、02、08、13、01
+17. [done/16-agent-loop.md](done/16-agent-loop.md) — ✅ 完成。依赖：00、02、08、13、01
 18. [17-hooks-commands.md](17-hooks-commands.md) — 依赖：00、03、05、16
 19. [18-cli.md](18-cli.md) — 依赖：00、16、10、11、14、15、17、01
 20. [19-hardening.md](19-hardening.md) — 依赖：全部

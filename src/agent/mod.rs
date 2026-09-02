@@ -1,7 +1,8 @@
 //! Agent loop（第二版 §2.5）：一个普通的 async 循环，不做状态机。
 //!
-//! TODO(16)：填 `assemble` / `run_turn` / `stream_assistant`；所有退出路径
-//! 统一补 ToolResult 保证会话不变量（§6 风险 2）；取消用 `tokio::select!`。
+//! `assemble` / `run_turn` / `stream_assistant`；所有退出路径统一走
+//! `finish_turn` 补 ToolResult，保证 `02` 的会话不变量（§6 风险 2）；
+//! 取消用 `tokio::select!`。
 //! hooks 触发点（SessionStart/Stop 等）由 `17` 在本文件接线，对 `agent/mod.rs`
 //! 的修改仅限触发点。
 
@@ -10,18 +11,31 @@ pub mod compact;
 pub mod event;
 pub mod prompt;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
+use futures::StreamExt;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::Mode;
 use crate::hooks::Hooks;
+use crate::message::Content;
 use crate::message::Message;
+use crate::message::Role;
+use crate::message::Usage;
+use crate::message::INTERRUPTED_TEXT;
 use crate::provider::Provider;
+use crate::provider::Request;
+use crate::provider::StreamEvent;
 use crate::session::Session;
 use crate::tools::Registry;
+use crate::tools::ToolCtx;
+use crate::tools::ToolOutput;
+use crate::ProviderError;
 
 pub use approval::Approval;
 pub use approval::Confirm;
@@ -37,7 +51,8 @@ pub struct AgentCfg {
     pub mode: Mode,
     /// 默认 1000（goose agent.rs:85），可配。
     pub max_turns: u32,
-    /// registry 四级顺序解析后的值（`10`）。
+    /// registry 四级顺序解析后的值（`10`）；`assemble` 里没有 registry，
+    /// 取 `config.context_limit` 覆盖 → [`crate::provider::context_limit_for`]。
     pub context_limit: u32,
     /// 默认 0.8（第二版 §2.7）。
     pub compaction_threshold: f32,
@@ -50,6 +65,11 @@ pub struct Agent {
     pub approval: Approval,
     /// 无 hooks 插件时为 None（`17`）。
     pub hooks: Option<Arc<Hooks>>,
+    /// 系统提示注入位：每个 MCP server 的 instructions（含 server 名前缀），
+    /// 由 `18` 装配时填入。
+    pub mcp_instructions: Vec<String>,
+    /// 系统提示注入位：每个 skill 的 `name — description`，由 `18` 装配时填入。
+    pub skill_lines: Vec<String>,
 }
 
 /// `run_turn` 的结果。
@@ -60,40 +80,955 @@ pub enum TurnResult {
     MaxTurns,
 }
 
+/// `stream_assistant` 的产物：折叠出的 assistant 消息 + 输入 JSON 解析失败的
+/// ToolUse（id → 错误文本，loop 直接补 is_error 结果、不执行）+ 流是否被取消。
+#[derive(Debug)]
+pub struct AssistantStream {
+    pub message: Message,
+    pub malformed: HashMap<String, String>,
+    pub cancelled: bool,
+}
+
+impl AssistantStream {
+    fn cancelled_empty() -> Self {
+        Self {
+            message: Message::assistant(Vec::new(), None),
+            malformed: HashMap::new(),
+            cancelled: true,
+        }
+    }
+}
+
 impl Agent {
     /// config + provider + 已注册工具源的 Registry（+ hooks）装配；CLI `18` 调用。
-    /// TODO(16)
     pub fn assemble(
-        _config: &Config,
-        _provider: Arc<dyn Provider>,
-        _tools: Registry,
-        _hooks: Option<Hooks>,
+        config: &Config,
+        provider: Arc<dyn Provider>,
+        tools: Registry,
+        hooks: Option<Hooks>,
     ) -> crate::Result<Agent> {
-        todo!("TODO(16)")
+        let model = config
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("config.model is required to assemble the agent"))?;
+        let context_limit = config
+            .context_limit
+            .unwrap_or_else(|| crate::provider::context_limit_for(&model));
+        let approval = Approval::new(config.mode, config.always_allow.clone(), None)
+            .with_config(config.clone());
+        Ok(Agent {
+            cfg: AgentCfg {
+                model,
+                max_tokens: config.max_tokens,
+                temperature: None,
+                mode: config.mode,
+                max_turns: config.max_turns,
+                context_limit,
+                compaction_threshold: config.compaction_threshold,
+            },
+            provider,
+            tools: Arc::new(tools),
+            approval,
+            hooks: hooks.map(Arc::new),
+            mcp_instructions: Vec::new(),
+            skill_lines: Vec::new(),
+        })
     }
 
     /// 第二版 §2.5 伪代码：append user → 循环 {compact::maybe → stream_assistant
     /// → append assistant → 无 tool call 即 Done → 逐个审批 + 串行执行 →
-    /// 结果合成一条 user 消息}。chat 模式请求不带 tools。TODO(16)
+    /// 结果合成一条 user 消息}。chat 模式请求不带 tools。
     pub async fn run_turn(
         &self,
-        _session: &mut Session,
-        _text: String,
-        _cancel: CancellationToken,
-        _events: mpsc::Sender<Event>,
+        session: &mut Session,
+        text: String,
+        cancel: CancellationToken,
+        events: mpsc::Sender<Event>,
     ) -> crate::Result<TurnResult> {
-        todo!("TODO(16)")
+        session.append(Message::user_text(text))?;
+        let mut overflow_retried = false;
+        for _ in 0..self.cfg.max_turns {
+            if cancel.is_cancelled() {
+                return Ok(TurnResult::Interrupted);
+            }
+            compact::maybe(self, session, &events).await?;
+            let streamed = match self.stream_assistant(session, &cancel, &events).await {
+                Ok(streamed) => streamed,
+                Err(e) => {
+                    let overflow = matches!(
+                        e.downcast_ref::<ProviderError>(),
+                        Some(ProviderError::ContextOverflow)
+                    );
+                    if overflow && !overflow_retried {
+                        overflow_retried = true;
+                        compact::force(self, session, &events).await?;
+                        continue;
+                    }
+                    Self::emit(&events, Event::Error(e.to_string())).await;
+                    return Err(e);
+                }
+            };
+
+            let calls = streamed.message.tool_uses();
+            let ctx = ToolCtx {
+                cwd: session.header.cwd.clone(),
+                cancel: cancel.clone(),
+            };
+            let mut results: Vec<Content> = Vec::with_capacity(calls.len());
+            for call in &calls {
+                if let Some(detail) = streamed.malformed.get(&call.id) {
+                    results.push(Content::tool_result(
+                        call,
+                        ToolOutput::err(format!(
+                            "tool input JSON is broken and the tool was not executed: {detail}"
+                        )),
+                    ));
+                    continue;
+                }
+                if streamed.cancelled || cancel.is_cancelled() {
+                    results.push(Content::interrupted(call));
+                    continue;
+                }
+                let output = match self.approval.decide(call).await {
+                    Decision::Allow | Decision::AllowAlways => {
+                        Self::emit(
+                            &events,
+                            Event::ToolStart {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                input: call.input.clone(),
+                            },
+                        )
+                        .await;
+                        let started = Instant::now();
+                        let output = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
+                            out = self.tools.call(call, &ctx) => out,
+                        };
+                        Self::emit(
+                            &events,
+                            Event::ToolDone {
+                                id: call.id.clone(),
+                                preview: preview_text(&output.text),
+                                is_error: output.is_error,
+                                elapsed_ms: started.elapsed().as_millis() as u64,
+                            },
+                        )
+                        .await;
+                        output
+                    }
+                    Decision::Deny(reason) => {
+                        Self::emit(
+                            &events,
+                            Event::ToolDone {
+                                id: call.id.clone(),
+                                preview: format!("user denied: {reason}"),
+                                is_error: true,
+                                elapsed_ms: 0,
+                            },
+                        )
+                        .await;
+                        ToolOutput::denied(&reason)
+                    }
+                };
+                results.push(Content::tool_result(call, output));
+            }
+
+            // 所有退出路径统一落盘：assistant 与答复它的 user 消息一起写，
+            // 保证 02 的会话不变量。
+            finish_turn(session, streamed.message, results)?;
+
+            if streamed.cancelled || cancel.is_cancelled() {
+                return Ok(TurnResult::Interrupted);
+            }
+            if calls.is_empty() {
+                return Ok(TurnResult::Done);
+            }
+        }
+        Ok(TurnResult::MaxTurns)
     }
 
     /// StreamEvent 折叠成一条 assistant Message，同时转发 TextDelta；
-    /// JSON 损坏时给 is_error 的 ToolResult 告诉模型。ContextOverflow 原样上抛
-    /// 由 run_turn 触发强制压缩重试。TODO(16)
+    /// JSON 损坏记入 `malformed`（loop 生成 is_error 的 ToolResult 告诉模型）。
+    /// ContextOverflow 原样上抛，由 run_turn 触发强制压缩重试。
+    /// 取消时返回已折叠的部分消息并置 `cancelled`。
     pub async fn stream_assistant(
         &self,
-        _session: &Session,
-        _cancel: &CancellationToken,
-        _events: &mpsc::Sender<Event>,
-    ) -> crate::Result<Message> {
-        todo!("TODO(16)")
+        session: &Session,
+        cancel: &CancellationToken,
+        events: &mpsc::Sender<Event>,
+    ) -> crate::Result<AssistantStream> {
+        let specs = if self.approval.grants_tools() {
+            self.tools.list().await
+        } else {
+            Vec::new()
+        };
+        let ctx = prompt::PromptContext {
+            tools: &specs,
+            cwd: &session.header.cwd,
+            now: chrono::Utc::now(),
+            mcp_instructions: &self.mcp_instructions,
+            skill_lines: &self.skill_lines,
+        };
+        let system = prompt::system(&ctx);
+        let request = Request {
+            model: &self.cfg.model,
+            system: &system,
+            messages: &session.messages,
+            tools: &specs,
+            max_tokens: self.cfg.max_tokens,
+            temperature: self.cfg.temperature,
+        };
+
+        let mut stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Ok(AssistantStream::cancelled_empty());
+            }
+            stream = self.provider.stream(request) => stream?,
+        };
+
+        let mut blocks: Vec<Content> = Vec::new();
+        let mut text = String::new();
+        let mut pending: Option<(String, String, String)> = None;
+        let mut malformed = HashMap::new();
+        let mut usage: Option<Usage> = None;
+        let mut cancelled = false;
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
+            match item? {
+                StreamEvent::TextDelta(delta) => {
+                    if !delta.is_empty() {
+                        Self::emit(events, Event::TextDelta(delta.clone())).await;
+                        text.push_str(&delta);
+                    }
+                }
+                StreamEvent::ToolUseStart { id, name } => {
+                    flush_text(&mut blocks, &mut text);
+                    pending = Some((id, name, String::new()));
+                }
+                StreamEvent::ToolUseDelta(delta) => {
+                    if let Some((_, _, buf)) = pending.as_mut() {
+                        buf.push_str(&delta);
+                    }
+                }
+                StreamEvent::ToolUseEnd => {
+                    let Some((id, name, buf)) = pending.take() else {
+                        continue;
+                    };
+                    match serde_json::from_str::<Value>(&buf) {
+                        Ok(input) => blocks.push(Content::ToolUse { id, name, input }),
+                        Err(e) => {
+                            malformed.insert(id.clone(), e.to_string());
+                            blocks.push(Content::ToolUse {
+                                id,
+                                name,
+                                input: Value::String(buf),
+                            });
+                        }
+                    }
+                }
+                StreamEvent::Done { usage: u, .. } => {
+                    usage = Some(u);
+                    Self::emit(events, Event::Usage(u)).await;
+                }
+            }
+        }
+        // 未等到 ToolUseEnd 的 ToolUse 不完整，丢弃。
+        drop(pending);
+        flush_text(&mut blocks, &mut text);
+        Ok(AssistantStream {
+            message: Message::assistant(blocks, usage),
+            malformed,
+            cancelled,
+        })
+    }
+
+    /// 事件通道只给 UI 看：接收端断开不该弄死 loop。
+    pub(crate) async fn emit(events: &mpsc::Sender<Event>, event: Event) {
+        let _ = events.send(event).await;
+    }
+}
+
+fn flush_text(blocks: &mut Vec<Content>, text: &mut String) {
+    if !text.is_empty() {
+        blocks.push(Content::Text(std::mem::take(text)));
+    }
+}
+
+/// assistant + 工具结果一次性落盘（空 content 跳过，保 validate 不变量 3）。
+fn finish_turn(
+    session: &mut Session,
+    assistant: Message,
+    results: Vec<Content>,
+) -> crate::Result<()> {
+    if !assistant.content.is_empty() {
+        session.append(assistant)?;
+    }
+    if !results.is_empty() {
+        session.append(Message {
+            role: Role::User,
+            content: results,
+            ts: chrono::Utc::now().timestamp(),
+            usage: None,
+        })?;
+    }
+    Ok(())
+}
+
+/// ToolDone 预览：前 10 行 / 1KB（渲染细则归 `18`）。
+fn preview_text(text: &str) -> String {
+    const MAX_LINES: usize = 10;
+    const MAX_BYTES: usize = 1024;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut truncated = lines.len() > MAX_LINES;
+    let mut preview = lines[..lines.len().min(MAX_LINES)].join("\n");
+    if preview.len() > MAX_BYTES {
+        let mut cut = MAX_BYTES;
+        while !preview.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        preview.truncate(cut);
+        truncated = true;
+    }
+    if truncated {
+        preview.push_str("\n[output truncated]");
+    }
+    preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::compact::COMPACTION_PROMPT;
+    use crate::message::SUMMARY_PREFIX;
+    use crate::session::SessionHeader;
+    use crate::tools::BuiltinTools;
+    use crate::tools::ToolCall;
+    use async_trait::async_trait;
+    use futures::stream;
+    use futures::stream::BoxStream;
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    enum Scripted {
+        Ok {
+            events: Vec<StreamEvent>,
+            cancel_at_end: Option<CancellationToken>,
+        },
+        Err(ProviderError),
+    }
+
+    fn done(input: u32, output: u32) -> StreamEvent {
+        StreamEvent::Done {
+            usage: Usage {
+                input,
+                output,
+                ..Default::default()
+            },
+            stop_reason: crate::provider::StopReason::EndTurn,
+        }
+    }
+
+    fn tool_use_shell(id: &str, raw_json: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolUseStart {
+                id: id.into(),
+                name: "shell".into(),
+            },
+            StreamEvent::ToolUseDelta(raw_json.into()),
+            StreamEvent::ToolUseEnd,
+        ]
+    }
+
+    fn scripted(events: Vec<StreamEvent>) -> Scripted {
+        Scripted::Ok {
+            events,
+            cancel_at_end: None,
+        }
+    }
+
+    /// 流耗尽后把 cancel 置位再收尾：模拟"流中途取消"。
+    fn scripted_then_cancel(events: Vec<StreamEvent>, token: &CancellationToken) -> Scripted {
+        Scripted::Ok {
+            events,
+            cancel_at_end: Some(token.clone()),
+        }
+    }
+
+    struct MockProvider {
+        script: tokio::sync::Mutex<VecDeque<Scripted>>,
+        calls: AtomicUsize,
+        seen: tokio::sync::Mutex<Vec<Vec<Message>>>,
+        seen_tool_counts: tokio::sync::Mutex<Vec<usize>>,
+    }
+
+    impl MockProvider {
+        fn new(script: Vec<Scripted>) -> Arc<Self> {
+            Arc::new(Self {
+                script: tokio::sync::Mutex::new(script.into()),
+                calls: AtomicUsize::new(0),
+                seen: tokio::sync::Mutex::new(Vec::new()),
+                seen_tool_counts: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        async fn seen(&self) -> Vec<Vec<Message>> {
+            self.seen.lock().await.clone()
+        }
+
+        async fn seen_tool_counts(&self) -> Vec<usize> {
+            self.seen_tool_counts.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            req: Request<'_>,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().await.push(req.messages.to_vec());
+            self.seen_tool_counts.lock().await.push(req.tools.len());
+            let Some(step) = self.script.lock().await.pop_front() else {
+                return Err(ProviderError::Transport("mock script exhausted".into()));
+            };
+            match step {
+                Scripted::Err(e) => Err(e),
+                Scripted::Ok {
+                    events,
+                    cancel_at_end,
+                } => {
+                    let head = stream::iter(events.into_iter().map(Ok)).boxed();
+                    let tail: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+                        match cancel_at_end {
+                            Some(token) => stream::once(async move {
+                                token.cancel();
+                                Ok(StreamEvent::TextDelta(String::new()))
+                            })
+                            .boxed(),
+                            None => stream::empty().boxed(),
+                        };
+                    Ok(head.chain(tail).boxed())
+                }
+            }
+        }
+    }
+
+    struct FixedConfirm {
+        decision: Decision,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Confirm for FixedConfirm {
+        async fn confirm(&self, _call: &ToolCall) -> Decision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision.clone()
+        }
+    }
+
+    fn confirm(decision: Decision) -> (Arc<FixedConfirm>, Arc<dyn Confirm>) {
+        let fixed = Arc::new(FixedConfirm {
+            decision,
+            calls: AtomicUsize::new(0),
+        });
+        let arc: Arc<dyn Confirm> = fixed.clone();
+        (fixed, arc)
+    }
+
+    fn auto() -> Approval {
+        Approval::new(Mode::Auto, vec![], None)
+    }
+
+    fn agent(
+        provider: Arc<MockProvider>,
+        mode: Mode,
+        context_limit: u32,
+        approval: Approval,
+    ) -> Agent {
+        let mut registry = Registry::new();
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        Agent {
+            cfg: AgentCfg {
+                model: "mock-model".into(),
+                max_tokens: 1024,
+                temperature: None,
+                mode,
+                max_turns: 10,
+                context_limit,
+                compaction_threshold: 0.8,
+            },
+            provider,
+            tools: Arc::new(registry),
+            approval,
+            hooks: None,
+            mcp_instructions: Vec::new(),
+            skill_lines: Vec::new(),
+        }
+    }
+
+    /// 手工构造会话文件（不碰 INSTAGENT_DATA_DIR，避免与其他模块并行测试
+    /// 的环境变量互踩）。
+    fn temp_session(dir: &Path) -> Session {
+        let header = SessionHeader {
+            id: "test".into(),
+            created: 0,
+            cwd: dir.to_path_buf(),
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            name: None,
+        };
+        let path = dir.join("test.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&header).unwrap()),
+        )
+        .unwrap();
+        Session {
+            header,
+            messages: Vec::new(),
+            path,
+        }
+    }
+
+    async fn run(
+        agent: &Agent,
+        session: &mut Session,
+        text: &str,
+    ) -> (crate::Result<TurnResult>, Vec<Event>) {
+        run_with(agent, session, text, CancellationToken::new()).await
+    }
+
+    async fn run_with(
+        agent: &Agent,
+        session: &mut Session,
+        text: &str,
+        cancel: CancellationToken,
+    ) -> (crate::Result<TurnResult>, Vec<Event>) {
+        let (tx, mut rx) = mpsc::channel(8192);
+        let result = agent.run_turn(session, text.to_string(), cancel, tx).await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    fn first_text(message: &Message) -> String {
+        match &message.content[0] {
+            Content::Text(text) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn tool_results(message: &Message) -> Vec<(String, String, bool)> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_loop_text_tool_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![
+                StreamEvent::TextDelta("working".into()),
+                StreamEvent::TextDelta("…".into()),
+                StreamEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                },
+                StreamEvent::ToolUseDelta("{\"command\": \"ech".into()),
+                StreamEvent::ToolUseDelta("o instagent-hi\"}".into()),
+                StreamEvent::ToolUseEnd,
+                done(10, 5),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("all done".into()), done(20, 3)]),
+        ]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "say hi").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 2);
+
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(first_text(&session.messages[0]), "say hi");
+        assert_eq!(
+            session.messages[1].content[0],
+            Content::Text("working…".into())
+        );
+        let calls = session.messages[1].tool_uses();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input["command"], "echo instagent-hi");
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].2, "{}", results[0].1);
+        assert!(results[0].1.contains("instagent-hi"), "{}", results[0].1);
+        assert_eq!(first_text(&session.messages[3]), "all done");
+        assert_eq!(session.messages[3].usage.unwrap().input, 20);
+
+        // 会话文件同步落盘（header + 4 条）；auto 模式带内置 5 工具。
+        let raw = std::fs::read_to_string(&session.path).unwrap();
+        assert_eq!(raw.lines().count(), 5);
+        assert_eq!(provider.seen_tool_counts().await, vec![5, 5]);
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolStart { name, .. } if name == "shell")));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToolDone {
+                is_error: false,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(e, Event::Usage(_))));
+    }
+
+    #[tokio::test]
+    async fn approve_deny_becomes_error_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(tool_use_shell("t1", "{\"command\": \"echo nope\"}")),
+            scripted(vec![
+                StreamEvent::TextDelta("ok, stopping".into()),
+                done(5, 2),
+            ]),
+        ]);
+        let (_counter, arc) = confirm(Decision::Deny("not now".into()));
+        let approval = Approval::new(Mode::Approve, vec![], Some(arc));
+        let agent = agent(provider.clone(), Mode::Approve, 100_000, approval);
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "run it").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results[0].1, "user denied: not now");
+        assert!(results[0].2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolDone { is_error: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn approve_allow_always_skips_confirm_next_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(tool_use_shell("t1", "{\"command\": \"echo one\"}")),
+            scripted(tool_use_shell("t2", "{\"command\": \"echo two\"}")),
+            scripted(vec![StreamEvent::TextDelta("both ran".into()), done(9, 1)]),
+        ]);
+        let (counter, arc) = confirm(Decision::AllowAlways);
+        let approval = Approval::new(Mode::Approve, vec![], Some(arc));
+        let agent = agent(provider.clone(), Mode::Approve, 100_000, approval);
+        let mut session = temp_session(dir.path());
+
+        let (result, _events) = run(&agent, &mut session, "twice").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(
+            counter.calls.load(Ordering::SeqCst),
+            1,
+            "AllowAlways 写回后同会话不再问"
+        );
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 6);
+        for index in [2, 4] {
+            let results = tool_results(&session.messages[index]);
+            assert!(!results[0].2, "{}", results[0].1);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_mode_sends_no_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![scripted(vec![
+            StreamEvent::TextDelta("chatting".into()),
+            done(4, 4),
+        ])]);
+        let agent = agent(
+            provider.clone(),
+            Mode::Chat,
+            100_000,
+            Approval::new(Mode::Chat, vec![], None),
+        );
+        let mut session = temp_session(dir.path());
+
+        let (result, _events) = run(&agent, &mut session, "hello").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(first_text(&session.messages[1]), "chatting");
+
+        let seen = provider.seen().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(provider.seen_tool_counts().await, vec![0], "chat 不带工具");
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_keeps_session_invariants() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let mut events = vec![StreamEvent::TextDelta("partial".into())];
+        events.extend(tool_use_shell("t1", "{\"command\": \"echo hi\"}"));
+        let provider = MockProvider::new(vec![scripted_then_cancel(events, &token)]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, _events) = run_with(&agent, &mut session, "go", token).await;
+        assert_eq!(result.unwrap(), TurnResult::Interrupted);
+
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[1].tool_uses().len(), 1);
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "t1");
+        assert_eq!(results[0].1, INTERRUPTED_TEXT);
+        assert!(results[0].2);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_turn_starts_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let provider = MockProvider::new(vec![]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, _events) = run_with(&agent, &mut session, "go", token).await;
+        assert_eq!(result.unwrap(), TurnResult::Interrupted);
+        assert_eq!(provider.calls(), 0);
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_json_gets_error_result_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![
+                StreamEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                },
+                StreamEvent::ToolUseDelta("{not json".into()),
+                StreamEvent::ToolUseEnd,
+                done(3, 1),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("sorry".into()), done(6, 1)]),
+        ]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "bad args").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert!(results[0].2);
+        assert!(results[0].1.contains("JSON"), "{}", results[0].1);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ToolStart { .. })),
+            "malformed 调用不该执行"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_usage_triggers_compaction_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![StreamEvent::TextDelta("a1".into()), done(900, 5)]),
+            scripted(vec![
+                StreamEvent::TextDelta("## summary\nwe talked".into()),
+                done(100, 30),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("a2".into()), done(50, 2)]),
+        ]);
+        let agent = agent(provider.clone(), Mode::Auto, 1000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "first question").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+
+        let (result, events) = run(&agent, &mut session, "second question").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 3);
+
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 2);
+        let summary = first_text(&session.messages[0]);
+        assert!(summary.starts_with(SUMMARY_PREFIX));
+        assert!(summary.contains("we talked"));
+        assert!(summary.contains("second question"), "{summary}");
+        assert_eq!(first_text(&session.messages[1]), "a2");
+
+        let compacted = events
+            .iter()
+            .find(|e| matches!(e, Event::Compacted { .. }))
+            .expect("Compacted event");
+        match compacted {
+            Event::Compacted {
+                before_tokens,
+                after_tokens,
+            } => {
+                assert_eq!(*before_tokens, 900);
+                assert_eq!(*after_tokens, 30);
+            }
+            _ => unreachable!(),
+        }
+
+        // 摘要请求带上了历史文本，且压缩后的重试请求只剩 summary 一条。
+        let seen = provider.seen().await;
+        assert_eq!(seen[1].len(), 1);
+        let request_text = first_text(&seen[1][0]);
+        assert!(request_text.starts_with("## Task Context"));
+        assert!(request_text.contains("**Conversation History:**"));
+        assert!(request_text.contains("Write the summary as a Markdown document"));
+        assert!(request_text.contains("first question"));
+        assert!(request_text.contains("assistant: a1"));
+        assert_eq!(seen[2].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_forces_compaction_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![StreamEvent::TextDelta("a1".into()), done(10, 5)]),
+            Scripted::Err(ProviderError::ContextOverflow),
+            scripted(vec![
+                StreamEvent::TextDelta("overflowed summary".into()),
+                done(700, 25),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("a2".into()), done(60, 2)]),
+        ]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "first").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        let (result, events) = run(&agent, &mut session, "second").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 4, "overflow → 摘要 → 重试，共 4 次");
+
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 2);
+        let summary = first_text(&session.messages[0]);
+        assert!(summary.contains("overflowed summary"));
+        assert!(summary.contains("second"), "{summary}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Compacted {
+                before_tokens: 10,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn second_context_overflow_surfaces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Scripted::Err(ProviderError::ContextOverflow),
+            Scripted::Err(ProviderError::ContextOverflow),
+        ]);
+        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "hi").await;
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::ContextOverflow)
+        ));
+        assert_eq!(provider.calls(), 2, "只重试一次");
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert!(events.iter().any(|e| matches!(e, Event::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn compaction_prompt_placeholder_is_replaced() {
+        // COMPACTION_PROMPT 的占位符被替换（防 typo：常量和 replace 同名）。
+        assert!(COMPACTION_PROMPT.contains(crate::agent::compact::MESSAGES_PLACEHOLDER));
+    }
+
+    #[test]
+    fn preview_cuts_long_output() {
+        let long = "line\n".repeat(50);
+        let preview = preview_text(&long);
+        assert_eq!(preview.lines().count(), 11); // 10 行 + 截断标记
+        assert!(preview.ends_with("[output truncated]"));
+
+        let big = "a".repeat(5000);
+        let preview = preview_text(&big);
+        assert!(preview.len() <= 1024 + "\n[output truncated]".len());
+
+        assert_eq!(preview_text("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn assemble_wires_config_into_agent() {
+        let config = Config {
+            model: Some("claude-sonnet-4-5".into()),
+            max_tokens: 4096,
+            mode: Mode::Auto,
+            max_turns: 7,
+            context_limit: None,
+            compaction_threshold: 0.5,
+            always_allow: vec!["web__search".into()],
+            ..Config::default()
+        };
+        let provider = MockProvider::new(vec![]);
+        let agent = Agent::assemble(&config, provider, Registry::new(), None).unwrap();
+        assert_eq!(agent.cfg.model, "claude-sonnet-4-5");
+        assert_eq!(agent.cfg.max_turns, 7);
+        assert_eq!(agent.cfg.context_limit, 200 * 1024);
+        assert_eq!(agent.cfg.compaction_threshold, 0.5);
+        assert!(agent.approval.always_allow.contains("web__search"));
+        assert!(agent.approval.grants_tools());
+    }
+
+    #[test]
+    fn assemble_requires_a_model() {
+        let provider = MockProvider::new(vec![]);
+        let err = Agent::assemble(&Config::default(), provider, Registry::new(), None)
+            .err()
+            .expect("missing model must bail");
+        assert!(err.to_string().contains("config.model"), "{err}");
     }
 }
