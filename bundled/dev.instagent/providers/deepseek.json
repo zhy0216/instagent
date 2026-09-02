@@ -1,0 +1,22 @@
+{
+  "name": "deepseek",
+  "engine": "openai",
+  "display_name": "DeepSeek",
+  "description": "DeepSeek chat and reasoning models",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "base_url": "https://api.deepseek.com",
+  "models": [
+    {
+      "name": "deepseek-v4-flash",
+      "context_limit": 128000
+    },
+    {
+      "name": "deepseek-v4-pro",
+      "context_limit": 128000
+    },
+    {
+      "name": "deepseek-reasoner",
+      "context_limit": 128000
+    }
+  ]
+}

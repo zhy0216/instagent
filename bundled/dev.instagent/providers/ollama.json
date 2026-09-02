@@ -2,10 +2,13 @@
   "name": "ollama",
   "engine": "openai",
   "display_name": "Ollama",
+  "description": "Local Ollama server (OpenAI-compatible /v1); no API key required",
   "base_url": "http://localhost:11434/v1",
   "headers": {},
   "timeout_seconds": 600,
   "models": [
-    { "name": "llama3.1", "context_limit": 131072, "max_tokens": 8192 }
+    { "name": "llama3.1", "context_limit": 131072, "max_tokens": 8192 },
+    { "name": "llama3.2", "context_limit": 131072, "max_tokens": 8192 },
+    { "name": "qwen2.5-coder", "context_limit": 32768, "max_tokens": 8192 }
   ]
 }

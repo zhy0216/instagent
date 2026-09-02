@@ -1,0 +1,19 @@
+{
+  "name": "openrouter",
+  "engine": "openai",
+  "display_name": "OpenRouter",
+  "description": "One OpenAI-compatible API for 200+ models from OpenAI, Anthropic, Google, DeepSeek and more",
+  "api_key_env": "OPENROUTER_API_KEY",
+  "base_url": "https://openrouter.ai/api/v1",
+  "headers": {
+    "http-referer": "https://github.com/instagent",
+    "x-title": "instagent"
+  },
+  "timeout_seconds": 600,
+  "models": [
+    { "name": "anthropic/claude-sonnet-4.6", "context_limit": 200000, "max_tokens": 64000 },
+    { "name": "openai/gpt-5.5", "context_limit": 400000, "max_tokens": 32000 },
+    { "name": "google/gemini-3-flash-preview", "context_limit": 1000000, "max_tokens": 8192 },
+    { "name": "deepseek/deepseek-v4-pro", "context_limit": 163840, "max_tokens": 8192 }
+  ]
+}
