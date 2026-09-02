@@ -20,6 +20,15 @@ path = "tests/fixtures/mcp_stdio_server.rs"
 test = false
 doctest = false
 
+# todo 11 测试 fixture：假 openai 兼容 proxy server（仅 std，形态同 mcp
+# fixture 的 bin 先例），由 tests/provider_proxy.rs 的测试经
+# CARGO_BIN_EXE_fake-proxy-server 启动。仍只加 target，不加依赖。
+[[bin]]
+name = "fake-proxy-server"
+path = "tests/fixtures/fake_proxy_server.rs"
+test = false
+doctest = false
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

@@ -4,8 +4,8 @@
 //! 解析成 [`ProviderDef`]（K1：变量展开 `${env:NAME}` / `${PLUGIN_ROOT}` /
 //! `${PLUGIN_DATA}`，`${PORT}` 原样保留给 `11` 拉起时展开）。
 //! 按名字查找（K2）：重名报错并要求写成 `plugin/name`；用户插件覆盖 bundled。
-//! engine 分派：`openai` → `09`；`proxy` / `anthropic` 分支 `bail!` 占位
-//! （分别由 `11` / `12` 接上，勿删占位分支）。
+//! engine 分派：`openai` → `09`；`proxy` → `11` 的 [`ProxyProvider`]（拉起 +
+//! 就绪轮询）；`anthropic` 分支 `bail!` 占位（由 `12` 接上，勿删占位分支）。
 //! `context_limit` 四级顺序：配置覆盖 → provider models 表 → `08` 前缀小表 → 128k。
 
 use std::collections::BTreeSet;
@@ -26,6 +26,7 @@ use crate::plugin::PluginSource;
 use crate::plugin::NAMESPACE;
 use crate::provider::context_limit_for;
 use crate::provider::openai::OpenAiProvider;
+use crate::provider::proxy::ProxyProvider;
 use crate::provider::EngineKind;
 use crate::provider::Provider;
 use crate::provider::ProviderDef;
@@ -34,11 +35,13 @@ use crate::provider::ProviderDef;
 const PROVIDERS_DIR: &str = "providers";
 
 /// 一个 provider 定义 + 它的来源插件（覆盖与消歧的依据）。
+/// `root` 供 `11` 解析 proxy 的 `./` 相对命令（约定同 `06`）。
 #[derive(Debug, Clone)]
 struct Entry {
     def: ProviderDef,
     plugin: String,
     source: PluginSource,
+    root: PathBuf,
 }
 
 impl Entry {
@@ -99,6 +102,7 @@ impl ProviderRegistry {
                     def,
                     plugin: plugin.manifest.name.clone(),
                     source: plugin.source,
+                    root: plugin.root.clone(),
                 });
             }
         }
@@ -110,12 +114,11 @@ impl ProviderRegistry {
         let entry = self.resolve(name)?;
         match entry.def.engine {
             EngineKind::Openai => Ok(Arc::new(OpenAiProvider::new(&entry.def)?)),
-            // TODO(11)：占位分支，proxy 拉起器落地后替换为构造 ProxyProvider。
             EngineKind::Proxy => {
-                bail!(
-                    "provider `{}` uses engine `proxy`, not implemented yet (todo 11)",
-                    entry.qualified()
-                )
+                let provider = ProxyProvider::start(&entry.def, &entry.root)
+                    .await
+                    .with_context(|| format!("provider `{}`", entry.qualified()))?;
+                Ok(Arc::new(provider))
             }
             // TODO(12)：占位分支，cargo feature `anthropic-engine` 落地后替换。
             EngineKind::Anthropic => {
@@ -544,7 +547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_dispatch_openai_builds_proxy_and_anthropic_bail() {
+    async fn engine_dispatch_openai_and_proxy_build_then_anthropic_bail() {
         let env = isolated();
         let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
         write_provider(
@@ -552,10 +555,13 @@ mod tests {
             "oai.json",
             &def_json("oai", "openai", "https://oai.test/v1"),
         );
+        // 11 接线：proxy 分支构造 ProxyProvider 并真正拉起（端到端拉起见
+        // tests/provider_proxy.rs；这里用必然 spawn 失败的命令证明占位 bail
+        // 已被接线替换）。
         write_provider(
             &p,
             "px.json",
-            r#"{"name":"px","engine":"proxy","proxy":{"command":"./bin/proxy","args":["--port","${PORT}"]}}"#,
+            r#"{"name":"px","engine":"proxy","proxy":{"command":"no-such-proxy-binary-42","args":["--port","${PORT}"]}}"#,
         );
         write_provider(
             &p,
@@ -567,8 +573,12 @@ mod tests {
         let provider = registry.get("oai").await.unwrap();
         assert_eq!(provider.name(), "oai");
 
-        let err = registry.get("px").await.map(drop).unwrap_err().to_string();
-        assert!(err.contains("proxy") && err.contains("todo 11"), "{err}");
+        let err = format!("{:#}", registry.get("px").await.map(drop).unwrap_err());
+        assert!(
+            err.contains("spawn proxy command") && err.contains("no-such-proxy-binary-42"),
+            "{err}"
+        );
+
         let err = registry
             .get("anth")
             .await
