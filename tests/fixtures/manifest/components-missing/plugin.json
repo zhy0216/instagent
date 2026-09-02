@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "bare-plugin",
+  "version": "0.1.0",
+  "description": "plugin.json only, no skills/, mcp.json or dev.instagent/"
+}

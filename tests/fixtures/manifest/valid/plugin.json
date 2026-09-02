@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "groq-and-review",
+  "version": "1.0.0",
+  "description": "Groq provider + a review skill + a lint hook",
+  "author": {
+    "name": "Instagent Team",
+    "email": "team@instagent.dev"
+  },
+  "homepage": "https://instagent.dev/plugins/groq-and-review",
+  "repository": "https://github.com/instagent/groq-and-review",
+  "license": "Apache-2.0",
+  "keywords": ["groq", "review"],
+  "extensions": {
+    "dev.instagent": { "minKernel": "0.1" },
+    "com.example.tools": { "anything": true }
+  }
+}

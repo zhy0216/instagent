@@ -1,0 +1,5 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/0.9.0/plugin.schema.json",
+  "name": "ok-name",
+  "version": "1.0.0"
+}
