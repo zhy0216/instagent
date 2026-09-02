@@ -17,6 +17,7 @@ use include_dir::DirEntry;
 
 use crate::plugin::discovery::discover;
 use crate::plugin::discovery::PluginSet;
+use crate::plugin::discovery::SkippedPlugin;
 use crate::plugin::install::data_dir;
 use crate::plugin::manifest::read_manifest;
 use crate::plugin::Plugin;
@@ -94,7 +95,31 @@ pub fn discover_with_bundled(
 ) -> crate::Result<PluginSet> {
     let set = discover(cwd, settings, extra_paths, cli_plugins)?;
     let bundled = load_bundled()?;
-    Ok(with_bundled(set, bundled, settings))
+    let mut set = with_bundled(set, bundled, settings);
+    // 白名单显式启用的插件在所有层都找不到（目录被删、改名）：记 skipped
+    // 给启动警告，不 panic（第三版 §5 P7"插件目录被删"）。manifest 已坏
+    // 的目录发现层记过 skipped，不重复报。
+    for name in &settings.enabled_plugins {
+        let known = set.get(name).is_some()
+            || set.skipped.iter().any(|skipped| {
+                skipped
+                    .path
+                    .file_name()
+                    .is_some_and(|dir| dir == name.as_str())
+            });
+        if !known {
+            set.skipped.push(SkippedPlugin {
+                path: crate::plugin::discovery::agents_dir()?
+                    .join("plugins")
+                    .join(name),
+                reason: format!(
+                    "plugin `{name}` is enabled in settings but was not found in any \
+                     plugin root (directory deleted, moved, or renamed?)"
+                ),
+            });
+        }
+    }
+    Ok(set)
 }
 
 /// 纯合并：外部任一层已有同名 `bundled` 时不注入；启用判定与 `05`
@@ -125,8 +150,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// env 隔离约定同 `discovery.rs`（lock_env 串行化进程级变量）。
-    /// 特意**不**设 `INSTAGENT_DATA_DIR`：`session.rs` 的测试写同一变量但
-    /// 用另一把锁，并行互踩；bundled 物化走 `*_at` 参数化入口。
+    /// bundled 物化走 `*_at` 参数化入口，本就不需要设 `INSTAGENT_DATA_DIR`；
+    /// `session.rs` 的测试自 `19` 起共用同一把 lock_env，不再有并行互踩。
     struct Env {
         _guard: MutexGuard<'static, ()>,
         agents: TempDir,
@@ -138,6 +163,9 @@ mod tests {
         let agents = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
         std::env::set_var("INSTAGENT_AGENTS_DIR", agents.path());
+        // discover_with_bundled 的 `load_bundled()` 走全局 data_dir()；
+        // lock_env 已全 crate 统一（`19`），覆盖它不再与 session 测试互踩。
+        std::env::set_var("INSTAGENT_DATA_DIR", data.path());
         Env {
             _guard: guard,
             agents,
@@ -205,6 +233,51 @@ mod tests {
         let set = with_bundled(set, bundled, &Settings::default());
         let plugin = set.get(BUNDLED_PLUGIN_NAME).expect("bundled in set");
         assert_eq!(plugin.source, PluginSource::Bundled);
+    }
+
+    /// 第三版 §5 P7"启用的插件目录被删"：白名单里的插件在所有扫描层都
+    /// 找不到 → skipped 警告（启动时经 notes 展示），不 panic。
+    #[test]
+    fn enabled_plugin_with_deleted_dir_warns_without_panic() {
+        let env = isolated();
+        let dir = env.agents.path().join("plugins").join("gone");
+        write_plugin(&dir, "gone", "1.0.0");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let settings = Settings {
+            enabled_plugins: vec!["gone".into()],
+            ..Settings::default()
+        };
+        let set = discover_with_bundled(env.agents.path(), &settings, &[], &[]).unwrap();
+        assert!(set.plugins.is_empty());
+        let skipped = set
+            .skipped
+            .iter()
+            .find(|s| s.reason.contains("`gone`"))
+            .expect("被删的启用插件必须有可读警告");
+        assert!(
+            skipped.reason.contains("not found"),
+            "{skipped:?} 应说明找不到目录"
+        );
+        assert!(skipped.path.ends_with("plugins/gone"), "{skipped:?}");
+    }
+
+    /// 能找到的启用插件（含 bundled）不误报；坏 manifest 已被发现层记
+    /// skipped，不重复报"找不到"。
+    #[test]
+    fn existing_enabled_plugins_are_not_warned() {
+        let env = isolated();
+        write_plugin(
+            &env.agents.path().join("plugins").join("kept"),
+            "kept",
+            "1.0.0",
+        );
+        let settings = Settings {
+            enabled_plugins: vec!["kept".into(), BUNDLED_PLUGIN_NAME.into()],
+            ..Settings::default()
+        };
+        let set = discover_with_bundled(env.agents.path(), &settings, &[], &[]).unwrap();
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+        assert_eq!(names(&set), vec![BUNDLED_PLUGIN_NAME, "kept"]);
     }
 
     #[test]

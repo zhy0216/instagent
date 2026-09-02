@@ -20,3 +20,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # todo 12 已合并：anthropic 原生 engine 走独立 feature，两步全量校验。
+      - run: cargo clippy --all-targets --features anthropic-engine -- -D warnings
+      - run: cargo test --features anthropic-engine

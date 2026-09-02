@@ -80,4 +80,4 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 17. [done/16-agent-loop.md](done/16-agent-loop.md) — ✅ 完成。依赖：00、02、08、13、01
 18. [done/17-hooks-commands.md](done/17-hooks-commands.md) — ✅ 完成。依赖：00、03、05、16
 19. [done/18-cli.md](done/18-cli.md) — ✅ 完成。依赖：00、16、10、11、14、15、17、01
-20. [19-hardening.md](19-hardening.md) — 依赖：全部
+20. [done/19-hardening.md](done/19-hardening.md) — ✅ 完成。依赖：全部

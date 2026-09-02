@@ -84,8 +84,9 @@ fn now_ts() -> i64 {
 /// `<data_dir>`：`INSTAGENT_DATA_DIR` 优先，否则 etcetera（XDG）的
 /// `~/.local/share/instagent`——约定与 `session.rs` 完全一致。
 ///
-/// 测试不改写进程全局 `INSTAGENT_DATA_DIR`（`session.rs` 的测试用它但
-/// 各用各的锁，并行会互踩）：覆盖语义在纯函数 [`data_dir_from`] 验证，
+/// 测试优先走参数化入口而不改写进程全局 `INSTAGENT_DATA_DIR`（`session.rs`
+/// 的测试用它；全 crate 测试自 `19` 起共用 `config::lock_env` 一把锁）：
+/// 覆盖语义在纯函数 [`data_dir_from`] 验证，
 /// 路径逻辑在 [`plugin_data_dir_at`] 验证，这里只是取环境变量的胶水。
 pub(crate) fn data_dir() -> crate::Result<PathBuf> {
     data_dir_from(std::env::var_os("INSTAGENT_DATA_DIR"))
@@ -535,8 +536,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// env 隔离约定同 `discovery.rs`（lock_env 串行化进程级变量）。
-    /// 特意**不**设 `INSTAGENT_DATA_DIR`：`session.rs` 的测试写同一变量但
-    /// 用另一把锁，并行互踩；数据目录逻辑走 `*_at` 参数化入口测试。
+    /// 本模块数据目录逻辑走 `*_at` 参数化入口测试，特意**不**设
+    /// `INSTAGENT_DATA_DIR`，保持 hermetic。
     struct Env {
         _guard: MutexGuard<'static, ()>,
         agents: TempDir,

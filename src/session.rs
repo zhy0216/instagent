@@ -312,14 +312,11 @@ mod tests {
     use crate::message::Content;
     use crate::message::Role;
     use crate::message::Usage;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// 用 tempdir + INSTAGENT_DATA_DIR 隔离数据目录，返回（会话目录守卫）。
     /// 持有返回值期间环境变量有效；串行执行避免测试间竞态。
+    /// env 锁统一用 `config::lock_env`（全 crate 一把，见 `19`）。
     fn temp_data_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::config::lock_env();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("INSTAGENT_DATA_DIR", dir.path());
         (dir, guard)

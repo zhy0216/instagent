@@ -156,6 +156,8 @@ async fn missing_command_binary_errors_readably() {
     let msg = format!("{err:#}");
     assert!(msg.contains("no-such-server"), "{msg}");
     assert!(msg.contains("not found"), "{msg}");
+    // 第三版 §5 P7：错误必须同时指出插件与 server 名（来源 id `mcp:<plugin>/<server>`）。
+    assert!(msg.contains("mcp:demo/gone"), "{msg}");
 }
 
 // ---- O2 ----

@@ -136,6 +136,9 @@ pub fn discover(
 
 /// `path` 含 `plugin.json` 则按单个插件目录注册，否则作为插件根目录按名称
 /// 升序扫描其子目录（目录内先到先得，同名靠 [`Layer`] 覆盖）。
+/// 用户/项目扫描根不存在属正常（首次运行）；配置 `plugins` 与 `--plugin`
+/// 是用户显式声明的路径，缺失（被删、写错）记 skipped 警告并在启动提示里
+/// 给出（第三版 §5 P7"插件目录被删"），不中断发现。
 fn scan_path(
     path: &Path,
     source: PluginSource,
@@ -149,7 +152,17 @@ fn scan_path(
     }
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if matches!(layer, Layer::Extra | Layer::Cli) {
+                skipped.push(SkippedPlugin {
+                    path: path.to_path_buf(),
+                    reason: "explicitly configured plugin path not found \
+                             (deleted, moved, or misspelled)"
+                        .to_string(),
+                });
+            }
+            return;
+        }
         Err(err) => {
             skipped.push(SkippedPlugin {
                 path: path.to_path_buf(),
@@ -459,5 +472,34 @@ mod tests {
         let set = discover(cwd.path(), &Settings::default(), &[], &[]).unwrap();
         assert!(set.plugins.is_empty());
         assert!(set.skipped.is_empty());
+    }
+
+    /// 第三版 §5 P7"插件目录被删"：用户/项目根缺失静默，显式声明的路径
+    /// （配置 `plugins` / `--plugin`）缺失 → skipped 警告、不 panic。
+    #[test]
+    fn missing_explicit_paths_are_warned_not_fatal() {
+        let _env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let gone = cwd.path().join("deleted-plugin");
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            &[gone.join("from-config")],
+            std::slice::from_ref(&gone),
+        )
+        .unwrap();
+        assert!(set.plugins.is_empty());
+        assert_eq!(set.skipped.len(), 2, "{:?}", set.skipped);
+        for skipped in &set.skipped {
+            assert!(
+                skipped.reason.contains("not found"),
+                "{skipped:?} 应指出路径缺失"
+            );
+        }
+        assert!(set.skipped.iter().any(|s| s.path == gone));
+        assert!(set
+            .skipped
+            .iter()
+            .any(|s| s.path == gone.join("from-config")));
     }
 }

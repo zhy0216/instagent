@@ -67,8 +67,8 @@ impl ProviderRegistry {
     }
 
     /// [`Self::from_plugins`] 的路径层：`PLUGIN_DATA` 的数据根由参数给出
-    /// （约定同 `07` 的 `load_bundled_at`，测试不改写进程全局
-    /// `INSTAGENT_DATA_DIR`，避免与 `session.rs` 测试互踩）。
+    /// （约定同 `07` 的 `load_bundled_at`，测试不必改写进程全局
+    /// `INSTAGENT_DATA_DIR`；全 crate 测试共用 `config::lock_env` 一把锁）。
     pub(crate) fn from_plugins_at(
         plugins: &PluginSet,
         _config: &Config,
