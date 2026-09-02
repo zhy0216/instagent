@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "drafty": {
+      "command": "uvx",
+      "args": ["mcp-drafty"],
+      "env": { "A": "${PLUGIN_ROOT}/a" }
+    }
+  }
+}

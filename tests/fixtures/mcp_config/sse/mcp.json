@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "local": {
+      "type": "stdio",
+      "command": "srv"
+    },
+    "legacy": {
+      "type": "sse",
+      "url": "https://example.com/sse"
+    }
+  }
+}

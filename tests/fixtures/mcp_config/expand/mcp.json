@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "everything": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "${PLUGIN_ROOT}/server.js", "${PLUGIN_DATA}/cache", "${HOME}/keep-me"],
+      "env": {
+        "ROOT": "${PLUGIN_ROOT}",
+        "DATA_DIR": "${PLUGIN_DATA}/d",
+        "UNKNOWN": "${NOPE}x"
+      },
+      "cwd": "${PLUGIN_ROOT}"
+    },
+    "remote-docs": {
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": {}
+    }
+  }
+}

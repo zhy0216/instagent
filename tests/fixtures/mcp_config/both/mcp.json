@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "normative": {
+      "type": "stdio",
+      "command": "from-mcp-json"
+    }
+  }
+}

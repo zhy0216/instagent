@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "drafty": {
+      "command": "from-dot-mcp-json"
+    }
+  }
+}
