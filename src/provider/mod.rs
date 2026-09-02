@@ -1,6 +1,6 @@
 //! provider 层（第二版 §2.3；第三版 §2.4：provider 定义来自插件，内核只有引擎）。
 //!
-//! 类型布局由 00 锁定；TODO(08) 填 `context_limit_for` 等实现，
+//! 类型布局由 00 锁定；`context_limit_for` 由 08 实现，
 //! engine 实现在 [`openai`] / [`proxy`] / [`anthropic`]，装配在 [`registry`]。
 
 #[cfg(feature = "anthropic-engine")]
@@ -76,9 +76,60 @@ pub trait Provider: Send + Sync {
 }
 
 /// 模型名前缀小表 + 兜底 128k：claude 200k、gpt-4o 128k、gpt-4.1 1M、
-/// o 系列 200k、deepseek 128k、llama 128k（第二版 §2.3）。TODO(08)
-pub fn context_limit_for(_model: &str) -> u32 {
-    todo!("TODO(08)")
+/// o 系列 200k、deepseek 128k、llama 128k（第二版 §2.3）。
+/// 名字带 `provider/` 命名空间前缀时按最后一段匹配。
+pub fn context_limit_for(model: &str) -> u32 {
+    const K: u32 = 1024;
+    let m = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if m.starts_with("claude") {
+        200 * K
+    } else if m.starts_with("gpt-4.1") {
+        1024 * K
+    } else if m.starts_with("gpt-4o") {
+        128 * K
+    } else if is_o_series(&m) {
+        200 * K
+    } else {
+        // deepseek / llama 未列出的其余模型一律兜底 128k。
+        DEFAULT_CONTEXT_LIMIT
+    }
+}
+
+/// o 系列 = 首字符 `o` + 数字（o1 / o3 / o4-mini …）。
+fn is_o_series(m: &str) -> bool {
+    let mut chars = m.chars();
+    matches!(chars.next(), Some('o')) && chars.next().is_some_and(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_limit_prefix_table() {
+        const K: u32 = 1024;
+        assert_eq!(context_limit_for("claude-sonnet-4-5"), 200 * K);
+        assert_eq!(context_limit_for("gpt-4o-mini"), 128 * K);
+        assert_eq!(context_limit_for("gpt-4.1-nano"), 1024 * K);
+        assert_eq!(context_limit_for("o3"), 200 * K);
+        assert_eq!(context_limit_for("o1-preview"), 200 * K);
+        assert_eq!(context_limit_for("deepseek-chat"), DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(context_limit_for("llama3.1-70b"), DEFAULT_CONTEXT_LIMIT);
+    }
+
+    #[test]
+    fn context_limit_fallback_and_normalization() {
+        assert_eq!(context_limit_for("mistral-large"), DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(context_limit_for(""), DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(context_limit_for("openai/gpt-4o"), 128 * 1024);
+        assert_eq!(context_limit_for("GPT-4.1"), 1024 * 1024);
+        // "ollama" 之类 o 开头但非 o+数字，不误判为 o 系列。
+        assert_eq!(context_limit_for("ollama"), DEFAULT_CONTEXT_LIMIT);
+    }
 }
 
 /// `dev.instagent/providers/*.json` 的形状（第三版 §2.4；沿用 goose
