@@ -5,7 +5,8 @@
 //! `${PLUGIN_DATA}`，`${PORT}` 原样保留给 `11` 拉起时展开）。
 //! 按名字查找（K2）：重名报错并要求写成 `plugin/name`；用户插件覆盖 bundled。
 //! engine 分派：`openai` → `09`；`proxy` → `11` 的 [`ProxyProvider`]（拉起 +
-//! 就绪轮询）；`anthropic` 分支 `bail!` 占位（由 `12` 接上，勿删占位分支）。
+//! 就绪轮询）；`anthropic` 分支由 `12` 接上原生引擎（feature
+//! `anthropic-engine` 开时构造 `AnthropicProvider`，关时保留 `bail!` 占位）。
 //! `context_limit` 四级顺序：配置覆盖 → provider models 表 → `08` 前缀小表 → 128k。
 
 use std::collections::BTreeSet;
@@ -24,6 +25,8 @@ use crate::plugin::install::plugin_data_dir_at;
 use crate::plugin::PluginSet;
 use crate::plugin::PluginSource;
 use crate::plugin::NAMESPACE;
+#[cfg(feature = "anthropic-engine")]
+use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::context_limit_for;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::proxy::ProxyProvider;
@@ -120,12 +123,20 @@ impl ProviderRegistry {
                     .with_context(|| format!("provider `{}`", entry.qualified()))?;
                 Ok(Arc::new(provider))
             }
-            // TODO(12)：占位分支，cargo feature `anthropic-engine` 落地后替换。
+            // `12` 接线：feature 开时构造原生 Messages API 引擎；关时保留占位 bail
+            // （M3：默认构建不编译 anthropic 模块）。
             EngineKind::Anthropic => {
-                bail!(
-                    "provider `{}` uses engine `anthropic`, not implemented yet (todo 12)",
-                    entry.qualified()
-                )
+                #[cfg(feature = "anthropic-engine")]
+                {
+                    Ok(Arc::new(AnthropicProvider::new(&entry.def)?))
+                }
+                #[cfg(not(feature = "anthropic-engine"))]
+                {
+                    bail!(
+                        "provider `{}` uses engine `anthropic`, not implemented yet (todo 12)",
+                        entry.qualified()
+                    )
+                }
             }
         }
     }
@@ -547,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_dispatch_openai_and_proxy_build_then_anthropic_bail() {
+    async fn engine_dispatch_openai_proxy_and_anthropic() {
         let env = isolated();
         let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
         write_provider(
@@ -579,16 +590,19 @@ mod tests {
             "{err}"
         );
 
-        let err = registry
-            .get("anth")
-            .await
-            .map(drop)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("anthropic") && err.contains("todo 12"),
-            "{err}"
-        );
+        // 12 接线：feature 开时 anthropic 分支构造原生引擎实例；
+        // 关时保留占位 bail（M3 feature 隔离的另一半）。
+        let result = registry.get("anth").await;
+        if cfg!(feature = "anthropic-engine") {
+            let provider = result.expect("anthropic engine wired");
+            assert_eq!(provider.name(), "anth");
+        } else {
+            let err = result.map(drop).unwrap_err().to_string();
+            assert!(
+                err.contains("anthropic") && err.contains("todo 12"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

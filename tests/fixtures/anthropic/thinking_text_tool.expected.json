@@ -1,0 +1,11 @@
+[
+  { "kind": "text_delta", "text": "Let me search for that." },
+  { "kind": "tool_use_start", "id": "tool_1", "name": "search" },
+  { "kind": "tool_use_delta", "arguments": "{\"query\":\"rust\"}" },
+  { "kind": "tool_use_end" },
+  {
+    "kind": "done",
+    "usage": { "input": 8, "output": 15, "cache_read": 0, "cache_write": 0 },
+    "stop_reason": "tool_use"
+  }
+]

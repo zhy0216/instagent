@@ -1,0 +1,10 @@
+data: {"type":"message_start","message":{"id":"msg_noargs","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":3,"output_tokens":0}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_c","name":"ping","input":{}}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}
+
+data: {"type":"message_stop"}
+
