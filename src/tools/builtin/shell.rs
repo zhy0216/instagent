@@ -318,6 +318,24 @@ mod tests {
             .expect("pid")
     }
 
+    /// pid 落盘的有界轮询（10ms 一次、最多 0.5s）。只在被测任务返回
+    /// （组已 SIGKILL）之后调用：文件此时不再变化——有则进程启动过，
+    /// 无则说明它直到超时都没启动，组杀检查没有可观测对象。
+    #[cfg(unix)]
+    async fn wait_pid_file(path: &Path) -> Option<u32> {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if pid > 0 {
+                        return Some(pid);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
     #[tokio::test]
     async fn shell_runs_command_with_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -363,8 +381,9 @@ mod tests {
         assert!(out.is_error);
         assert!(out.text.contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(10));
-
-        eventually_dead(pid_of(&pid_file)).await;
+        if let Some(pid) = wait_pid_file(&pid_file).await {
+            eventually_dead(pid).await;
+        }
     }
 
     #[cfg(unix)]

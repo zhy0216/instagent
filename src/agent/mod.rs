@@ -3,8 +3,10 @@
 //! `assemble` / `run_turn` / `stream_assistant`；所有退出路径统一走
 //! `finish_turn` 补 ToolResult，保证 `02` 的会话不变量（§6 风险 2）；
 //! 取消用 `tokio::select!`。
-//! hooks 触发点（SessionStart/Stop 等）由 `17` 在本文件接线，对 `agent/mod.rs`
-//! 的修改仅限触发点。
+//! hooks 触发点（`17` 接线，§2.7）：UserPromptSubmit / PreToolUse /
+//! PostToolUse / Stop 在 `run_turn` 内；SessionStart / SessionEnd 走
+//! [`Agent::run_session_event`]，由 `18` 的会话生命周期调用。
+//! `hooks` 为 None 时行为与未接 hooks 完全一致。
 
 pub mod approval;
 pub mod compact;
@@ -22,7 +24,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::Mode;
+use crate::hooks::HookContext;
+use crate::hooks::HookDecision;
+use crate::hooks::HookEvent;
 use crate::hooks::Hooks;
+use crate::hooks::STOP_BLOCK_LIMIT;
 use crate::message::Content;
 use crate::message::Message;
 use crate::message::Role;
@@ -146,8 +152,16 @@ impl Agent {
         cancel: CancellationToken,
         events: mpsc::Sender<Event>,
     ) -> crate::Result<TurnResult> {
+        // hook 触发点（`17` §2.7）：UserPromptSubmit 不可阻止，决策忽略。
+        if let Some(hooks) = &self.hooks {
+            let ctx = HookContext::new(HookEvent::UserPromptSubmit, session.header.id.clone())
+                .with_message(text.clone())
+                .with_working_dir(session.header.cwd.clone());
+            let _ = hooks.run(&ctx).await;
+        }
         session.append(Message::user_text(text))?;
         let mut overflow_retried = false;
+        let mut stop_blocks = 0u32;
         for _ in 0..self.cfg.max_turns {
             if cancel.is_cancelled() {
                 return Ok(TurnResult::Interrupted);
@@ -192,6 +206,29 @@ impl Agent {
                 }
                 let output = match self.approval.decide(call).await {
                     Decision::Allow | Decision::AllowAlways => {
+                        // hook 触发点：PreToolUse 在审批之后、调用之前；
+                        // 阻止 → is_error 结果，工具不执行。
+                        if let Some(hooks) = &self.hooks {
+                            let hook_ctx =
+                                HookContext::new(HookEvent::PreToolUse, session.header.id.clone())
+                                    .with_tool(call.name.clone(), Some(call.input.clone()))
+                                    .with_working_dir(session.header.cwd.clone());
+                            if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
+                                let text = format!("blocked by PreToolUse hook: {reason}");
+                                Self::emit(
+                                    &events,
+                                    Event::ToolDone {
+                                        id: call.id.clone(),
+                                        preview: text.clone(),
+                                        is_error: true,
+                                        elapsed_ms: 0,
+                                    },
+                                )
+                                .await;
+                                results.push(Content::tool_result(call, ToolOutput::err(text)));
+                                continue;
+                            }
+                        }
                         Self::emit(
                             &events,
                             Event::ToolStart {
@@ -217,6 +254,15 @@ impl Agent {
                             },
                         )
                         .await;
+                        // hook 触发点：PostToolUse 观察事件，决策忽略。
+                        if let Some(hooks) = &self.hooks {
+                            let hook_ctx =
+                                HookContext::new(HookEvent::PostToolUse, session.header.id.clone())
+                                    .with_tool(call.name.clone(), Some(call.input.clone()))
+                                    .with_tool_output(output.text.clone())
+                                    .with_working_dir(session.header.cwd.clone());
+                            let _ = hooks.run(&hook_ctx).await;
+                        }
                         output
                     }
                     Decision::Deny(reason) => {
@@ -236,6 +282,13 @@ impl Agent {
                 results.push(Content::tool_result(call, output));
             }
 
+            // Stop hook 载荷要带助手文本；finish_turn 会 move 掉消息，先取。
+            let last_assistant = if self.hooks.is_some() {
+                assistant_text(&streamed.message)
+            } else {
+                String::new()
+            };
+
             // 所有退出路径统一落盘：assistant 与答复它的 user 消息一起写，
             // 保证 02 的会话不变量。
             finish_turn(session, streamed.message, results)?;
@@ -244,10 +297,47 @@ impl Agent {
                 return Ok(TurnResult::Interrupted);
             }
             if calls.is_empty() {
+                // hook 触发点：Stop 被阻止 → 注入提醒 user 消息、本轮继续跑；
+                // 连续阻止超上限（默认 8）强制结束，防死循环（§2.7）。
+                if let Some(hooks) = &self.hooks {
+                    let hook_ctx = HookContext::new(HookEvent::Stop, session.header.id.clone())
+                        .with_message(last_assistant)
+                        .with_working_dir(session.header.cwd.clone());
+                    if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
+                        stop_blocks += 1;
+                        if stop_blocks > STOP_BLOCK_LIMIT {
+                            tracing::warn!(
+                                "Stop hook 连续阻止 {stop_blocks} 次（上限 {STOP_BLOCK_LIMIT}），\
+                                 强制结束本轮"
+                            );
+                            return Ok(TurnResult::Done);
+                        }
+                        session.append(Message::user_text(format!(
+                            "Stop hook blocked ending this turn:\n\n{reason}\n\n\
+                             Address this policy hook denial before trying to stop again."
+                        )))?;
+                        continue;
+                    }
+                }
                 return Ok(TurnResult::Done);
             }
         }
         Ok(TurnResult::MaxTurns)
+    }
+
+    /// hook 触发点入口：SessionStart / SessionEnd 由 `18` 的会话生命周期
+    /// 调用（不可阻止事件，调用方忽略决策即可）。无 hooks 时直接 Allow。
+    pub async fn run_session_event(
+        &self,
+        event: HookEvent,
+        session: &Session,
+    ) -> crate::Result<HookDecision> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(HookDecision::Allow);
+        };
+        let ctx = HookContext::new(event, session.header.id.clone())
+            .with_working_dir(session.header.cwd.clone());
+        Ok(hooks.run(&ctx).await)
     }
 
     /// StreamEvent 折叠成一条 assistant Message，同时转发 TextDelta；
@@ -358,6 +448,19 @@ impl Agent {
     pub(crate) async fn emit(events: &mpsc::Sender<Event>, event: Event) {
         let _ = events.send(event).await;
     }
+}
+
+/// assistant 消息的全部文本拼接（Stop hook 的 last message）。
+fn assistant_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Content::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn flush_text(blocks: &mut Vec<Content>, text: &mut String) {
@@ -1030,5 +1133,206 @@ mod tests {
             .err()
             .expect("missing model must bail");
         assert!(err.to_string().contains("config.model"), "{err}");
+    }
+
+    // ---- hooks 触发点（`17`） ----
+
+    /// 造一个 hooks 插件：每个事件一个独立脚本（走 ${PLUGIN_ROOT} 展开）。
+    fn hook_fixture(dir: &Path, event_scripts: &[(&str, &str)]) -> Hooks {
+        use crate::plugin::manifest::PLUGIN_SCHEMA_URL;
+        use crate::plugin::Plugin;
+        use crate::plugin::PluginSet;
+        use crate::plugin::PluginSource;
+        use crate::plugin::NAMESPACE;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = dir.join("hookplug");
+        std::fs::create_dir_all(root.join(NAMESPACE)).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            format!(r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"hookplug","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        let mut groups = String::new();
+        for (index, (event, body)) in event_scripts.iter().enumerate() {
+            let script = root.join(format!("hook-{index}.sh"));
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if !groups.is_empty() {
+                groups.push(',');
+            }
+            groups.push_str(&format!(
+                r#""{event}":[{{"hooks":[{{"command":"${{PLUGIN_ROOT}}/hook-{index}.sh"}}]}}]"#
+            ));
+        }
+        std::fs::write(
+            root.join(NAMESPACE).join("hooks.json"),
+            format!(r#"{{"hooks":{{{groups}}}}}"#),
+        )
+        .unwrap();
+
+        let mut set = PluginSet::default();
+        set.plugins.push(Plugin {
+            manifest: crate::plugin::manifest::read_manifest(&root)
+                .unwrap()
+                .manifest,
+            root,
+            source: PluginSource::Extra,
+        });
+        Hooks::load(&set).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stop_hook_block_nudges_until_cap_then_forces_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = hook_fixture(dir.path(), &[("Stop", "echo keep going >&2\nexit 2")]);
+        let steps: Vec<Scripted> = (0..=STOP_BLOCK_LIMIT)
+            .map(|i| scripted(vec![StreamEvent::TextDelta(format!("a{i}")), done(1, 1)]))
+            .collect();
+        let provider = MockProvider::new(steps);
+        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        agent.hooks = Some(Arc::new(hooks));
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        // 前 8 次阻止各注入一条 nudge（cap=8），第 9 次超上限强制结束。
+        assert_eq!(provider.calls() as u32, STOP_BLOCK_LIMIT + 1);
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(
+            session.messages.len(),
+            1 + 2 * STOP_BLOCK_LIMIT as usize + 1
+        );
+        assert_eq!(first_text(&session.messages[2]), "Stop hook blocked ending this turn:\n\n[hookplug] keep going\n\nAddress this policy hook denial before trying to stop again.");
+        assert_eq!(first_text(&session.messages[17]), "a8");
+    }
+
+    #[tokio::test]
+    async fn stop_hook_allow_ends_turn_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = hook_fixture(dir.path(), &[("Stop", "true")]);
+        let provider = MockProvider::new(vec![scripted(vec![
+            StreamEvent::TextDelta("finished".into()),
+            done(1, 1),
+        ])]);
+        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        agent.hooks = Some(Arc::new(hooks));
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_block_is_error_result_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = hook_fixture(dir.path(), &[("PreToolUse", "echo no sudo >&2\nexit 2")]);
+        let provider = MockProvider::new(vec![
+            scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
+            scripted(vec![StreamEvent::TextDelta("ok".into()), done(1, 1)]),
+        ]);
+        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        agent.hooks = Some(Arc::new(hooks));
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "run it").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert!(results[0].2, "阻止必须是 is_error");
+        assert!(
+            results[0]
+                .1
+                .contains("blocked by PreToolUse hook: [hookplug] no sudo"),
+            "{}",
+            results[0].1
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ToolStart { .. })),
+            "被阻止的工具不该执行"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolDone { is_error: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn prompt_and_post_tool_events_observe_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hookplug").join("payloads");
+        std::fs::create_dir_all(&out).unwrap();
+        // UserPromptSubmit + PostToolUse 各把 stdin 载荷落到独立文件。
+        let hooks = hook_fixture(
+            dir.path(),
+            &[
+                (
+                    "UserPromptSubmit",
+                    "cat > \"$PLUGIN_ROOT/payloads/prompt.json\"",
+                ),
+                ("PostToolUse", "cat >> \"$PLUGIN_ROOT/payloads/post.json\""),
+            ],
+        );
+        let provider = MockProvider::new(vec![
+            scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(1, 1)]),
+        ]);
+        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        agent.hooks = Some(Arc::new(hooks));
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "hello hooks").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        assert_eq!(session.messages.len(), 4);
+
+        let prompt: Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("prompt.json")).unwrap())
+                .unwrap();
+        assert_eq!(prompt["event"], "UserPromptSubmit");
+        assert_eq!(prompt["message"], "hello hooks");
+        assert_eq!(prompt["session_id"], "test");
+        let post: Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("post.json")).unwrap()).unwrap();
+        assert_eq!(post["event"], "PostToolUse");
+        assert_eq!(post["tool_name"], "shell");
+        assert_eq!(post["tool_input"]["command"], "echo hi");
+        assert!(post["tool_output"].as_str().unwrap().contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_entry_runs_and_cannot_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let hooks = hook_fixture(
+            dir.path(),
+            &[(
+                "SessionStart",
+                &format!("touch {}\nexit 2", marker.display()),
+            )],
+        );
+        let provider = MockProvider::new(vec![]);
+        let mut hooked = agent(provider, Mode::Auto, 100_000, auto());
+        hooked.hooks = Some(Arc::new(hooks));
+        let session = temp_session(dir.path());
+
+        // 不可阻止事件：exit 2 也只观察，返回 Allow。
+        let decision = hooked
+            .run_session_event(HookEvent::SessionStart, &session)
+            .await
+            .unwrap();
+        assert_eq!(decision, HookDecision::Allow);
+        assert!(marker.exists(), "SessionStart 脚本应被执行");
+
+        // 无 hooks 的 Agent：入口直接 Allow、不报错。
+        let plain = agent(MockProvider::new(vec![]), Mode::Auto, 100_000, auto());
+        assert_eq!(
+            plain
+                .run_session_event(HookEvent::SessionEnd, &session)
+                .await
+                .unwrap(),
+            HookDecision::Allow
+        );
     }
 }

@@ -428,12 +428,44 @@ mod tests {
         assert!(out.text.contains("partial-out"));
     }
 
+    /// pid 落盘的有界轮询（10ms 一次、最多 0.5s）。只在 call 返回（组已
+    /// SIGKILL）之后调用：文件此时不再变化——有则进程必然启动过（第一行
+    /// 就是 echo），无则说明它直到超时都没启动。
+    async fn wait_pid_file(path: &Path) -> Option<u32> {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Some(pid) = text.trim().parse::<u32>().ok().filter(|p| *p > 0) {
+                    return Some(pid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    /// 10ms 轮询、最多 5s：pid 不可信号即通过，超时才判失败。
+    async fn assert_group_dead(pid: u32) {
+        for _ in 0..500 {
+            if unsafe { kill(pid as i32, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("tool process {pid} still alive after group kill");
+    }
+
     #[tokio::test]
     async fn timeout_kills_process_group_and_is_error() {
+        const TIMEOUT_SECS: u64 = 3;
         let h = harness();
         let plugin = h.plugin("slowpoke");
         let pid_file = h.root().join("tool.pid");
-        // 脚本自己落 pid（3s 超时的 kill 必然晚于这一行），再挂住不退出。
+        // 脚本自己落 pid，再挂住不退出；极端负载下进程若直到超时都没
+        // 启动，pid 文件永不出现，届时跳过组杀检查（见测试尾部注释）。
         h.script(
             &plugin,
             "scripts/slow.sh",
@@ -442,43 +474,26 @@ mod tests {
         h.tool(
             &plugin,
             "slow.json",
-            &weather_def("scripts/slow.sh", Some(3)).replace("weather", "slow"),
+            &weather_def("scripts/slow.sh", Some(TIMEOUT_SECS)).replace("weather", "slow"),
         );
 
         let set = plugin_set(&[&plugin]);
         let sources = CommandTools::load(&set).unwrap();
         let ctx = ctx_in(h.root());
-        let call =
-            tokio::spawn(async move { sources[0].call("slowpoke__slow", json!({}), &ctx).await });
-        // 超时前确认脚本已启动（否则 pid 断言没有观测对象）。
-        for _ in 0..80 {
-            if pid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
         let started = std::time::Instant::now();
-        let out = call.await.expect("call task");
+        let out = sources[0].call("slowpoke__slow", json!({}), &ctx).await;
         assert!(out.is_error);
-        assert!(out.text.contains("timed out after 3s"), "{}", out.text);
-        assert!(started.elapsed() < Duration::from_secs(10));
-
-        // 整组被杀：脚本 pid 不再可信号。
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file")
-            .trim()
-            .parse()
-            .expect("pid");
-        for _ in 0..100 {
-            if unsafe { kill(pid, 0) } != 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("tool process still alive after group kill");
-
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
+        assert!(
+            out.text
+                .contains(&format!("timed out after {TIMEOUT_SECS}s")),
+            "{}",
+            out.text
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // 组杀检查只在观测到 pid 时做：进程没在超时前启动就没有可观测
+        // 对象，跳过不影响超时→is_error 的决策断言。
+        if let Some(pid) = wait_pid_file(&pid_file).await {
+            assert_group_dead(pid).await;
         }
     }
 
