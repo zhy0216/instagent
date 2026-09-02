@@ -1,0 +1,47 @@
+[package]
+name = "instagent"
+version = "0.1.0"
+edition = "2021"
+description = "插件为核心的最小 agent（Rust 从零实现）"
+
+[features]
+default = []
+# Anthropic 原生 Messages API engine（todos/12），默认不编译（第三版 §2.4）。
+anthropic-engine = []
+
+# 依赖清单在 todos/00 一次性锁定，后续任务不加依赖、不升级依赖。
+# 版本基准：第二版 §3 + 第三版 §4；rmcp 版本取 goose 根 Cargo.toml workspace 值（4ad43df）。
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+etcetera = "0.11"
+futures = "0.3"
+ignore = "0.4"
+include_dir = "0.7"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+rmcp = { version = "3.0.0", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    # 14 的 StreamableHttpClientTransport::from_uri 需要 reqwest 实现（rmcp 3.x 拆出的子 feature）
+    "transport-streamable-http-client-reqwest",
+] }
+rustyline = "18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+shellexpand = "3"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

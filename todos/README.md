@@ -47,7 +47,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 
 | 优先级 | 文件 | 说明 |
 |---|---|---|
-| P0 | 00-skeleton.md | Cargo 工程 + 完整模块树空壳 + 依赖锁定 |
+| P0 | done/00-skeleton.md ✅ | Cargo 工程 + 完整模块树空壳 + 依赖锁定 |
 | P1 | 01-config-settings.md, 02-message-session.md, 03-subprocess.md | 内核基础件 |
 | P1 | 04-plugin-manifest.md, 05-plugin-discovery.md, 06-plugin-mcp-config.md, 07-plugin-install-bundled.md | 插件加载 |
 | P1 | 08-provider-core-http.md, 09-provider-openai.md | provider 主路径 |
@@ -61,7 +61,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 
 按数字前缀升序；"依赖"指必须先合并的任务。
 
-1. [00-skeleton.md](00-skeleton.md) — 依赖：无。串行第一个。
+1. [done/00-skeleton.md](done/00-skeleton.md) — ✅ 完成。依赖：无。串行第一个。
 2. [01-config-settings.md](01-config-settings.md) — 依赖：00
 3. [02-message-session.md](02-message-session.md) — 依赖：00
 4. [03-subprocess.md](03-subprocess.md) — 依赖：00
