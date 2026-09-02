@@ -183,9 +183,8 @@ pub fn sessions_list_rows() -> instagent::Result<Vec<String>> {
         let created = chrono::DateTime::from_timestamp(header.created, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| header.created.to_string());
-        let name = header.name.as_deref().unwrap_or("-");
         rows.push(format!(
-            "{:>3}. {}  {created}  {}/{}  cwd={}  name={name}",
+            "{:>3}. {}  {created}  {}/{}  cwd={}",
             index + 1,
             header.id,
             header.provider,

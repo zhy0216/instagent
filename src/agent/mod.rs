@@ -702,7 +702,6 @@ mod tests {
             cwd: dir.to_path_buf(),
             provider: "mock".into(),
             model: "mock-model".into(),
-            name: None,
         };
         let path = dir.join("test.jsonl");
         std::fs::write(

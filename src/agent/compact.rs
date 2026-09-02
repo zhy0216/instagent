@@ -344,7 +344,6 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 provider: "mock".into(),
                 model: "m".into(),
-                name: None,
             },
             messages: vec![
                 Message::user_text("first".into()),

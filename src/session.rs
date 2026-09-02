@@ -36,7 +36,6 @@ pub struct SessionHeader {
     pub cwd: PathBuf,
     pub provider: String,
     pub model: String,
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +81,6 @@ impl Session {
             cwd: cwd.to_path_buf(),
             provider: provider.to_string(),
             model: model.to_string(),
-            name: None,
         };
         let path = dir.join(format!("{}.{}", header.id, JSONL_EXT));
         let mut file = File::create(&path)
@@ -96,7 +94,9 @@ impl Session {
         })
     }
 
-    /// 全量读回，并跑 `message::validate`。坏行报错带行号（header 为第 1 行）。
+    /// 全量读回。header（第 1 行）损坏直接报错带行号；正文按"合法前缀"恢复：
+    /// 遇到坏行即截断，再回退到最近一条满足 `message::validate` 的前缀，
+    /// 丢弃行数向 stderr 警告；只剩 header 时按空会话打开。
     pub fn resume(id: &str) -> crate::Result<Session> {
         let path = Self::sessions_dir()?.join(format!("{id}.{JSONL_EXT}"));
         let file =
@@ -106,14 +106,6 @@ impl Session {
             let raw = next_line(&mut lines, &path, 1)?;
             parse_line(&raw, &path, 1)?
         };
-        let mut messages = Vec::new();
-        let mut num = 2usize;
-        while let Some(raw) = opt_line(&mut lines, &path, num)? {
-            if !raw.trim().is_empty() {
-                messages.push(parse_line(&raw, &path, num)?);
-            }
-            num += 1;
-        }
         if header.id != id {
             bail!(
                 "session {}: header id {:?} != requested {id:?}",
@@ -121,7 +113,20 @@ impl Session {
                 header.id
             );
         }
-        message::validate(&messages).with_context(|| format!("validate session {id}"))?;
+        let mut raws = Vec::new();
+        let mut num = 2usize;
+        while let Some(raw) = opt_line(&mut lines, &path, num)? {
+            raws.push(raw);
+            num += 1;
+        }
+        let (messages, dropped) = salvage(&raws);
+        if dropped > 0 {
+            eprintln!(
+                "warning: session {}: dropped {dropped} unrecoverable line(s), kept {} message(s)",
+                path.display(),
+                messages.len()
+            );
+        }
         Ok(Session {
             header,
             messages,
@@ -129,7 +134,7 @@ impl Session {
         })
     }
 
-    /// `id` 为 None 新建；Some("last") 取最近（按文件 mtime）；否则按 id。TODO(`18`) 接线
+    /// `id` 为 None 新建；Some("last") 取最近（按文件 mtime）；否则按 id。
     pub fn open_or_resume(
         id: Option<&str>,
         cwd: &Path,
@@ -196,12 +201,21 @@ impl Session {
         fs::remove_file(&path).with_context(|| format!("remove session file {}", path.display()))
     }
 
-    /// 压缩用原子重写（`16` 调用）：header + 新内容写临时文件，旧文件改名
-    /// `<id>.<n>.bak.jsonl` 留着排错，再把临时文件 rename 到位。
+    /// 压缩用原子重写（`16` 调用）：header + 新内容写**随机后缀**临时文件并
+    /// sync，把旧主文件**复制**为 `<id>.<n>.bak.jsonl` 留着排错（best-effort，
+    /// 失败只警告），最后 rename 临时文件覆盖主文件。不变量：主文件任何时刻
+    /// 要么是旧内容要么是新内容，绝不缺失（不再有两次 rename 之间的窗口）。
     pub fn rewrite(&mut self, messages: Vec<Message>) -> crate::Result<()> {
         message::validate(&messages)
             .with_context(|| format!("validate rewritten session {}", self.header.id))?;
-        let tmp_path = self.path.with_extension(format!("{JSONL_EXT}.tmp"));
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
+        let tmp_path = self
+            .path
+            .with_file_name(format!("{stem}.{}.jsonl.tmp", Uuid::new_v4()));
         {
             let mut file = File::create(&tmp_path)
                 .with_context(|| format!("create temp file {}", tmp_path.display()))?;
@@ -213,13 +227,13 @@ impl Session {
             file.sync_all()?;
         }
         let bak = backup_path(&self.path);
-        fs::rename(&self.path, &bak).with_context(|| {
-            format!(
-                "move old session {} to {}",
-                self.path.display(),
+        if let Err(err) = fs::copy(&self.path, &bak) {
+            tracing::warn!(
+                "session {}: backup copy to {} failed: {err}",
+                self.header.id,
                 bak.display()
-            )
-        })?;
+            );
+        }
         fs::rename(&tmp_path, &self.path).with_context(|| {
             format!(
                 "move new session {} to {}",
@@ -304,6 +318,31 @@ where
 {
     serde_json::from_str(raw)
         .with_context(|| format!("invalid JSON at line {num} of {}: {raw}", path.display()))
+}
+
+/// 从正文行（header 之后）恢复最长合法前缀：第一条坏行即截断，再回退到满足
+/// `message::validate` 的前缀（如尾部 tool_use 缺结果）。返回（消息，丢弃行数）。
+/// ponytail: 回退是 O(n²) 全量 validate；会话规模几百条，够用。
+fn salvage(raws: &[String]) -> (Vec<Message>, usize) {
+    let mut messages = Vec::new();
+    let mut dropped = 0usize;
+    for (index, raw) in raws.iter().enumerate() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Message>(raw) {
+            Ok(message) => messages.push(message),
+            Err(_) => {
+                dropped = raws.len() - index;
+                break;
+            }
+        }
+    }
+    while !messages.is_empty() && message::validate(&messages).is_err() {
+        messages.pop();
+        dropped += 1;
+    }
+    (messages, dropped)
 }
 
 #[cfg(test)]
@@ -397,6 +436,7 @@ mod tests {
         session
             .append(Message::assistant(vec![Content::Text("two".into())], None))
             .unwrap();
+        let old_raw = fs::read_to_string(&session.path).unwrap();
 
         let summary = msg(
             Role::User,
@@ -409,9 +449,7 @@ mod tests {
             .join(SESSIONS_SUBDIR)
             .join(format!("{}.1.bak.jsonl", session.header.id));
         assert!(bak.exists(), "expected {bak:?}");
-        let bak_raw = fs::read_to_string(&bak).unwrap();
-        assert!(bak_raw.contains("one"));
-        assert!(bak_raw.contains("two"));
+        assert_eq!(fs::read_to_string(&bak).unwrap(), old_raw);
 
         let resumed = Session::resume(&session.header.id).unwrap();
         assert_eq!(resumed.messages.len(), 1);
@@ -423,43 +461,126 @@ mod tests {
             .join(SESSIONS_SUBDIR)
             .join(format!("{}.2.bak.jsonl", session.header.id));
         assert!(bak2.exists());
-        // 备份文件不出现在 list 里
+        // 备份与随机后缀临时文件都不出现在 list 里；rewrite 成功后无 tmp 残留。
         assert_eq!(Session::list().unwrap().len(), 1);
+        let leftovers: Vec<String> = fs::read_dir(dir.path().join(SESSIONS_SUBDIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
-    fn bad_line_reports_line_number() {
+    fn rewrite_survives_backup_copy_failure_without_losing_main() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        session.append(msg(Role::User, "one")).unwrap();
+        // 主文件不可读 → bak 复制失败（步骤在 rename 之前，非致命），主文件全程存在。
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0o000)).unwrap();
+        session.rewrite(vec![msg(Role::User, "new")]).unwrap();
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0o644)).unwrap();
+        let resumed = Session::resume(&session.header.id).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(text_of(&resumed.messages[0]), "new");
+    }
+
+    #[test]
+    fn broken_header_reports_line_number() {
         let (dir, _guard) = temp_data_dir();
         let session = sample_session(&dir);
-        fs::write(
-            &session.path,
-            format!(
-                "{}\nnot-json\n",
-                serde_json::to_string(&session.header).unwrap()
-            ),
-        )
-        .unwrap();
-        let err = Session::resume(&session.header.id).unwrap_err().to_string();
-        assert!(err.contains("line 2"), "{err}");
-
         fs::write(&session.path, "{ broken header\n").unwrap();
         let err = Session::resume(&session.header.id).unwrap_err().to_string();
         assert!(err.contains("line 1"), "{err}");
     }
 
     #[test]
-    fn resume_rejects_broken_invariants_and_remove_deletes() {
+    fn salvage_counts_truncation_and_backtrack() {
+        let good = serde_json::to_string(&msg(Role::User, "hi")).unwrap();
+        // 坏行截断：坏行及其后的行全部计入丢弃。
+        let (messages, dropped) = salvage(&[good.clone(), "not json".into(), good.clone()]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(dropped, 2);
+        // 尾部 tool_use 无结果（合法 JSON、违反不变量 2）：回退到合法前缀。
+        let orphan = Message::assistant(
+            vec![Content::ToolUse {
+                id: "t1".into(),
+                name: "shell".into(),
+                input: serde_json::json!({}),
+            }],
+            None,
+        );
+        let (messages, dropped) = salvage(&[good.clone(), serde_json::to_string(&orphan).unwrap()]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(dropped, 1);
+        // 全坏正文：只剩 header。
+        let (messages, dropped) = salvage(&["nope".into(), "{".into()]);
+        assert!(messages.is_empty());
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn resume_salvages_corrupt_tail() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        session.append(msg(Role::User, "hi")).unwrap();
+        session
+            .append(Message::assistant(vec![Content::Text("yo".into())], None))
+            .unwrap();
+        let good_raw = fs::read_to_string(&session.path).unwrap();
+
+        // 尾部追加手写坏行：resume 成功且保留合法前缀。
+        fs::write(&session.path, format!("{good_raw}garbage-not-json\n")).unwrap();
+        let resumed = Session::resume(&session.header.id).unwrap();
+        assert_eq!(resumed.messages.len(), 2);
+        assert_eq!(text_of(&resumed.messages[1]), "yo");
+
+        // 正文全坏：按空会话打开。
+        fs::write(
+            &session.path,
+            format!(
+                "{}\nnope\n",
+                serde_json::to_string(&session.header).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(Session::resume(&session.header.id)
+            .unwrap()
+            .messages
+            .is_empty());
+    }
+
+    #[test]
+    fn resume_backtracks_broken_invariants_and_remove_deletes() {
         let (dir, _guard) = temp_data_dir();
         let mut session = sample_session(&dir);
         session.append(msg(Role::User, "a")).unwrap();
         session.append(msg(Role::User, "b")).unwrap();
-        let err = Session::resume(&session.header.id).unwrap_err();
-        assert!(
-            err.to_string().contains("invariant 1") || format!("{err:#}").contains("invariant 1"),
-            "{err:#}"
-        );
+        // 违反不变量 1 的尾部回退掉，保留合法前缀。
+        let resumed = Session::resume(&session.header.id).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(text_of(&resumed.messages[0]), "a");
         Session::remove(&session.header.id).unwrap();
         assert!(!session.path.exists());
         assert!(Session::remove(&session.header.id).is_err());
+    }
+
+    #[test]
+    fn resume_ignores_legacy_name_field() {
+        let (dir, _guard) = temp_data_dir();
+        let session = sample_session(&dir);
+        let mut legacy = serde_json::to_value(&session.header).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("name".into(), serde_json::json!("legacy-name"));
+        fs::write(
+            &session.path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+        let resumed = Session::resume(&session.header.id).unwrap();
+        assert_eq!(resumed.header, session.header);
     }
 }
