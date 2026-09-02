@@ -22,14 +22,14 @@ use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
+use crate::subprocess::drain;
+use crate::subprocess::read_all;
 use crate::subprocess::ProcessGroupChild;
 
 /// 默认超时 30s（§2.7）。
@@ -471,8 +471,6 @@ fn hook_command(
     cmd
 }
 
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
 /// 跑一条 command hook：载荷写 stdin，超时 drop [`ProcessGroupChild`]
 /// 杀整个进程组（`03`），stdout/stderr 独立排空。
 async fn run_hook(
@@ -504,10 +502,10 @@ async fn run_hook(
             let _ = stdin.shutdown().await;
         });
     }
-    let stdout_task = tokio::spawn(read_all(
+    let mut stdout_task = tokio::spawn(read_all(
         child.child_mut().stdout.take().expect("stdout piped"),
     ));
-    let stderr_task = tokio::spawn(read_all(
+    let mut stderr_task = tokio::spawn(read_all(
         child.child_mut().stderr.take().expect("stderr piped"),
     ));
 
@@ -523,8 +521,8 @@ async fn run_hook(
     if timed_out {
         drop(child); // 进程组守卫：SIGKILL 整组（含孙进程）
     }
-    let stdout = drain(stdout_task).await;
-    let stderr = drain(stderr_task).await;
+    let stdout = drain(&mut stdout_task).await;
+    let stderr = drain(&mut stderr_task).await;
     if timed_out {
         tracing::warn!(
             "hook `{}` 超时 {timeout:?}，按 on_failure 处理",
@@ -533,24 +531,6 @@ async fn run_hook(
         return no_decision(on_failure, "the hook timed out without a decision");
     }
     parse_decision(&stdout, &stderr, exit_code, on_failure)
-}
-
-async fn drain(handle: JoinHandle<String>) -> String {
-    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, handle).await {
-        Ok(Ok(text)) => text,
-        _ => String::new(),
-    }
-}
-
-async fn read_all<R>(mut reader: R) -> String
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let mut buf = Vec::new();
-    if reader.read_to_end(&mut buf).await.is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]

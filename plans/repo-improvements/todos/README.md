@@ -10,7 +10,7 @@
 | `01-quick-fixes.md` ✅ done | P2 | easy | 死代码、过期文案、README 安装命令修正 |
 | `02-builtin-tools-hardening.md` | P1 | medium | fs/tree/shell 原子写、符号链接、流式读、权限 |
 | `done/03-session-robustness.md` ✅ | P1 | medium | rewrite 崩溃窗口、坏行 salvage、半死字段 |
-| `04-subprocess-io-dedup.md` | P1 | medium | hooks/command 双份进程输出模板收敛 |
+| `done/04-subprocess-io-dedup.md` ✅ | P1 | medium | hooks/command 双份进程输出模板收敛 |
 | `05-agent-run-turn-extract.md` | P1 | medium | run_turn 工具执行段抽函数 |
 | `06-provider-shared-stream.md` | P1 | hard | openai/anthropic 共享 SSE 流驱动层 |
 | `07-cli-confirm-parse.md` | P1 | medium | 审批输入解析抽纯函数 + 单测 |
@@ -22,7 +22,7 @@
 1. `01-quick-fixes.md` — 依赖：无
 2. `02-builtin-tools-hardening.md` — 依赖：无
 3. [done/03-session-robustness.md](done/03-session-robustness.md) — ✅ 完成。依赖：无
-4. `04-subprocess-io-dedup.md` — 依赖：无
+4. `done/04-subprocess-io-dedup.md` — ✅ 完成。依赖：无
 5. `05-agent-run-turn-extract.md` — 依赖：无
 6. `06-provider-shared-stream.md` — 依赖：无
 7. `07-cli-confirm-parse.md` — 依赖：无

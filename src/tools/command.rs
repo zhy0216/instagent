@@ -16,14 +16,14 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
+use crate::subprocess::drain;
+use crate::subprocess::read_all;
 use crate::subprocess::ProcessGroupChild;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
@@ -33,8 +33,6 @@ use crate::tools::NAME_SEP;
 
 /// `timeout_secs` 缺省值。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// 进程退出后给输出管道最多 500ms 收尾（同 builtin shell）。
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 单个 command tool 定义。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,16 +144,6 @@ fn expand_plugin_root(command: &str, plugin_root: &Path) -> String {
     command.replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
 }
 
-async fn drain(mut handle: JoinHandle<String>) -> String {
-    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut handle).await {
-        Ok(Ok(text)) => text,
-        _ => {
-            handle.abort();
-            String::new()
-        }
-    }
-}
-
 enum Outcome {
     Exited(Option<i32>),
     TimedOut,
@@ -212,8 +200,8 @@ impl ToolSource for CommandTools {
 
         let stdout_pipe = child.child_mut().stdout.take().expect("stdout piped");
         let stderr_pipe = child.child_mut().stderr.take().expect("stderr piped");
-        let stdout_task = tokio::spawn(read_all(stdout_pipe));
-        let stderr_task = tokio::spawn(read_all(stderr_pipe));
+        let mut stdout_task = tokio::spawn(read_all(stdout_pipe));
+        let mut stderr_task = tokio::spawn(read_all(stderr_pipe));
 
         let timeout = Duration::from_secs(def.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
         let outcome = {
@@ -230,8 +218,8 @@ impl ToolSource for CommandTools {
             drop(child);
         }
 
-        let stdout = drain(stdout_task).await;
-        let stderr = drain(stderr_task).await;
+        let stdout = drain(&mut stdout_task).await;
+        let stderr = drain(&mut stderr_task).await;
 
         let (exit_code, note) = match outcome {
             Outcome::Exited(code) => (code, String::new()),
@@ -259,17 +247,6 @@ impl ToolSource for CommandTools {
             ToolOutput::ok(text)
         }
     }
-}
-
-async fn read_all<R>(mut reader: R) -> String
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let mut buf = Vec::new();
-    if reader.read_to_end(&mut buf).await.is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]

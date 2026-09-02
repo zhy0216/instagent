@@ -8,10 +8,13 @@
 //! 弥补 tokio / rmcp 只杀直接子进程的缺口。shell / MCP stdio / hooks / proxy 都复用这里。
 
 use std::io;
+use std::time::Duration;
 
 use rmcp::transport::TokioChildProcess;
+use tokio::io::AsyncReadExt;
 use tokio::process::ChildStderr;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 #[cfg(target_os = "linux")]
 use std::sync::{mpsc, OnceLock};
@@ -186,6 +189,32 @@ pub fn git_command() -> std::process::Command {
     command
 }
 
+/// 进程退出 / 被杀后给输出管道最多 500ms 收尾（同 builtin shell）。
+pub(crate) const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 读子进程流到 EOF（lossy UTF-8），读失败返回空串。
+pub(crate) async fn read_all<R>(mut reader: R) -> String
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut buf = Vec::new();
+    if reader.read_to_end(&mut buf).await.is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 进程组 kill 后的限时残留输出收集：超时则 abort 读取任务并返回空串。
+pub(crate) async fn drain(handle: &mut JoinHandle<String>) -> String {
+    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *handle).await {
+        Ok(Ok(text)) => text,
+        _ => {
+            handle.abort();
+            String::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +305,24 @@ mod tests {
         drop(child);
 
         eventually("mcp subprocess gone", || !signalable(pid)).await;
+    }
+
+    #[tokio::test]
+    async fn read_all_collects_until_eof() {
+        assert_eq!(read_all(&b"hello hooks"[..]).await, "hello hooks");
+    }
+
+    #[tokio::test]
+    async fn drain_returns_text_on_time_and_gives_up_on_timeout() {
+        let mut done = tokio::spawn(async { "text".to_string() });
+        assert_eq!(drain(&mut done).await, "text");
+
+        let mut stalled = tokio::spawn(async { std::future::pending::<String>().await });
+        let started = std::time::Instant::now();
+        assert_eq!(drain(&mut stalled).await, "");
+        assert!(started.elapsed() >= OUTPUT_DRAIN_TIMEOUT);
+        let err = stalled.await.unwrap_err();
+        assert!(err.is_cancelled(), "stalled read task must be aborted");
     }
 
     #[test]
