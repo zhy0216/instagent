@@ -39,6 +39,7 @@ use crate::provider::Request;
 use crate::provider::StreamEvent;
 use crate::session::Session;
 use crate::tools::Registry;
+use crate::tools::ToolCall;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
 use crate::ProviderError;
@@ -154,9 +155,7 @@ impl Agent {
     ) -> crate::Result<TurnResult> {
         // hook 触发点（`17` §2.7）：UserPromptSubmit 不可阻止，决策忽略。
         if let Some(hooks) = &self.hooks {
-            let ctx = HookContext::new(HookEvent::UserPromptSubmit, session.header.id.clone())
-                .with_message(text.clone())
-                .with_working_dir(session.header.cwd.clone());
+            let ctx = hook_ctx(session, HookEvent::UserPromptSubmit).with_message(text.clone());
             let _ = hooks.run(&ctx).await;
         }
         session.append(Message::user_text(text))?;
@@ -185,102 +184,9 @@ impl Agent {
             };
 
             let calls = streamed.message.tool_uses();
-            let ctx = ToolCtx {
-                cwd: session.header.cwd.clone(),
-                cancel: cancel.clone(),
-            };
-            let mut results: Vec<Content> = Vec::with_capacity(calls.len());
-            for call in &calls {
-                if let Some(detail) = streamed.malformed.get(&call.id) {
-                    results.push(Content::tool_result(
-                        call,
-                        ToolOutput::err(format!(
-                            "tool input JSON is broken and the tool was not executed: {detail}"
-                        )),
-                    ));
-                    continue;
-                }
-                if streamed.cancelled || cancel.is_cancelled() {
-                    results.push(Content::interrupted(call));
-                    continue;
-                }
-                let output = match self.approval.decide(call).await {
-                    Decision::Allow | Decision::AllowAlways => {
-                        // hook 触发点：PreToolUse 在审批之后、调用之前；
-                        // 阻止 → is_error 结果，工具不执行。
-                        if let Some(hooks) = &self.hooks {
-                            let hook_ctx =
-                                HookContext::new(HookEvent::PreToolUse, session.header.id.clone())
-                                    .with_tool(call.name.clone(), Some(call.input.clone()))
-                                    .with_working_dir(session.header.cwd.clone());
-                            if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
-                                let text = format!("blocked by PreToolUse hook: {reason}");
-                                Self::emit(
-                                    &events,
-                                    Event::ToolDone {
-                                        id: call.id.clone(),
-                                        preview: text.clone(),
-                                        is_error: true,
-                                        elapsed_ms: 0,
-                                    },
-                                )
-                                .await;
-                                results.push(Content::tool_result(call, ToolOutput::err(text)));
-                                continue;
-                            }
-                        }
-                        Self::emit(
-                            &events,
-                            Event::ToolStart {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                input: call.input.clone(),
-                            },
-                        )
-                        .await;
-                        let started = Instant::now();
-                        let output = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
-                            out = self.tools.call(call, &ctx) => out,
-                        };
-                        Self::emit(
-                            &events,
-                            Event::ToolDone {
-                                id: call.id.clone(),
-                                preview: preview_text(&output.text),
-                                is_error: output.is_error,
-                                elapsed_ms: started.elapsed().as_millis() as u64,
-                            },
-                        )
-                        .await;
-                        // hook 触发点：PostToolUse 观察事件，决策忽略。
-                        if let Some(hooks) = &self.hooks {
-                            let hook_ctx =
-                                HookContext::new(HookEvent::PostToolUse, session.header.id.clone())
-                                    .with_tool(call.name.clone(), Some(call.input.clone()))
-                                    .with_tool_output(output.text.clone())
-                                    .with_working_dir(session.header.cwd.clone());
-                            let _ = hooks.run(&hook_ctx).await;
-                        }
-                        output
-                    }
-                    Decision::Deny(reason) => {
-                        Self::emit(
-                            &events,
-                            Event::ToolDone {
-                                id: call.id.clone(),
-                                preview: format!("user denied: {reason}"),
-                                is_error: true,
-                                elapsed_ms: 0,
-                            },
-                        )
-                        .await;
-                        ToolOutput::denied(&reason)
-                    }
-                };
-                results.push(Content::tool_result(call, output));
-            }
+            let results = self
+                .execute_calls(session, &calls, &streamed, &cancel, &events)
+                .await;
 
             // Stop hook 载荷要带助手文本；finish_turn 会 move 掉消息，先取。
             let last_assistant = if self.hooks.is_some() {
@@ -297,32 +203,152 @@ impl Agent {
                 return Ok(TurnResult::Interrupted);
             }
             if calls.is_empty() {
-                // hook 触发点：Stop 被阻止 → 注入提醒 user 消息、本轮继续跑；
-                // 连续阻止超上限（默认 8）强制结束，防死循环（§2.7）。
-                if let Some(hooks) = &self.hooks {
-                    let hook_ctx = HookContext::new(HookEvent::Stop, session.header.id.clone())
-                        .with_message(last_assistant)
-                        .with_working_dir(session.header.cwd.clone());
-                    if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
-                        stop_blocks += 1;
-                        if stop_blocks > STOP_BLOCK_LIMIT {
-                            tracing::warn!(
-                                "Stop hook 连续阻止 {stop_blocks} 次（上限 {STOP_BLOCK_LIMIT}），\
-                                 强制结束本轮"
-                            );
-                            return Ok(TurnResult::Done);
-                        }
-                        session.append(Message::user_text(format!(
-                            "Stop hook blocked ending this turn:\n\n{reason}\n\n\
-                             Address this policy hook denial before trying to stop again."
-                        )))?;
-                        continue;
-                    }
+                // Stop 被阻止 → 注入提醒 user 消息、本轮继续跑（§2.7）。
+                if self
+                    .stop_hook(session, last_assistant, &mut stop_blocks)
+                    .await?
+                {
+                    continue;
                 }
                 return Ok(TurnResult::Done);
             }
         }
         Ok(TurnResult::MaxTurns)
+    }
+
+    /// 逐个执行 tool call：malformed / 取消短路 → 审批 → PreToolUse hook →
+    /// emit ToolStart → 执行 → emit ToolDone → PostToolUse hook → deny 分支。
+    /// 每个 call 产出一个 ToolResult，顺序与 calls 一致。
+    async fn execute_calls(
+        &self,
+        session: &Session,
+        calls: &[ToolCall],
+        streamed: &AssistantStream,
+        cancel: &CancellationToken,
+        events: &mpsc::Sender<Event>,
+    ) -> Vec<Content> {
+        let ctx = ToolCtx {
+            cwd: session.header.cwd.clone(),
+            cancel: cancel.clone(),
+        };
+        let mut results: Vec<Content> = Vec::with_capacity(calls.len());
+        for call in calls {
+            if let Some(detail) = streamed.malformed.get(&call.id) {
+                results.push(Content::tool_result(
+                    call,
+                    ToolOutput::err(format!(
+                        "tool input JSON is broken and the tool was not executed: {detail}"
+                    )),
+                ));
+                continue;
+            }
+            if streamed.cancelled || cancel.is_cancelled() {
+                results.push(Content::interrupted(call));
+                continue;
+            }
+            let output = match self.approval.decide(call).await {
+                Decision::Allow | Decision::AllowAlways => {
+                    // hook 触发点：PreToolUse 在审批之后、调用之前；
+                    // 阻止 → is_error 结果，工具不执行。
+                    if let Some(hooks) = &self.hooks {
+                        let hook_ctx = hook_ctx(session, HookEvent::PreToolUse)
+                            .with_tool(call.name.clone(), Some(call.input.clone()));
+                        if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
+                            let text = format!("blocked by PreToolUse hook: {reason}");
+                            Self::emit(
+                                events,
+                                Event::ToolDone {
+                                    id: call.id.clone(),
+                                    preview: text.clone(),
+                                    is_error: true,
+                                    elapsed_ms: 0,
+                                },
+                            )
+                            .await;
+                            results.push(Content::tool_result(call, ToolOutput::err(text)));
+                            continue;
+                        }
+                    }
+                    Self::emit(
+                        events,
+                        Event::ToolStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                        },
+                    )
+                    .await;
+                    let started = Instant::now();
+                    let output = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
+                        out = self.tools.call(call, &ctx) => out,
+                    };
+                    Self::emit(
+                        events,
+                        Event::ToolDone {
+                            id: call.id.clone(),
+                            preview: preview_text(&output.text),
+                            is_error: output.is_error,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        },
+                    )
+                    .await;
+                    // hook 触发点：PostToolUse 观察事件，决策忽略。
+                    if let Some(hooks) = &self.hooks {
+                        let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
+                            .with_tool(call.name.clone(), Some(call.input.clone()))
+                            .with_tool_output(output.text.clone());
+                        let _ = hooks.run(&hook_ctx).await;
+                    }
+                    output
+                }
+                Decision::Deny(reason) => {
+                    Self::emit(
+                        events,
+                        Event::ToolDone {
+                            id: call.id.clone(),
+                            preview: format!("user denied: {reason}"),
+                            is_error: true,
+                            elapsed_ms: 0,
+                        },
+                    )
+                    .await;
+                    ToolOutput::denied(&reason)
+                }
+            };
+            results.push(Content::tool_result(call, output));
+        }
+        results
+    }
+
+    /// hook 触发点：Stop。被阻止 → 注入提醒 user 消息并返回 true（本轮继续跑）；
+    /// 无 hooks / 未阻止 / 连续阻止超上限（默认 8）强制结束返回 false，防死循环（§2.7）。
+    async fn stop_hook(
+        &self,
+        session: &mut Session,
+        last_assistant: String,
+        stop_blocks: &mut u32,
+    ) -> crate::Result<bool> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(false);
+        };
+        let ctx = hook_ctx(session, HookEvent::Stop).with_message(last_assistant);
+        if let HookDecision::Block(reason) = hooks.run(&ctx).await {
+            *stop_blocks += 1;
+            if *stop_blocks > STOP_BLOCK_LIMIT {
+                tracing::warn!(
+                    "Stop hook 连续阻止 {stop_blocks} 次（上限 {STOP_BLOCK_LIMIT}），强制结束本轮"
+                );
+                return Ok(false);
+            }
+            session.append(Message::user_text(format!(
+                "Stop hook blocked ending this turn:\n\n{reason}\n\n\
+                 Address this policy hook denial before trying to stop again."
+            )))?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// hook 触发点入口：SessionStart / SessionEnd 由 `18` 的会话生命周期
@@ -335,9 +361,7 @@ impl Agent {
         let Some(hooks) = &self.hooks else {
             return Ok(HookDecision::Allow);
         };
-        let ctx = HookContext::new(event, session.header.id.clone())
-            .with_working_dir(session.header.cwd.clone());
-        Ok(hooks.run(&ctx).await)
+        Ok(hooks.run(&hook_ctx(session, event)).await)
     }
 
     /// StreamEvent 折叠成一条 assistant Message，同时转发 TextDelta；
@@ -448,6 +472,12 @@ impl Agent {
     pub(crate) async fn emit(events: &mpsc::Sender<Event>, event: Event) {
         let _ = events.send(event).await;
     }
+}
+
+/// hook 上下文公共基底：事件 + session id + working dir（`17` §2.7），
+/// 各触发点再链式 `.with_*` 补专属字段。
+fn hook_ctx(session: &Session, event: HookEvent) -> HookContext {
+    HookContext::new(event, session.header.id.clone()).with_working_dir(session.header.cwd.clone())
 }
 
 /// assistant 消息的全部文本拼接（Stop hook 的 last message）。
