@@ -1,0 +1,10 @@
+[
+  { "kind": "tool_use_start", "id": "call_x", "name": "ping" },
+  { "kind": "tool_use_delta", "arguments": "{}" },
+  { "kind": "tool_use_end" },
+  {
+    "kind": "done",
+    "usage": { "input": 0, "output": 0, "cache_read": 0, "cache_write": 0 },
+    "stop_reason": "tool_use"
+  }
+]

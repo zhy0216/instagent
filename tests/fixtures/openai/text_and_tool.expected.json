@@ -1,0 +1,12 @@
+[
+  { "kind": "text_delta", "text": "I'll " },
+  { "kind": "text_delta", "text": "run ls" },
+  { "kind": "tool_use_start", "id": "call_t", "name": "developer__shell" },
+  { "kind": "tool_use_delta", "arguments": "{\"command\": \"ls\"}" },
+  { "kind": "tool_use_end" },
+  {
+    "kind": "done",
+    "usage": { "input": 4982, "output": 122, "cache_read": 0, "cache_write": 0 },
+    "stop_reason": "tool_use"
+  }
+]
