@@ -11,6 +11,15 @@ anthropic-engine = []
 
 # 依赖清单在 todos/00 一次性锁定，后续任务不加依赖、不升级依赖。
 # 版本基准：第二版 §3 + 第三版 §4；rmcp 版本取 goose 根 Cargo.toml workspace 值（4ad43df）。
+# todo 14 测试 fixture：最小 stdio MCP server（rmcp server 侧），由
+# src/tools/mcp.rs 的测试经 CARGO_BIN_EXE_mcp-fixture-server 启动。
+# 仅新增 target 声明，不改依赖清单（AGENTS.md 由 00 锁定的部分不变）。
+[[bin]]
+name = "mcp-fixture-server"
+path = "tests/fixtures/mcp_stdio_server.rs"
+test = false
+doctest = false
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
