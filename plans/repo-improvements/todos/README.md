@@ -7,7 +7,7 @@
 
 | 文件 | 优先级 | 难度 | 说明 |
 |---|---|---|---|
-| `01-quick-fixes.md` | P2 | easy | 死代码、过期文案、README 安装命令修正 |
+| `01-quick-fixes.md` ✅ done | P2 | easy | 死代码、过期文案、README 安装命令修正 |
 | `02-builtin-tools-hardening.md` | P1 | medium | fs/tree/shell 原子写、符号链接、流式读、权限 |
 | `03-session-robustness.md` | P1 | medium | rewrite 崩溃窗口、坏行 salvage、半死字段 |
 | `04-subprocess-io-dedup.md` | P1 | medium | hooks/command 双份进程输出模板收敛 |

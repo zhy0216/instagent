@@ -6,7 +6,6 @@
   "api_key_env": "OPENROUTER_API_KEY",
   "base_url": "https://openrouter.ai/api/v1",
   "headers": {
-    "http-referer": "https://github.com/instagent",
     "x-title": "instagent"
   },
   "timeout_seconds": 600,

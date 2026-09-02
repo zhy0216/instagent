@@ -171,7 +171,7 @@ my-plugin/
 | engine | 内核实现 | 说明 |
 |---|---|---|
 | `openai` | v1，约 450 行 | Chat Completions，`Authorization: Bearer <api_key_env>`，`base_url` 后拼 `/chat/completions` |
-| `proxy` | v1，约 150 行 | 拉起 `proxy.command`，内核选一个空闲端口，替换 `args` 里的 `${PORT}` 并设环境变量 `MINI_AGENT_PORT`，轮询 `GET http://127.0.0.1:{port}{proxy.ready}` 到 200 为止（`ready` 默认 `/v1/models`，超时默认 20s），之后当 `openai` engine 用；会话结束时 kill；连接失败自动重启一次 |
+| `proxy` | v1，约 150 行 | 拉起 `proxy.command`，内核选一个空闲端口，替换 `args` 里的 `${PORT}` 并设环境变量 `MINI_AGENT_PORT`（本仓库实际为 `INSTAGENT_PORT`），轮询 `GET http://127.0.0.1:{port}{proxy.ready}` 到 200 为止（`ready` 默认 `/v1/models`，超时默认 20s），之后当 `openai` engine 用；会话结束时 kill；连接失败自动重启一次 |
 | `anthropic` | v1.5，cargo feature，约 450 行 | 原生 Messages API：cache_control、thinking、strict；实现见第二版 §2.3 |
 
 `proxy` 示例（Claude 走原生协议，但内核不用会 Messages API）：

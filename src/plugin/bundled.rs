@@ -30,14 +30,9 @@ pub const BUNDLED_PLUGIN_NAME: &str = "bundled";
 /// 编译期内嵌仓库根 `bundled/` 目录（`File::path()` 相对该根）。
 static BUNDLED: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/bundled");
 
-/// 把内嵌树写到 `<data_dir>/bundled/`（每次覆盖，保证与二进制一致），
-/// 返回物化根目录。
-pub fn materialize_dir() -> crate::Result<PathBuf> {
-    materialize_at(&data_dir()?)
-}
-
-/// [`materialize_dir`] 的路径层：数据根目录由参数给出（同 `install.rs`，
-/// 测试不改写进程全局 `INSTAGENT_DATA_DIR`，避免与 `session.rs` 测试互踩）。
+/// 把内嵌树写到 `<base>/bundled/`（每次覆盖，保证与二进制一致），返回
+/// 物化根目录。数据根目录由参数给出（同 `install.rs`，测试不改写进程
+/// 全局 `INSTAGENT_DATA_DIR`，避免与 `session.rs` 测试互踩）。
 pub(crate) fn materialize_at(base: &Path) -> crate::Result<PathBuf> {
     let root = base.join(BUNDLED_PLUGIN_NAME);
     write_entries(&BUNDLED, &root)?;

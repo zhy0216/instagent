@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 仓库级校验（与 .github/workflows/ci.yml 等价的本地复现，todos/19）。
+# 仓库级校验（.github/workflows/ci.yml 全量 + 一步 `--help` smoke，todos/19）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

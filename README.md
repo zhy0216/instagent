@@ -15,7 +15,7 @@ anthropic-compat）同样来自一个 bundled 插件。
 
 ```bash
 cargo build --release          # 产物 target/release/instagent
-cargo install --path .         # 或直接装到 ~/.cargo/bin
+cargo install --path . --bin instagent   # 或直接装到 ~/.cargo/bin（只装主二进制，不含测试 fixture）
 ```
 
 工具链要求见 `rust-toolchain.toml`。可选 feature `anthropic-engine`
@@ -65,6 +65,15 @@ instagent --help
 环境变量（优先级高于配置文件）：`INSTAGENT_PROVIDER`、`INSTAGENT_MODEL`、
 `INSTAGENT_MODE`；沙箱/测试用：`INSTAGENT_CONFIG_DIR`、`INSTAGENT_DATA_DIR`、
 `INSTAGENT_AGENTS_DIR`；日志：`RUST_LOG=warn`（默认关闭，REPL 输出干净）。
+
+两点设计语义须知：
+
+- `read` / `tree` 在默认审批白名单（`DEFAULT_ALWAYS_ALLOW`）里：approve 模式
+  下它们可不经确认读取当前用户可读的任意路径（含绝对路径与 `..`）。这是
+  "用户环境代理"的定位（同 goose）；介意可通过 config 的 `always_allow`
+  调整白名单。
+- 会话文件假设单进程独占：不要对同一会话 id 同时开两个
+  `instagent chat --resume`，两进程追加会互相漂移。
 
 ### 插件管理
 
