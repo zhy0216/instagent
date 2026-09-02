@@ -114,6 +114,16 @@ fn truncate_one_line(text: &str) -> String {
     format!("{head}…")
 }
 
+/// 审批输入行 → 决策：trim + 忽略大小写；`y`/`yes` 放行一次，
+/// `a`/`always` 永久放行，其余（含 `n`/`no`/空/未知）拒绝。
+fn parse_confirm(line: &str) -> Decision {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Decision::Allow,
+        "a" | "always" => Decision::AllowAlways,
+        other => Decision::Deny(format!("user answered {other:?}")),
+    }
+}
+
 /// CLI 审批回调：阻塞读 stdin（v1 唯一实现；loop 走 `16` 的 Confirm trait）。
 pub struct CliConfirm;
 
@@ -127,11 +137,7 @@ impl Confirm for CliConfirm {
         if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
             return Decision::Deny("no answer (EOF)".to_string());
         }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => Decision::Allow,
-            "a" | "always" => Decision::AllowAlways,
-            other => Decision::Deny(format!("user answered {other:?}")),
-        }
+        parse_confirm(&line)
     }
 }
 
@@ -176,5 +182,42 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.last_usage.unwrap().input, 12);
+    }
+
+    #[test]
+    fn parse_confirm_maps_approval_inputs() {
+        assert_eq!(parse_confirm("y"), Decision::Allow);
+        assert_eq!(parse_confirm("Y"), Decision::Allow);
+        assert_eq!(parse_confirm("yes"), Decision::Allow);
+        assert_eq!(parse_confirm("YES"), Decision::Allow);
+        assert_eq!(parse_confirm("a"), Decision::AllowAlways);
+        assert_eq!(parse_confirm("Always"), Decision::AllowAlways);
+        // 拒绝分支：n/no 与未知输入同路，原因带回显（trim+小写后）。
+        assert_eq!(
+            parse_confirm("n"),
+            Decision::Deny("user answered \"n\"".into())
+        );
+        assert_eq!(
+            parse_confirm("NO"),
+            Decision::Deny("user answered \"no\"".into())
+        );
+        assert_eq!(
+            parse_confirm(""),
+            Decision::Deny("user answered \"\"".into())
+        );
+        assert_eq!(
+            parse_confirm("\n"),
+            Decision::Deny("user answered \"\"".into())
+        );
+        assert_eq!(
+            parse_confirm("  Y  "),
+            Decision::Allow,
+            "前后空白（含换行）被 trim"
+        );
+        assert_eq!(parse_confirm("  Always\t\n"), Decision::AllowAlways);
+        assert_eq!(
+            parse_confirm("maybe"),
+            Decision::Deny("user answered \"maybe\"".into())
+        );
     }
 }
