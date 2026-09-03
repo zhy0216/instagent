@@ -8,7 +8,7 @@
 
 - 使用说明：[`docs/usage.md`](docs/usage.md)
 - 架构总览：[`docs/architecture.md`](docs/architecture.md)
-- 决策记录：[`docs/adr/`](docs/adr/)（ADR 0001：不支持 Anthropic）
+- 决策记录：[`docs/adr/`](docs/adr/)（0001 不支持 Anthropic；0002 sandbox 内 agent，UI/permission 非目标）
 - 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
 - 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
 - 插件规范：[Agent Plugins v1.0.0](https://agent-plugins.org/specification)
