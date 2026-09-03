@@ -153,3 +153,26 @@ cargo test --features anthropic-engine
 - 假设 `cargo install --path . --bin instagent` 用法成立（README 改法，T1 验证）。
 - 假设 `CARGO_BIN_EXE_instagent` 对集成测试可用（`default-run` 已设，T9 验证）。
 - 会话单进程假设保持不变；若未来要支持多进程，另开计划。
+
+## 执行结果（2026-09-03，herdr-finish-plan 并行队列）
+
+9/9 全部合入 `main`，每笔均经 rebase → 协调器五条仓库级校验全绿 → `git merge --ff-only`，`bash scripts/ci.sh` 最终通过（退出码 0）。todos 全部归档至 `todos/done/`，README 状态已更新。
+
+| commit | todo |
+|---|---|
+| `f239363` | 01-quick-fixes（死代码、过期文案、README 安装命令与语义说明） |
+| `eba2cb9` | 03-session-robustness（rewrite 崩溃窗口消除、resume 坏行 salvage、删 `SessionHeader.name`） |
+| `5b8b2f1` | 04-subprocess-io-dedup（`subprocess.rs` 共享 `read_all`/`drain`/`OUTPUT_DRAIN_TIMEOUT`） |
+| `51e92d8` | 02-builtin-tools-hardening（fs 原子写 + 符号链接拒绝、流式 read + 32MB 上限、line/limit=0 显式报错、tree 流式数行 + 10MB 降级 `[?]`、shell 输出目录 0700/文件 0600） |
+| `8bcd129` | 05-agent-run-turn-extract（抽 `execute_calls`/`stop_hook`/`hook_ctx`，行为零变化） |
+| `7608099` | 07-cli-confirm-parse（抽 `parse_confirm` 纯函数 + 全分支单测） |
+| `cf34338` | 08-ci-audit-matrix（audit-check `continue-on-error: true`、ubuntu+macOS matrix、`--help` smoke 对齐 ci.sh） |
+| `51e8bab` | 06-provider-shared-stream（新私有模块 `src/provider/shared.rs`：SSE 驱动器 + StreamEngine trait + 构造骨架 + 共享 testutil，两引擎净减 ~650 行重复） |
+| `3d05434` | 09-cli-e2e-tests（`tests/cli_e2e.rs` 6 用例真进程 e2e + `trusty-plugin` 夹具） |
+
+执行中的观察（未处理，供后续决策）：
+
+- `tests/provider_proxy.rs` 存在与本次改动无关的既有负载 flake：并发构建下 proxy ready 固定 1s 超时偶发不足（多个任务复现，单跑该文件稳定 7/7 绿）。建议后续单独小修：加大超时或轮询等 meta 落盘。
+- 02-T3 的字面要求"读到 start+limit 行即停"与保留 `(N more lines)` 计数冲突（计数必须扫到 EOF），实现取后者：BufReader 流式（内存不整读）、扫至 EOF。行为与输出格式对旧语义完全兼容。
+- 06 按 plan 风险条款保留了引擎特有代码：`[DONE]`/`message_stop` 判定、usage 口径与 `map_stop_reason` 表留在各引擎侧。
+- 无 blocked / deferred 项；Herdr workspace 与任务分支已全部清理。
