@@ -35,7 +35,6 @@ instagent --help
    ```yaml
    provider: groq                # bundled 插件里的名字；重名时写 plugin/name
    model: llama-3.3-70b-versatile
-   mode: approve                 # auto | approve | chat（默认 approve）
    api_key_env: GROQ_API_KEY     # 从该环境变量读密钥
    ```
 
@@ -43,8 +42,8 @@ instagent --help
 
    ```bash
    export GROQ_API_KEY=...
-   instagent chat                # REPL：/help /exit /clear /compact /mode /tools
-   instagent run -t "list files" # 无交互跑一条任务（默认 auto 模式）
+   instagent chat                # REPL：/help /exit /clear /compact /tools
+   instagent run -t "list files" # 无交互跑一条任务
    instagent chat --resume last  # 恢复最近会话（JSONL 在 ~/.local/share/instagent/sessions/）
    ```
 
@@ -54,32 +53,30 @@ instagent --help
 
 | 位置 | 内容 |
 |---|---|
-| `~/.config/instagent/config.yaml` | provider / model / mode / `always_allow` 审批白名单 / `plugins` 额外搜索路径等 |
-| `~/.config/instagent/settings.json` | `enabledPlugins` / `disabledPlugins` / `trustedPlugins`（三层合并：`.local` > 项目 > 用户） |
+| `~/.config/instagent/config.yaml` | provider / model / `plugins` 额外搜索路径等 |
+| `~/.config/instagent/settings.json` | `enabledPlugins` / `disabledPlugins`（三层合并：`.local` > 项目 > 用户） |
 | `<project>/.config/instagent/` | 项目级 config/settings 覆盖 |
 | `~/.local/share/instagent/` | 数据目录：`sessions/*.jsonl`、`plugins/<name>/`（PLUGIN_DATA）、`bundled/`（物化的内嵌插件） |
 | `~/.agents/plugins/` | 用户插件安装根（Agent Plugins 规范的共享位置） |
 
-环境变量（优先级高于配置文件）：`INSTAGENT_PROVIDER`、`INSTAGENT_MODEL`、
-`INSTAGENT_MODE`；沙箱/测试用：`INSTAGENT_CONFIG_DIR`、`INSTAGENT_DATA_DIR`、
+环境变量（优先级高于配置文件）：`INSTAGENT_PROVIDER`、`INSTAGENT_MODEL`；
+沙箱/测试用：`INSTAGENT_CONFIG_DIR`、`INSTAGENT_DATA_DIR`、
 `INSTAGENT_AGENTS_DIR`；日志：`RUST_LOG=warn`（默认关闭，REPL 输出干净）。
 
-两点设计语义须知：
+设计语义须知：
 
-- `read` / `tree` 在默认审批白名单（`DEFAULT_ALWAYS_ALLOW`）里：approve 模式
-  下它们可不经确认读取当前用户可读的任意路径（含绝对路径与 `..`）。这是
-  "用户环境代理"的定位（同 goose）；介意可通过 config 的 `always_allow`
-  调整白名单。
+- instagent 运行在 sandbox 内，工具调用直接执行，安全边界由 sandbox 隔离
+  承担（ADR 0002）。
 - 会话文件假设单进程独占：不要对同一会话 id 同时开两个
   `instagent chat --resume`，两进程追加会互相漂移。
 
 ### 插件管理
 
 ```bash
-instagent plugin install <git-url 或本地路径> [--auto-update] [--yes]
+instagent plugin install <git-url 或本地路径> [--auto-update]
 instagent plugin list                 # 含启用/禁用状态
 instagent plugin show <name>
-instagent plugin enable <name>        # 带可执行组件的插件会要求信任确认
+instagent plugin enable <name>
 instagent plugin disable <name>
 instagent plugin update [name]
 instagent chat --plugin ./my-dev-plugin   # 开发时临时加载，不安装
@@ -160,9 +157,8 @@ schema，只用它选本地校验规则）：
 `everything__echo` 等（MCP）、`groq-and-review__weather`（command tool）、
 `load_skill`（skills）；system prompt 里多一行 `groq-and-review:review — …`；
 配置里 `provider: groq` 生效；`/review` 可用；每次调 `shell` 前 `guard.sh` 先跑。
-会执行命令的组件（MCP / hooks / command tools / proxy provider）首次启用需要
-信任确认（`instagent plugin enable` 回答 yes，或 `--yes`），未信任的插件只打
-提示、不拉起任何命令。
+会执行命令的组件（MCP / hooks / command tools / proxy provider）直接加载，
+安全由 sandbox 隔离承担（ADR 0002）。
 
 发现优先级：`--plugin PATH` > 配置 `plugins` 路径 > 项目 `<cwd>/.agents/plugins/` >
 用户 `~/.agents/plugins/` > bundled。manifest 校验失败的目录记警告跳过；
@@ -213,15 +209,9 @@ cargo test
    模型能引用上一会话内容；`instagent sessions list` 两行、`sessions rm <id>` 可删。
 5. **run -t**：`cargo run -- run -t "list files"`，无交互跑完，stdout 有最终回复
    与 `usage:` 行，工具调用打 `▶ shell  …` + 预览/耗时。
-6. **approve 模式审批提示**：`cargo run -- chat --mode approve`，让模型跑 `shell`，
-   出现 `allow this call? [y]es / [a]lways / [n]o:`；选 `a` 后同会话再跑 shell
-   不再询问，且 config.yaml 的 `always_allow` 多了一条。
-7. **plugin 子命令 + 首次启用确认**：
-   `cargo run -- plugin install <本地含 hooks/mcp/tools 的插件路径>` → 列出全部
-   命令要求确认；答 `y` 后 `~/.config/instagent/settings.json` 出现
-   `trustedPlugins`；`plugin list / show / disable / enable`（enable 同样触发确认）；
-   未信任的插件在 chat 启动时只打 `note: plugin ... is not trusted` 且其
-   mcp/hooks/command tools 不加载；`--yes` 跳过确认。
-8. **--plugin PATH 临时加载**：把含 provider JSON 的开发目录经 `--plugin` 传入，
+6. **plugin 子命令**：`cargo run -- plugin install <本地含 hooks/mcp/tools 的
+   插件路径>` → 不提问直接装好；`plugin list / show / disable / enable` 正常；
+   启用后 chat 启动即加载其 mcp/hooks/command tools（安全由 sandbox 隔离承担）。
+7. **--plugin PATH 临时加载**：把含 provider JSON 的开发目录经 `--plugin` 传入，
    `chat` 里 `provider` 可直接用该插件定义；`/help` 列出插件斜杠命令并可用
    `/review <args>` 展开成 prompt。

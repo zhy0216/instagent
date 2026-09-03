@@ -1,7 +1,8 @@
 # ADR 0002: 目标收敛为 sandbox 内的 agent，用户 UI 与 permission 管理降级为非目标
 
-- 状态：已接受
+- 状态：已落地
 - 日期：2026-09-04
+- 落地：`approval.rs`、`trust.rs`、`Mode` 三态已整体移除（见 git 历史 `feat!` 提交）
 - 影响：第三版 §2.9（审批）、`src/agent/approval.rs`、`src/cli/trust.rs`、REPL 交互确认等
 
 ## 背景
@@ -28,6 +29,10 @@ agent 内核**。隔离、安全边界、资源限制由 sandbox 承担；调用
 - 现有 `approval.rs`、`trust.rs`、REPL 确认路径冻结：不删（还能跑、
   测试还在），但停止演进，后续 todo 择机移除；
 - `Mode::Approve` / `always_allow` 不再出现在文档推荐用法里。
+
+上述冻结已执行完毕：approval / trust / `Mode` 连同 REPL 确认路径已整体
+移除（见 git 历史 `feat!` 提交），工具直接执行，安全依赖 sandbox 隔离；
+本文保留决策记录原文。
 
 ## 后果
 

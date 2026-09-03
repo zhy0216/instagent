@@ -9,6 +9,9 @@ server、skills、hooks、斜杠命令、command tools 全部以插件形式加�
 插件格式遵循 [Agent Plugins v1.0.0](https://agent-plugins.org/specification)，
 hooks 的载荷与决策协议与 [block/goose](https://github.com/block/goose) 兼容。
 
+instagent 运行在 sandbox 内，工具直接执行，安全边界由 sandbox 承担
+（见 [docs/adr/0002](adr/0002-sandbox-agent-no-ui-permission.md)）。
+
 ---
 
 ## 目录
@@ -17,14 +20,13 @@ hooks 的载荷与决策协议与 [block/goose](https://github.com/block/goose) 
 2. [快速上手](#2-快速上手)
 3. [命令参考](#3-命令参考)
 4. [配置](#4-配置)
-5. [审批模式与安全](#5-审批模式与安全)
-6. [REPL 交互](#6-repl-交互)
-7. [会话管理](#7-会话管理)
-8. [插件管理](#8-插件管理)
-9. [插件开发](#9-插件开发)
-10. [Provider 详解](#10-provider-详解)
-11. [文件位置速查](#11-文件位置速查)
-12. [故障排查](#12-故障排查)
+5. [REPL 交互](#5-repl-交互)
+6. [会话管理](#6-会话管理)
+7. [插件管理](#7-插件管理)
+8. [插件开发](#8-插件开发)
+9. [Provider 详解](#9-provider-详解)
+10. [文件位置速查](#10-文件位置速查)
+11. [故障排查](#11-故障排查)
 
 ---
 
@@ -47,7 +49,6 @@ cargo install --path . --bin instagent       # 装到 ~/.cargo/bin
 ```yaml
 provider: groq                 # bundled 插件里的 provider 名字
 model: llama-3.3-70b-versatile
-mode: approve                  # auto | approve | chat（默认 approve）
 api_key_env: GROQ_API_KEY      # 从哪个环境变量读密钥
 ```
 
@@ -56,7 +57,7 @@ api_key_env: GROQ_API_KEY      # 从哪个环境变量读密钥
 ```bash
 export GROQ_API_KEY=...
 instagent chat                 # 交互式 REPL
-instagent run -t "list files"  # 无交互跑一条任务（默认 auto 模式）
+instagent run -t "list files"  # 无交互跑一条任务
 ```
 
 不想碰真实配置可以先用沙箱目录试：
@@ -90,7 +91,7 @@ model: qwen2.5-coder
 ### `instagent chat`
 
 ```bash
-instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--mode MODE] [--plugin PATH ...]
+instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--plugin PATH ...]
 ```
 
 | 选项 | 说明 |
@@ -98,7 +99,6 @@ instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--mode MODE] [--plu
 | `--resume <id>` | 恢复指定会话；`--resume last` 恢复最近一次 |
 | `--cwd PATH` | 工作目录（不存在会创建），影响 shell/read 等工具的相对路径与项目级 settings/skills 发现 |
 | `-m, --model MODEL` | 覆盖配置里的 `model` |
-| `--mode auto\|approve\|chat` | 覆盖配置里的 `mode` |
 | `--plugin PATH` | 临时加载一个插件目录（可多次），不安装、不落盘，开发调试用 |
 
 会话生命周期会触发插件的 `SessionStart` / `SessionEnd` hooks。
@@ -106,13 +106,11 @@ instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--mode MODE] [--plu
 ### `instagent run`
 
 ```bash
-instagent run -t "..." [--cwd PATH] [-m MODEL] [--mode MODE] [--plugin PATH ...]
+instagent run -t "..." [--cwd PATH] [-m MODEL] [--plugin PATH ...]
 ```
 
 无交互：新建一个会话，把 `-t` 内容作为唯一一条用户消息跑完，最终回复与
-`usage:` 打到 stdout，工具调用过程打到 stderr。**默认模式是 `auto`**
-（无人可问，与 chat 的默认 `approve` 不同），需要审批时用
-`--mode approve`（但无交互场景下确认通道不可用，未命中白名单的调用会被拒绝）。
+`usage:` 打到 stdout，工具调用过程打到 stderr。
 
 ### `instagent sessions`
 
@@ -124,15 +122,15 @@ instagent sessions rm <id>     # 删除会话文件
 ### `instagent plugin`
 
 ```bash
-instagent plugin install <git-url 或本地路径> [--auto-update] [--yes]
+instagent plugin install <git-url 或本地路径> [--auto-update]
 instagent plugin list
 instagent plugin show <name>
-instagent plugin enable <name> [--yes]
+instagent plugin enable <name>
 instagent plugin disable <name>
 instagent plugin update [name]   # 不带 name = 更新全部 git 来源插件
 ```
 
-详见 §8。
+详见 §7。
 
 ---
 
@@ -145,17 +143,15 @@ settings，见 §4.3）。所有字段可缺省，缺省取默认值：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `provider` | 无 | provider 名字，定义来自插件（§10）；重名时写 `插件名/provider名` |
+| `provider` | 无 | provider 名字，定义来自插件（§9）；重名时写 `插件名/provider名` |
 | `model` | 无 | 模型名 |
 | `api_key_env` | 无 | 从该环境变量读密钥（推荐方式） |
 | `api_key` | 无 | 直接写密钥（文件会按 0600 权限保存；优先用 `api_key_env`） |
 | `max_tokens` | `8192` | 单次回复最大 token |
-| `mode` | `approve` | `auto` / `approve` / `chat`（§5） |
 | `max_turns` | `1000` | 单条用户消息内最多循环多少轮工具调用 |
-| `context_limit` | 无 | 覆盖模型上下文上限（默认按 §10 的四级推导） |
+| `context_limit` | 无 | 覆盖模型上下文上限（默认按 §9 的四级推导） |
 | `compaction_threshold` | `0.8` | token 用量占上下文比例超过该值时自动压缩会话 |
 | `shell` | `$SHELL` | `shell` 工具使用的解释器 |
-| `always_allow` | `[]` | 审批白名单（`read` `tree` 永远默认在内；§5） |
 | `plugins` | `[]` | 额外插件搜索目录（支持 `~`；相对路径按启动时 cwd 解析） |
 
 示例：
@@ -164,12 +160,9 @@ settings，见 §4.3）。所有字段可缺省，缺省取默认值：
 provider: openai
 model: gpt-5
 api_key_env: OPENAI_API_KEY
-mode: approve
 max_tokens: 4096
 compaction_threshold: 0.65
 shell: /bin/zsh
-always_allow:
-  - everything__echo
 plugins:
   - ~/my-plugins
   - ./project-plugins
@@ -183,7 +176,6 @@ plugins:
 |---|---|
 | `INSTAGENT_PROVIDER` | `provider` |
 | `INSTAGENT_MODEL` | `model` |
-| `INSTAGENT_MODE` | `mode`（非法值直接报错退出） |
 
 沙箱/测试用（重定向目录）：
 
@@ -197,7 +189,7 @@ plugins:
 
 ### 4.3 `settings.json`（三层）
 
-控制插件的启用/禁用/信任，按 **local > project > user** 合并：
+控制插件的启用/禁用，按 **local > project > user** 合并：
 
 | 层 | 路径 |
 |---|---|
@@ -208,64 +200,21 @@ plugins:
 ```json
 {
   "enabledPlugins": ["my-plugin"],
-  "disabledPlugins": ["bundled"],
-  "trustedPlugins": ["my-plugin"]
+  "disabledPlugins": ["bundled"]
 }
 ```
 
 - `enabledPlugins`：**写了就是白名单模式**，只有列出的插件启用；不写则"除
   `disabledPlugins` 外全部启用"。
 - `disabledPlugins`：黑名单。
-- `trustedPlugins`：信任名单（§5.2），三层取并集。
 - 同名插件的 enabled/disabled 字段：以最高层出现的为准；某层缺省的字段
   不参与覆盖（注意区分"没写"和"写了空数组"）。
 
 ---
 
-## 5. 审批模式与安全
+## 5. REPL 交互
 
-### 5.1 三种模式
-
-| 模式 | 行为 |
-|---|---|
-| `auto` | 全部工具调用直接放行 |
-| `approve`（默认） | 白名单内放行，其余逐个问用户 |
-| `chat` | 不给模型任何工具，纯对话 |
-
-切换：配置 `mode`、命令行 `--mode`、REPL 内 `/mode auto|approve|chat`。
-
-approve 模式的审批提示：
-
-```
-allow this call? [y]es / [a]lways / [n]o:
-```
-
-- `y`：本次放行
-- `a`：放行并加入白名单——立即写回 `config.yaml` 的 `always_allow`，
-  之后同名工具不再询问
-- `n`：拒绝（以错误结果回给模型，模型可换办法）
-
-**默认白名单**包含 `read` 和 `tree`：approve 模式下它们可不经确认读取
-当前用户可读的任意路径（含绝对路径与 `..`）。这是"用户环境代理"的定位
-（同 goose）；介意可自行调整 `always_allow`（白名单按**工具名**精确匹配，
-如 `shell`、`everything__echo`、`myplugin__weather`）。
-
-### 5.2 插件信任
-
-会**执行命令**的组件（MCP server / hooks / command tools / proxy provider）
-首次启用需要信任确认：
-
-- `plugin install` / `plugin enable` 时列出该插件全部可执行命令并要求确认；
-  `--yes` 跳过。
-- 确认后写入用户层 `settings.json` 的 `trustedPlugins`。
-- 未信任的插件：启动时只打 `note: plugin ... is not trusted`，其可执行
-  组件一律不加载（只读组件如 provider 定义、skills、斜杠命令不受影响）。
-
----
-
-## 6. REPL 交互
-
-启动横幅显示 provider / model / mode / session id。输入行直接发给模型；
+启动横幅显示 provider / model / session id。输入行直接发给模型；
 `/` 开头是斜杠命令：
 
 | 命令 | 说明 |
@@ -273,10 +222,9 @@ allow this call? [y]es / [a]lways / [n]o:
 | `/exit` `/quit` | 退出 |
 | `/clear` | 丢弃当前上下文（会话文件原子重写，留 `.bak.jsonl`） |
 | `/compact` | 立即强制压缩会话 |
-| `/mode <m>` | 切换模式（会显示当前模式） |
 | `/tools` | 列出当前可见的全部工具（含来源前缀与 read-only 标记） |
 | `/help` | 帮助 + 插件提供的斜杠命令列表 |
-| `/<插件命令> [参数]` | 插件斜杠命令，展开成一条用户消息（§9.7） |
+| `/<插件命令> [参数]` | 插件斜杠命令，展开成一条用户消息（§8.7） |
 
 **Ctrl-C 语义**：
 
@@ -291,7 +239,7 @@ allow this call? [y]es / [a]lways / [n]o:
 
 ---
 
-## 7. 会话管理
+## 6. 会话管理
 
 - 会话以 JSONL 存在 `~/.local/share/instagent/sessions/<id>.jsonl`，
   首行是 header（id、时间、provider、model、cwd）。
@@ -305,9 +253,9 @@ allow this call? [y]es / [a]lways / [n]o:
 
 ---
 
-## 8. 插件管理
+## 7. 插件管理
 
-### 8.1 发现来源与优先级
+### 7.1 发现来源与优先级
 
 启动时按以下顺序发现插件（高优先级在前）：
 
@@ -321,7 +269,7 @@ allow this call? [y]es / [a]lways / [n]o:
 manifest 校验失败的目录记警告跳过，不中断启动；settings 里启用但目录已删
 的插件同样只警告。同名插件先到先得。
 
-### 8.2 安装 / 更新
+### 7.2 安装 / 更新
 
 ```bash
 instagent plugin install https://github.com/some/plugin-repo   # git 克隆到 ~/.agents/plugins/<name>/
@@ -331,16 +279,16 @@ instagent plugin update              # 更新全部 git 来源插件（git pull�
 instagent plugin update my-plugin    # 只更新一个
 ```
 
-### 8.3 查看 / 启用 / 禁用
+### 7.3 查看 / 启用 / 禁用
 
 ```bash
 instagent plugin list            # 名字、版本、启用状态、来源
-instagent plugin show my-plugin  # 详情：root、来源、commit、信任状态、全部可执行命令
+instagent plugin show my-plugin  # 详情：root、来源、commit
 instagent plugin disable my-plugin
-instagent plugin enable my-plugin   # 带可执行组件的会触发信任确认（--yes 跳过）
+instagent plugin enable my-plugin
 ```
 
-### 8.4 开发时临时加载
+### 7.4 开发时临时加载
 
 ```bash
 instagent chat --plugin ./my-dev-plugin
@@ -351,7 +299,7 @@ instagent chat --plugin ./my-dev-plugin
 
 ---
 
-## 9. 插件开发
+## 8. 插件开发
 
 一个完整插件的目录结构：
 
@@ -371,7 +319,7 @@ groq-and-review/
   └ scripts/...
 ```
 
-### 9.1 `plugin.json`
+### 8.1 `plugin.json`
 
 `$schema` 必填且必须是 1.0.0 的规范 URL（客户端不联网，只按它选本地校验
 规则）；`name` `version` 必填：
@@ -387,9 +335,9 @@ groq-and-review/
 ```
 
 `extensions.dev.instagent.env` 声明该插件的 hooks 需要透传的环境变量名
-（§9.5，白名单机制）。
+（§8.5，白名单机制）。
 
-### 9.2 `mcp.json`
+### 8.2 `mcp.json`
 
 固定在插件根目录。只支持 `stdio` 传输（`sse` 会跳过并提示）：
 
@@ -413,11 +361,11 @@ groq-and-review/
   `~/.local/share/instagent/plugins/<name>/`）。
 - MCP 工具对模型的名字是 `<server名>__<工具名>`，如 `everything__echo`。
 
-### 9.3 `dev.instagent/providers/*.json`
+### 8.3 `dev.instagent/providers/*.json`
 
-见 §10.2 的完整字段表。
+见 §9.2 的完整字段表。
 
-### 9.4 `dev.instagent/tools/*.json`（command tools）
+### 8.4 `dev.instagent/tools/*.json`（command tools）
 
 脚本即工具。每个文件一个工具数组或单个对象均可，字段：
 
@@ -438,9 +386,8 @@ groq-and-review/
   被取消 → 结果是 `is_error`。
 - 子进程按进程组管理，超时杀整组。
 - 解析失败或非法的定义跳过（warn 日志），不影响其它工具。
-- 该组件会执行命令 → 受信任机制约束（§5.2）。
 
-### 9.5 `dev.instagent/hooks.json`
+### 8.5 `dev.instagent/hooks.json`
 
 格式与决策协议兼容 goose。顶层：
 
@@ -507,7 +454,7 @@ groq-and-review/
 `extensions["dev.instagent"].env` 声明的名字）+ `PLUGIN_ROOT`。
 `Stop` 连续阻止上限 8 次，防死循环。
 
-### 9.6 `skills/`
+### 8.6 `skills/`
 
 每个含 `SKILL.md` 的一层子目录是一个 skill（不递归）：
 
@@ -528,7 +475,7 @@ skill 跳过不报错。
 `名字 — 描述` 一行放进 system prompt，模型按需调用 `load_skill` 读正文
 或 `references/` 下的文件。
 
-### 9.7 `dev.instagent/commands/*.md`（斜杠命令）
+### 8.7 `dev.instagent/commands/*.md`（斜杠命令）
 
 文件名即命令名（`review.md` → `/review`）。frontmatter 取 `description` /
 `argument-hint`，正文是模板：
@@ -546,9 +493,9 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 - 多插件同名命令先到先得（插件名升序）；解析失败的文件跳过。
 - `/help` 会列出全部插件命令及参数提示。
 
-### 9.8 装上之后的完整效果
+### 8.8 装上之后的完整效果
 
-以上述 `groq-and-review` 为例，启用并信任后：
+以上述 `groq-and-review` 为例，启用后：
 
 - 模型可见工具：内置 5 个 + `everything__echo` 等（MCP）+
   `groq-and-review__weather`（command tool）+ `load_skill`（skills）；
@@ -559,9 +506,9 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 ---
 
-## 10. Provider 详解
+## 9. Provider 详解
 
-### 10.1 内置（bundled）provider
+### 9.1 内置（bundled）provider
 
 | provider | 密钥环境变量 | base_url |
 |---|---|---|
@@ -577,7 +524,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 配置里的 `provider` / `model` 也可用环境变量临时覆盖（§4.2），或用
 `--model` 命令行参数。
 
-### 10.2 自定义 provider（插件 JSON）
+### 9.2 自定义 provider（插件 JSON）
 
 放 `dev.instagent/providers/<任意名>.json`：
 
@@ -625,18 +572,17 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 - `command`：可执行名或 `./` 插件相对路径；`${PORT}` 在拉起时替换成分配
   的端口；就绪探针轮询 `ready` 路径（默认 `/v1/models`）直到返回 200 或
   超时（默认 20s）。
-- 该组件会执行命令 → 受信任机制约束。
 
 变量展开（所有 provider JSON）：`${env:NAME}` / `${PLUGIN_ROOT}` /
 `${PLUGIN_DATA}`；`${PORT}` 保留给运行时。
 
-### 10.3 名字解析与覆盖
+### 9.3 名字解析与覆盖
 
 - 配置写裸名（`groq`）；多个插件定义同名时报错，要求写
   `插件名/provider名`（如 `my-plugin/groq`）；
 - 用户插件的同名定义优先于 bundled（可以用同名 JSON 覆盖内置定义）。
 
-### 10.4 上下文上限推导（四级）
+### 9.4 上下文上限推导（四级）
 
 1. 配置 `context_limit`（最高优先）
 2. provider JSON 的 `models[].context_limit`
@@ -648,7 +594,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 ---
 
-## 11. 文件位置速查
+## 10. 文件位置速查
 
 | 路径 | 内容 |
 |---|---|
@@ -669,16 +615,14 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 ---
 
-## 12. 故障排查
+## 11. 故障排查
 
 | 现象 | 处理 |
 |---|---|
-| 启动报 `invalid INSTAGENT_MODE` / 配置解析错 | 检查环境变量与 config.yaml 的 YAML 语法 |
-| `note: plugin X is not trusted` | 可执行组件未信任：`instagent plugin show X` 查看命令，`plugin disable X && plugin enable X` 重新确认（或 `--yes`） |
+| 启动报配置解析错 | 检查 config.yaml 的 YAML 语法 |
 | provider 重名报错 | 配置里写 `插件名/provider名` |
 | `proxy not ready` | proxy 进程未在 `timeout_secs` 内就绪：手动跑该命令确认能监听 `${PORT}` 并在 `ready` 路径返回 200 |
 | 想看详细日志 | `RUST_LOG=warn instagent chat`（或 `info` / `debug`），日志走 stderr |
-| 审批弹窗在 `run` 里变成拒绝 | `run` 默认 `auto`；若显式 `--mode approve` 又没配 `always_allow`，无交互下只能拒绝 |
 | 会话内容错乱 | 确认没有两个进程同时 `--resume` 同一个会话 |
 
 开发自检：

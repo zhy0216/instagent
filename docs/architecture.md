@@ -7,14 +7,14 @@
 
 | 模块 | 职责 |
 |---|---|
-| `src/agent/` | agent loop：`assemble` / `run_turn` / 流式输出、审批（`approval.rs`）、压缩（`compact.rs`）、hooks 触发点 |
+| `src/agent/` | agent loop：`assemble` / `run_turn` / 流式输出、压缩（`compact.rs`）、hooks 触发点 |
 | `src/provider/` | provider **引擎**层：`openai.rs` / `proxy.rs` 两种引擎 + 共享 SSE 流驱动（`shared.rs`）+ `registry.rs` |
 | `src/tools/` | `ToolSource` trait + Registry；唯一内置内容 = 5 个工具 `shell` `read` `write` `edit` `tree`（`builtin/`） |
-| `src/plugin/` | 插件加载器：manifest 校验、四级发现（`--plugin` > 项目 > 用户 > bundled，同名覆盖）、install / enable / 信任 |
+| `src/plugin/` | 插件加载器：manifest 校验、四级发现（`--plugin` > 项目 > 用户 > bundled，同名覆盖）、install / enable |
 | `src/hooks.rs` | hooks 运行时——内核只提供执行机制，脚本来自插件 |
 | `src/commands.rs` | 斜杠命令加载器（`dev.instagent/commands/*.md`） |
 | `src/session.rs` `src/message.rs` | 会话 JSONL 持久化、消息模型 |
-| `src/config.rs` `src/settings.rs` | 配置（yaml）、插件启用/信任状态（settings 三层合并） |
+| `src/config.rs` `src/settings.rs` | 配置（yaml）、插件启用/禁用状态（settings 三层合并） |
 | `src/cli/` `src/subprocess.rs` | REPL / CLI、子进程管理（进程组 + kill_on_drop） |
 
 ## 插件形式提供
