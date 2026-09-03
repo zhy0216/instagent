@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "liveplug",
+  "version": "1.0.0",
+  "description": "live e2e fixture: command tool + hooks + skill + slash command"
+}

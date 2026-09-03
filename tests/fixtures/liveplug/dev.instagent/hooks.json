@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "shell",
+        "hooks": [{ "command": "${PLUGIN_ROOT}/scripts/guard.sh" }]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "command": "${PLUGIN_ROOT}/scripts/session_start.sh" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "command": "${PLUGIN_ROOT}/scripts/post_tool_use.sh" }] }
+    ]
+  }
+}

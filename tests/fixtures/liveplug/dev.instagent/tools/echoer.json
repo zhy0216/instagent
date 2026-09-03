@@ -1,0 +1,10 @@
+{
+  "name": "echoer",
+  "description": "echo the text argument back verbatim",
+  "input_schema": {
+    "type": "object",
+    "properties": { "text": { "type": "string" } },
+    "required": ["text"]
+  },
+  "command": "${PLUGIN_ROOT}/scripts/echoer.sh"
+}
