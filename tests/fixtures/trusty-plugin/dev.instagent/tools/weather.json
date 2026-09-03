@@ -1,0 +1,6 @@
+{
+  "name": "weather",
+  "description": "get weather",
+  "input_schema": { "type": "object" },
+  "command": "${PLUGIN_ROOT}/guard.sh"
+}

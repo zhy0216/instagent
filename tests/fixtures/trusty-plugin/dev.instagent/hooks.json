@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "hooks": [{ "command": "${PLUGIN_ROOT}/guard.sh" }] }
+    ]
+  }
+}
