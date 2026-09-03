@@ -3,10 +3,12 @@
 插件为核心的最小 agent（Rust 从零实现）。除了 5 个最简单的内置工具
 （`shell` `read` `write` `edit` `tree`），provider、MCP、skills、hooks、
 斜杠命令、command tools 全部以**插件**形式加载——provider 也不例外，
-内置的 6 个 provider（openai / ollama / groq / deepseek / openrouter /
-anthropic-compat）同样来自一个 bundled 插件。
+内置的 5 个 provider（openai / ollama / groq / deepseek / openrouter）
+同样来自一个 bundled 插件。
 
 - 使用说明：[`docs/usage.md`](docs/usage.md)
+- 架构总览：[`docs/architecture.md`](docs/architecture.md)
+- 决策记录：[`docs/adr/`](docs/adr/)（ADR 0001：不支持 Anthropic）
 - 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
 - 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
 - 插件规范：[Agent Plugins v1.0.0](https://agent-plugins.org/specification)
@@ -19,12 +21,7 @@ cargo build --release          # 产物 target/release/instagent
 cargo install --path . --bin instagent   # 或直接装到 ~/.cargo/bin（只装主二进制，不含测试 fixture）
 ```
 
-工具链要求见 `rust-toolchain.toml`。可选 feature `anthropic-engine`
-（原生 Messages API provider，todo 12）：
-
-```bash
-cargo build --release --features anthropic-engine
-```
+工具链要求见 `rust-toolchain.toml`。
 
 ## 快速上手
 
@@ -141,8 +138,8 @@ schema，只用它选本地校验规则）：
 }
 ```
 
-`dev.instagent/providers/groq.json`（engine 三选一：`openai` / `proxy` /
-`anthropic`〔需 `--features anthropic-engine`〕；支持 `${env:NAME}`、
+`dev.instagent/providers/groq.json`（engine 二选一：`openai` / `proxy`；
+支持 `${env:NAME}`、
 `${PLUGIN_ROOT}`、`${PLUGIN_DATA}`、`${PORT}` 展开；`base_url` 写到 `/v1`）：
 
 ```json
@@ -186,7 +183,7 @@ settings 里启用但目录已删的插件同样只警告不致命。详见第�
 ## 开发
 
 ```bash
-bash scripts/ci.sh        # = CI 全量：fmt / clippy / test（含 anthropic-engine）
+bash scripts/ci.sh        # = CI 全量：fmt / clippy / test
 cargo run -- --help
 ```
 
@@ -196,8 +193,6 @@ cargo run -- --help
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo clippy --all-targets --features anthropic-engine -- -D warnings
-cargo test --features anthropic-engine
 ```
 
 ## 手工验证清单（todos/18 · CLI 与运行时装配）

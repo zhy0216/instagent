@@ -12,12 +12,6 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo test"
 cargo test
 
-echo "==> cargo clippy --all-targets --features anthropic-engine -- -D warnings"
-cargo clippy --all-targets --features anthropic-engine -- -D warnings
-
-echo "==> cargo test --features anthropic-engine"
-cargo test --features anthropic-engine
-
 echo "==> cargo run -- --help"
 cargo run -q -- --help >/dev/null
 

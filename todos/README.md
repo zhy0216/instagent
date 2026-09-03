@@ -52,7 +52,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 | P1 | 04-plugin-manifest.md, 05-plugin-discovery.md, 06-plugin-mcp-config.md, 07-plugin-install-bundled.md | 插件加载 |
 | P1 | 08-provider-core-http.md, 09-provider-openai.md | provider 主路径 |
 | P2 | 10-provider-registry.md, 11-provider-proxy.md | provider 装配 |
-| P2 | 12-provider-anthropic.md | 可选 feature，可整段延后 |
+| P2 | 12-provider-anthropic.md | 可选 feature，可整段延后（后按 ADR 0001 整体移除） |
 | P2 | 13-tools-core-builtin.md, 14-tools-mcp.md, 15-tools-command-skills.md | 工具层 |
 | P3 | 16-agent-loop.md, 17-hooks-commands.md | loop 与扩展点 |
 | P4 | 18-cli.md, 19-hardening.md | 收口 |
@@ -73,7 +73,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 10. [done/09-provider-openai.md](done/09-provider-openai.md) — ✅ 完成。依赖：00、08
 11. [done/10-provider-registry.md](done/10-provider-registry.md) — ✅ 完成。依赖：00、08、09、07
 12. [done/11-provider-proxy.md](done/11-provider-proxy.md) — ✅ 完成。依赖：00、08、03、10
-13. [done/12-provider-anthropic.md](done/12-provider-anthropic.md) — ✅ 完成。依赖：00、08、10（可选）
+13. [done/12-provider-anthropic.md](done/12-provider-anthropic.md) — ✅ 完成，后按 `docs/adr/0001-no-anthropic-support.md` 整体移除。依赖：00、08、10（可选）
 14. [done/13-tools-core-builtin.md](done/13-tools-core-builtin.md) — ✅ 完成。依赖：00、03
 15. [done/14-tools-mcp.md](done/14-tools-mcp.md) — ✅ 完成。依赖：00、03、13、06
 16. [done/15-tools-command-skills.md](done/15-tools-command-skills.md) — ✅ 完成。依赖：00、13、05

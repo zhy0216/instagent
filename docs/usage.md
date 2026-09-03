@@ -3,8 +3,8 @@
 instagent 是一个**以插件为核心**的最小 agent：内核只有 5 个内置工具
 （`shell` `read` `write` `edit` `tree`）和一个 agent loop；provider、MCP
 server、skills、hooks、斜杠命令、command tools 全部以插件形式加载——连内置的
-6 个 provider 定义（openai / ollama / groq / deepseek / openrouter /
-anthropic-compat）也来自一个随二进制分发的 bundled 插件。
+5 个 provider 定义（openai / ollama / groq / deepseek / openrouter）
+也来自一个随二进制分发的 bundled 插件。
 
 插件格式遵循 [Agent Plugins v1.0.0](https://agent-plugins.org/specification)，
 hooks 的载荷与决策协议与 [block/goose](https://github.com/block/goose) 兼容。
@@ -35,12 +35,7 @@ cargo build --release                        # 产物 target/release/instagent
 cargo install --path . --bin instagent       # 装到 ~/.cargo/bin
 ```
 
-工具链版本要求见 `rust-toolchain.toml`。可选 feature `anthropic-engine`
-（原生 Anthropic Messages API 引擎，见 §10）：
-
-```bash
-cargo build --release --features anthropic-engine
-```
+工具链版本要求见 `rust-toolchain.toml`。
 
 ---
 
@@ -575,7 +570,6 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 | `groq` | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
 | `deepseek` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
 | `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
-| `anthropic-compat` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1`（走 OpenAI 兼容层） |
 
 模型列表见 `bundled/dev.instagent/providers/*.json`，也可用任意该服务
 支持的模型名（列表只影响上下文上限推导）。
@@ -604,7 +598,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 | 字段 | 说明 |
 |---|---|
 | `name` | provider 名（配置里 `provider:` 引用的名字） |
-| `engine` | `openai`（OpenAI 兼容 `/v1`）/ `proxy`（拉起本地代理进程）/ `anthropic`（原生 Messages API，需 `--features anthropic-engine`） |
+| `engine` | `openai`（OpenAI 兼容 `/v1`）/ `proxy`（拉起本地代理进程） |
 | `api_key_env` | 密钥环境变量名（密钥只能走环境变量或用户配置，不能写死在插件里） |
 | `base_url` | `openai` 引擎写到 `/v1`（请求时拼 `/chat/completions`） |
 | `headers` | 额外请求头，支持 `${env:NAME}` 展开 |
@@ -690,5 +684,5 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 开发自检：
 
 ```bash
-bash scripts/ci.sh    # fmt / clippy / test（含 anthropic-engine feature）
+bash scripts/ci.sh    # fmt / clippy / test
 ```

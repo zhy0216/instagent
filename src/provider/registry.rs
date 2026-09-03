@@ -5,8 +5,7 @@
 //! `${PLUGIN_DATA}`，`${PORT}` 原样保留给 `11` 拉起时展开）。
 //! 按名字查找（K2）：重名报错并要求写成 `plugin/name`；用户插件覆盖 bundled。
 //! engine 分派：`openai` → `09`；`proxy` → `11` 的 [`ProxyProvider`]（拉起 +
-//! 就绪轮询）；`anthropic` 分支由 `12` 接上原生引擎（feature
-//! `anthropic-engine` 开时构造 `AnthropicProvider`，关时保留 `bail!` 占位）。
+//! 就绪轮询）。
 //! `context_limit` 四级顺序：配置覆盖 → provider models 表 → `08` 前缀小表 → 128k。
 
 use std::collections::BTreeSet;
@@ -25,8 +24,6 @@ use crate::plugin::install::plugin_data_dir_at;
 use crate::plugin::PluginSet;
 use crate::plugin::PluginSource;
 use crate::plugin::NAMESPACE;
-#[cfg(feature = "anthropic-engine")]
-use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::context_limit_for;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::proxy::ProxyProvider;
@@ -118,21 +115,6 @@ impl ProviderRegistry {
                     .with_context(|| format!("provider `{}`", entry.qualified()))?;
                 Ok(Arc::new(provider))
             }
-            // `12` 接线：feature 开时构造原生 Messages API 引擎；关时保留占位 bail
-            // （M3：默认构建不编译 anthropic 模块）。
-            EngineKind::Anthropic => {
-                #[cfg(feature = "anthropic-engine")]
-                {
-                    Ok(Arc::new(AnthropicProvider::new(&entry.def)?))
-                }
-                #[cfg(not(feature = "anthropic-engine"))]
-                {
-                    bail!(
-                        "provider `{}` uses engine `anthropic`, not implemented yet (todo 12)",
-                        entry.qualified()
-                    )
-                }
-            }
         }
     }
 
@@ -219,7 +201,7 @@ impl ProviderRegistry {
     }
 }
 
-/// 加载期最小校验：engine 与必填字段匹配（占位分支语义见 `11` / `12`）。
+/// 加载期最小校验：engine 与必填字段匹配。
 fn validate_def(def: &ProviderDef) -> Result<()> {
     if def.name.is_empty() || def.name.contains('/') {
         bail!("provider name `{}` is empty or contains `/`", def.name);
@@ -241,7 +223,6 @@ fn validate_def(def: &ProviderDef) -> Result<()> {
                 );
             }
         }
-        EngineKind::Anthropic => {}
     }
     Ok(())
 }
@@ -552,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_dispatch_openai_proxy_and_anthropic() {
+    async fn engine_dispatch_openai_and_proxy() {
         let env = isolated();
         let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
         write_provider(
@@ -568,11 +549,6 @@ mod tests {
             "px.json",
             r#"{"name":"px","engine":"proxy","proxy":{"command":"no-such-proxy-binary-42","args":["--port","${PORT}"]}}"#,
         );
-        write_provider(
-            &p,
-            "anth.json",
-            &def_json("anth", "anthropic", "https://anth.test"),
-        );
         let registry = registry(&env, &[p]);
 
         let provider = registry.get("oai").await.unwrap();
@@ -583,20 +559,6 @@ mod tests {
             err.contains("spawn proxy command") && err.contains("no-such-proxy-binary-42"),
             "{err}"
         );
-
-        // 12 接线：feature 开时 anthropic 分支构造原生引擎实例；
-        // 关时保留占位 bail（M3 feature 隔离的另一半）。
-        let result = registry.get("anth").await;
-        if cfg!(feature = "anthropic-engine") {
-            let provider = result.expect("anthropic engine wired");
-            assert_eq!(provider.name(), "anth");
-        } else {
-            let err = result.map(drop).unwrap_err().to_string();
-            assert!(
-                err.contains("anthropic") && err.contains("todo 12"),
-                "{err}"
-            );
-        }
     }
 
     #[test]
@@ -646,14 +608,7 @@ mod tests {
         let names: Vec<&str> = listed.iter().map(String::as_str).collect();
         assert_eq!(
             names,
-            [
-                "anthropic-compat",
-                "deepseek",
-                "groq",
-                "ollama",
-                "openai",
-                "openrouter"
-            ]
+            ["deepseek", "groq", "ollama", "openai", "openrouter"]
         );
         // 转换约定：base_url 不带 /chat/completions，ollama 指本地。
         assert_eq!(

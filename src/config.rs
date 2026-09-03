@@ -189,9 +189,9 @@ mod tests {
     fn save_load_round_trip() {
         let (_guard, dir) = temp_config_dir();
         let config = Config {
-            provider: Some("anthropic".into()),
-            model: Some("claude-sonnet-4-5".into()),
-            api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            api_key_env: Some("OPENAI_API_KEY".into()),
             max_tokens: 4096,
             mode: Mode::Chat,
             max_turns: 50,

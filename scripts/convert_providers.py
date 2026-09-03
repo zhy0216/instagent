@@ -6,7 +6,7 @@
 commit 4ad43df 只读参考），按 `name`（含去掉 `custom_` 前缀后的名字）挑选，
 转换规则：base_url 去掉 `/chat/completions` 后缀（我们写到 `/v1`，引擎自己拼）、
 删除 setup / setup_steps 向导段与本内核不用的字段、`custom_` 前缀剥掉、
-engine=anthropic 的在 description 里标注需要 proxy 或原生 engine。
+engine=anthropic 直接报错退出（instagent 不支持 Anthropic，见 docs/adr/0001）。
 产物写入 OUT_DIR/<name>.json（产物是提交物，脚本只是生成器）。
 """
 import json
@@ -24,8 +24,8 @@ def convert(d):
     if d.get("base_url", "").endswith("/chat/completions"):
         d["base_url"] = d["base_url"][: -len("/chat/completions")]
     if d.get("engine") == "anthropic":
-        note = "[需 proxy 或原生 anthropic engine]"
-        d["description"] = f"{d.get('description', '')} {note}".strip()
+        sys.exit(f"provider `{d.get('name')}` engine=anthropic，"
+                 "instagent 不支持 Anthropic（docs/adr/0001-no-anthropic-support.md）")
     d["name"] = d["name"].removeprefix("custom_")
     d.setdefault("headers", {})
     d["models"] = [

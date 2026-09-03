@@ -1027,9 +1027,9 @@ mod tests {
 
     #[test]
     fn new_validates_engine_base_url_and_reads_env_key() {
-        let mut anthropic = def(Some("https://x.invalid/v1"));
-        anthropic.engine = EngineKind::Anthropic;
-        assert!(OpenAiProvider::new(&anthropic)
+        let mut proxy = def(Some("https://x.invalid/v1"));
+        proxy.engine = EngineKind::Proxy;
+        assert!(OpenAiProvider::new(&proxy)
             .unwrap_err()
             .to_string()
             .contains("not an openai engine"));

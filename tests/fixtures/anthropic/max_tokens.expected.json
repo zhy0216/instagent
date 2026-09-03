@@ -1,8 +1,0 @@
-[
-  { "kind": "text_delta", "text": "Partial answer" },
-  {
-    "kind": "done",
-    "usage": { "input": 10, "output": 25, "cache_read": 0, "cache_write": 0 },
-    "stop_reason": "max_tokens"
-  }
-]

@@ -324,7 +324,7 @@ fn duration_from_finite_secs(secs: f64) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs.min(MAX_RETRY_AFTER_SECS)))
 }
 
-/// `Retry-After`：只认非负整数秒（OpenAI / Anthropic / OpenRouter 实际都发
+/// `Retry-After`：只认非负整数秒（OpenAI / OpenRouter 实际都发
 /// 整数秒；HTTP-date 形式不解析，退回指数退避）。
 fn parse_retry_after_header(value: &str) -> Option<Duration> {
     value

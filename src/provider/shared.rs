@@ -1,7 +1,8 @@
-//! 引擎共享层（Q1–Q3 收敛）：openai / anthropic 两引擎逐字节相同或骨架同构
-//! 的公共件——错误转换、工具名 sanitize / 去重、空 arguments 兜底、
-//! SSE 流驱动器与构造骨架。引擎只提供「事件 → 状态」回调与引擎特有声明；
-//! 语义与共享抽象冲突时允许保留引擎特有代码（plan 风险条款）。
+//! 引擎共享层（Q1–Q3 收敛）：错误转换、工具名 sanitize / 去重、空 arguments
+//! 兜底、SSE 流驱动器与构造骨架。引擎只提供「事件 → 状态」回调与引擎特有
+//! 声明；语义与共享抽象冲突时允许保留引擎特有代码（plan 风险条款）。
+//! 现为 openai 引擎（含 proxy 内嵌的 openai 引擎）的公共件；历史上曾同时
+//! 服务 anthropic 引擎（ADR 0001 移除）。
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -27,8 +28,7 @@ use crate::tools::ToolSpec;
 pub const MAX_FUNCTION_NAME_LENGTH: usize = 64;
 
 /// 怪癖 2：只允许 `[A-Za-z0-9_-]`，非法字符替换为 `_`，超长截断到 64
-/// （goose formats/openai.rs:1918 sanitize_function_name 的规则，长度取 64；
-/// Anthropic 字符集相同，两引擎共用）。
+/// （goose formats/openai.rs:1918 sanitize_function_name 的规则，长度取 64）。
 /// 幂等：sanitize(sanitize(x)) == sanitize(x)。
 pub fn sanitize_function_name(name: &str) -> String {
     let sanitized: String = name
@@ -50,8 +50,8 @@ pub fn sanitize_function_name(name: &str) -> String {
     }
 }
 
-/// 两引擎 `format_tools` 共享的 sanitize + `seen` 去重循环：按原序返回
-/// sanitize 后的名字，sanitize 后重名直接报错（错误文案与原两引擎一致）。
+/// `format_tools` 的 sanitize + `seen` 去重循环：按原序返回
+/// sanitize 后的名字，sanitize 后重名直接报错。
 pub fn sanitized_tool_names(tools: &[ToolSpec]) -> crate::Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(tools.len());
@@ -67,7 +67,7 @@ pub fn sanitized_tool_names(tools: &[ToolSpec]) -> crate::Result<Vec<String>> {
     Ok(out)
 }
 
-/// 空（纯空白）arguments → `"{}"`（openai 怪癖 4 响应侧 / anthropic 空输入同规则）。
+/// 空（纯空白）arguments → `"{}"`（openai 怪癖 4 响应侧）。
 pub fn arguments_or_empty(arguments: String) -> String {
     if arguments.trim().is_empty() {
         "{}".to_string()
@@ -85,8 +85,8 @@ pub fn to_provider_error(err: anyhow::Error) -> ProviderError {
     }
 }
 
-/// 累积中的 tool call：openai 按 `delta.tool_calls[].index`、anthropic 按
-/// content block `index` 累积，流结束时整组 flush。
+/// 累积中的 tool call：openai 按 `delta.tool_calls[].index` 累积，
+/// 流结束时整组 flush。
 #[derive(Debug, Default)]
 pub struct PendingCall {
     pub id: String,
@@ -96,14 +96,13 @@ pub struct PendingCall {
 
 // ---------------------------------------------------------------------------
 // 引擎构造 / 请求骨架（Q2）：new / request_headers / stream 的公共部分；
-// 引擎只声明 EngineKind 与补充鉴权头（Bearer vs x-api-key+version）。
+// 引擎只声明 EngineKind 与补充鉴权头。
 // ---------------------------------------------------------------------------
 
-/// 引擎种类名（小写，错误文案与两引擎原文一致）。
+/// 引擎种类名（小写，错误文案用）。
 fn engine_kind_name(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Openai => "openai",
-        EngineKind::Anthropic => "anthropic",
         EngineKind::Proxy => "proxy",
     }
 }
@@ -144,7 +143,7 @@ pub fn headers_with_auth(
     headers
 }
 
-/// `base_url` 必填，缺失 → Transport（两引擎 stream() 共用，错误文案一致）。
+/// `base_url` 必填，缺失 → Transport。
 pub fn require_base_url(def: &ProviderDef) -> Result<&str, ProviderError> {
     def.base_url
         .as_deref()
@@ -152,17 +151,17 @@ pub fn require_base_url(def: &ProviderDef) -> Result<&str, ProviderError> {
 }
 
 // ---------------------------------------------------------------------------
-// SSE 流驱动层（Q1）：两引擎 unfold 骨架 ~90% 相同，抽成通用驱动器；
+// SSE 流驱动层（Q1）：通用驱动器；
 // 引擎只提供「事件 → 状态」回调（apply）与收尾钩子（finalize）。
 // ---------------------------------------------------------------------------
 
-/// 两引擎共享的流状态：输出队列、按 index 累积的待发 tool、终止标记。
-/// usage 口径与 finalize 语义各引擎不同，留在引擎侧。
+/// 流状态：输出队列、按 index 累积的待发 tool、终止标记。
+/// usage 口径与 finalize 语义留在引擎侧。
 #[derive(Debug, Default)]
 pub struct StreamState {
     pub out: VecDeque<Result<StreamEvent, ProviderError>>,
     pub tools: BTreeMap<i64, PendingCall>,
-    /// 记录到的终止原因（openai `finish_reason` / anthropic `stop_reason`）。
+    /// 记录到的终止原因（openai `finish_reason`）。
     pub stop: Option<String>,
     pub ended: bool,
 }
@@ -174,12 +173,11 @@ pub trait StreamEngine: Send {
     fn ended(&mut self) -> &mut bool;
     /// 处理一条 SSE 事件；`Err` 以该错误终止流。
     fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError>;
-    /// `[DONE]`（openai）/ `message_stop`（anthropic）/ 断流收尾。
+    /// `[DONE]` / 断流收尾。
     fn finalize(&mut self);
 }
 
-/// 空 data 跳过 + JSON parse；畸形块 → `Transport("malformed SSE chunk …")`
-/// （两引擎原错误文案逐字节一致）。
+/// 空 data 跳过 + JSON parse；畸形块 → `Transport("malformed SSE chunk …")`。
 pub fn parse_chunk(ev: &SseEvent) -> Result<Option<Value>, ProviderError> {
     let data = ev.data.trim();
     if data.is_empty() {
@@ -228,8 +226,8 @@ pub fn sse_to_stream_events<E: StreamEngine + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// 两引擎共享测试脚手架（Q3 收敛）：引擎测试只保留各自的引擎种类 / 模型 /
-// 路径等参数差异，重复骨架集中在这里。
+// 测试脚手架（Q3 收敛）：引擎测试只保留引擎种类 / 模型 / 路径等参数差异，
+// 重复骨架集中在这里。
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

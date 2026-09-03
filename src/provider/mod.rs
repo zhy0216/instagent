@@ -1,10 +1,8 @@
 //! provider 层（第二版 §2.3；第三版 §2.4：provider 定义来自插件，内核只有引擎）。
 //!
 //! 类型布局由 00 锁定；`context_limit_for` 由 08 实现，
-//! engine 实现在 [`openai`] / [`proxy`] / [`anthropic`]，装配在 [`registry`]。
+//! engine 实现在 [`openai`] / [`proxy`]，装配在 [`registry`]。
 
-#[cfg(feature = "anthropic-engine")]
-pub mod anthropic;
 pub mod http;
 pub mod openai;
 pub mod proxy;
@@ -161,8 +159,6 @@ pub struct ProviderDef {
 pub enum EngineKind {
     Openai,
     Proxy,
-    /// cargo feature `anthropic-engine`（`12`）。
-    Anthropic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
