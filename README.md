@@ -6,6 +6,7 @@
 内置的 6 个 provider（openai / ollama / groq / deepseek / openrouter /
 anthropic-compat）同样来自一个 bundled 插件。
 
+- 使用说明：[`docs/usage.md`](docs/usage.md)
 - 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
 - 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
 - 插件规范：[Agent Plugins v1.0.0](https://agent-plugins.org/specification)
