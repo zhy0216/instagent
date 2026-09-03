@@ -61,19 +61,14 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     /// 扫描 [`PluginSet`]（含 bundled）所有插件的 provider JSON 并装配。
-    /// `config` 当前只在 [`Self::context_limit`] 按调用读取，这里保留入参。
-    pub fn from_plugins(plugins: &PluginSet, config: &Config) -> Result<Self> {
-        Self::from_plugins_at(plugins, config, &data_dir()?)
+    pub fn from_plugins(plugins: &PluginSet) -> Result<Self> {
+        Self::from_plugins_at(plugins, &data_dir()?)
     }
 
     /// [`Self::from_plugins`] 的路径层：`PLUGIN_DATA` 的数据根由参数给出
     /// （约定同 `07` 的 `load_bundled_at`，测试不必改写进程全局
     /// `INSTAGENT_DATA_DIR`；全 crate 测试共用 `config::lock_env` 一把锁）。
-    pub(crate) fn from_plugins_at(
-        plugins: &PluginSet,
-        _config: &Config,
-        data_base: &Path,
-    ) -> Result<Self> {
+    pub(crate) fn from_plugins_at(plugins: &PluginSet, data_base: &Path) -> Result<Self> {
         let mut entries = Vec::new();
         for plugin in plugins.iter() {
             let dir = plugin.root.join(NAMESPACE).join(PROVIDERS_DIR);
@@ -144,6 +139,11 @@ impl ProviderRegistry {
     /// 按名字解析出定义（重名报错 / bundled 覆盖 / `plugin/name` 消歧）。
     pub fn lookup(&self, name: &str) -> Result<&ProviderDef> {
         Ok(&self.resolve(name)?.def)
+    }
+
+    /// 定义该 provider 的插件名（信任门控用）。
+    pub fn provider_plugin(&self, name: &str) -> Result<String> {
+        Ok(self.resolve(name)?.plugin.clone())
     }
 
     /// 全部可用名（错误提示 / 补全用）；重名的裸名同时给出 `plugin/name` 形态。
@@ -354,7 +354,6 @@ mod tests {
                 license: None,
                 keywords: vec![],
                 extensions: BTreeMap::new(),
-                unknown: BTreeMap::new(),
             },
             root,
             source,
@@ -371,8 +370,7 @@ mod tests {
             plugins: plugins.to_vec(),
             skipped: vec![],
         };
-        ProviderRegistry::from_plugins_at(&set, &Config::default(), env.data.path())
-            .expect("from_plugins_at")
+        ProviderRegistry::from_plugins_at(&set, env.data.path()).expect("from_plugins_at")
     }
 
     fn def_json(name: &str, engine: &str, base_url: &str) -> String {
@@ -436,8 +434,7 @@ mod tests {
             plugins: vec![p],
             skipped: vec![],
         };
-        let err = ProviderRegistry::from_plugins_at(&set, &Config::default(), env.data.path())
-            .unwrap_err();
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("acme"), "{message}");
         assert!(message.contains("REG_TEST_UNDEFINED"), "{message}");
@@ -501,18 +498,15 @@ mod tests {
             r#"{"name":"groq","engine":"openai","display_name":"Groq (mine)","base_url":"https://user.test/v1","headers":{}}"#,
         );
         let registry = registry(&env, &[bundled, user]);
+        // 用户插件覆盖 bundled：裸名解析到 user 的 base_url。
         assert_eq!(
-            registry.lookup("groq").unwrap().display_name.as_deref(),
-            Some("Groq (mine)")
+            registry.lookup("groq").unwrap().base_url.as_deref(),
+            Some("https://user.test/v1")
         );
         // 显式点名 bundled 仍然可达。
         assert_eq!(
-            registry
-                .lookup("bundled/groq")
-                .unwrap()
-                .display_name
-                .as_deref(),
-            Some("Groq (bundled)")
+            registry.lookup("bundled/groq").unwrap().base_url.as_deref(),
+            Some("https://bundled.test/v1")
         );
     }
 
@@ -614,8 +608,7 @@ mod tests {
             plugins: vec![p.clone()],
             skipped: vec![],
         };
-        let err = ProviderRegistry::from_plugins_at(&set, &Config::default(), env.data.path())
-            .unwrap_err();
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
         assert!(err.to_string().contains("proxy section"), "{err:#}");
 
         let q = plugin(env.data.path().join("q"), "q", PluginSource::User);
@@ -633,8 +626,7 @@ mod tests {
             plugins: vec![q],
             skipped: vec![],
         };
-        let err = ProviderRegistry::from_plugins_at(&set, &Config::default(), env.data.path())
-            .unwrap_err();
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
         assert!(
             err.to_string().contains("declares provider `dup` twice"),
             "{err:#}"

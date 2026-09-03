@@ -190,7 +190,7 @@ fn register(
     skipped: &mut Vec<SkippedPlugin>,
 ) {
     let manifest = match read_manifest(dir) {
-        Ok(validated) => validated.manifest,
+        Ok(manifest) => manifest,
         Err(err) => {
             skipped.push(SkippedPlugin {
                 path: dir.to_path_buf(),

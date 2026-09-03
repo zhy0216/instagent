@@ -77,10 +77,6 @@ pub struct AutoUpdateResult {
     pub result: crate::Result<()>,
 }
 
-fn now_ts() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
 /// `<data_dir>`：`INSTAGENT_DATA_DIR` 优先，否则 etcetera（XDG）的
 /// `~/.local/share/instagent`——约定与 `session.rs` 完全一致。
 ///
@@ -129,7 +125,7 @@ fn user_plugins_dir() -> crate::Result<PathBuf> {
 /// clone / 复制 → 校验 → 写 `.install.json` → 放入用户目录。
 /// 同名插件重复 install 即覆盖更新。
 pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<Plugin> {
-    let now = now_ts();
+    let now = crate::message::now_ts();
     let staging = Staging::new()?;
     let commit = match source {
         InstallSource::GitUrl(url) => {
@@ -147,9 +143,8 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
             None
         }
     };
-    let manifest = read_manifest(&staging.path)
-        .with_context(|| format!("validate plugin at {source:?}"))?
-        .manifest;
+    let manifest =
+        read_manifest(&staging.path).with_context(|| format!("validate plugin at {source:?}"))?;
     let info = InstallInfo {
         source: match source {
             InstallSource::GitUrl(url) => url.clone(),
@@ -167,7 +162,7 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
 
 /// 按 `.install.json` 重新拉取（手动 update 不受节流限制）。
 pub fn update(name: &str) -> crate::Result<()> {
-    update_at(name, now_ts())
+    update_at(name, crate::message::now_ts())
 }
 
 /// 24h 节流的纯时间判定（goose `should_auto_update`）。
@@ -228,7 +223,7 @@ pub fn list(cwd: &Path) -> crate::Result<Vec<InstalledPlugin>> {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(manifest) = read_manifest(&dir).map(|v| v.manifest) else {
+        let Ok(manifest) = read_manifest(&dir) else {
             continue;
         };
         let name = &manifest.name;
@@ -333,8 +328,7 @@ fn update_at(name: &str, now: i64) -> crate::Result<()> {
     let commit = head_commit(&staging.path)?;
     remove_git_dir(&staging.path)?;
     let manifest = read_manifest(&staging.path)
-        .with_context(|| format!("validate updated plugin `{name}`"))?
-        .manifest;
+        .with_context(|| format!("validate updated plugin `{name}`"))?;
     if manifest.name != name {
         staging.cleanup_ok();
         bail!(
@@ -708,9 +702,7 @@ mod tests {
         git_commit(repo.path(), "bump 2.0.0");
         update("git-plugin").unwrap();
 
-        let updated = crate::plugin::manifest::read_manifest(&plugin.root)
-            .unwrap()
-            .manifest;
+        let updated = crate::plugin::manifest::read_manifest(&plugin.root).unwrap();
         assert_eq!(updated.version, "2.0.0");
         let info = read_install_info(&plugin.root).unwrap();
         assert_eq!(info.installed_at, old.installed_at);
@@ -742,7 +734,7 @@ mod tests {
         .unwrap();
         let installed_at = read_install_info(&plugin.root).unwrap().installed_at;
         assert!(
-            installed_at > 0 && installed_at <= now_ts(),
+            installed_at > 0 && installed_at <= crate::message::now_ts(),
             "just installed"
         );
 
@@ -763,7 +755,6 @@ mod tests {
         assert_eq!(
             crate::plugin::manifest::read_manifest(&plugin.root)
                 .unwrap()
-                .manifest
                 .version,
             "2.0.0"
         );

@@ -335,22 +335,12 @@ fn confirm_trust(
     out: &mut dyn Write,
 ) -> instagent::Result<()> {
     let mut trusted = trust::user_trusted()?;
-    let granted = trust::ensure_trusted(
-        plugin,
-        &trust::plugin_surfaces(plugin)?,
-        &mut trusted,
-        yes,
-        reader,
-        out,
-    )?;
-    if granted && !plugin_surfaces_empty(plugin)? {
+    let surfaces = trust::plugin_surfaces(plugin)?;
+    let granted = trust::ensure_trusted(plugin, &surfaces, &mut trusted, yes, reader, out)?;
+    if granted && !surfaces.is_empty() {
         writeln!(out, "plugin `{}` trusted", plugin.manifest.name)?;
     }
     Ok(())
-}
-
-fn plugin_surfaces_empty(plugin: &Plugin) -> instagent::Result<bool> {
-    Ok(trust::plugin_surfaces(plugin)?.is_empty())
 }
 
 #[cfg(test)]

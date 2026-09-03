@@ -30,8 +30,8 @@ use crate::tools::ToolSpec;
 /// `description` 上限（Agent Skills 规范）。
 pub const MAX_DESCRIPTION_CHARS: usize = 1024;
 
-/// SKILL.md frontmatter（Agent Skills 规范）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// SKILL.md frontmatter（Agent Skills 规范）。`allowed-tools` 等未知字段忽略。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillFrontmatter {
     /// 必需，1~64，小写字母数字和 `-`，必须等于目录名。
     pub name: String,
@@ -43,9 +43,6 @@ pub struct SkillFrontmatter {
     pub compatibility: Option<String>,
     #[serde(default)]
     pub metadata: Option<Value>,
-    /// 实验字段，v2 给审批白名单加临时项（这里只解析不使用）。
-    #[serde(default, rename = "allowed-tools")]
-    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// 一个已发现 skill 的元信息（进系统提示的那一行）。
@@ -141,7 +138,7 @@ fn scan_skills_root(
 
 /// frontmatter 解析 + 规范校验（name 字符集 / description 长度 / name == 目录名）。
 fn validate_skill(text: &str, dir_name: &str) -> crate::Result<SkillFrontmatter> {
-    let (frontmatter, _body) = parse_frontmatter(text)?;
+    let (frontmatter, _body) = parse_frontmatter::<SkillFrontmatter>(text, false)?;
     if !is_valid_skill_name(&frontmatter.name) {
         bail!(
             "name `{}` 不符合规范（1~64 位小写字母、数字或 `-`）",
@@ -245,7 +242,7 @@ fn load_skill_body(skill: &SkillMeta) -> ToolOutput {
         Ok(text) => text,
         Err(err) => return ToolOutput::err(format!("Failed to read {}: {err}", path.display())),
     };
-    match parse_frontmatter(&text) {
+    match parse_frontmatter::<SkillFrontmatter>(&text, false) {
         Ok((_frontmatter, body)) => ToolOutput::ok(body),
         Err(err) => ToolOutput::err(format!("Failed to parse {}: {err:#}", path.display())),
     }
@@ -265,14 +262,20 @@ fn load_supporting_file(skill: &SkillMeta, file: &str) -> ToolOutput {
 }
 
 /// 拆分并解析 `---` frontmatter，返回（元信息，正文）。
-pub fn parse_frontmatter(text: &str) -> crate::Result<(SkillFrontmatter, String)> {
+/// 缺失 frontmatter：`missing_ok` 为真时容忍（元信息取 Default，整篇是正文），
+/// 否则报错。
+pub fn parse_frontmatter<F>(text: &str, missing_ok: bool) -> crate::Result<(F, String)>
+where
+    F: serde::de::DeserializeOwned + Default,
+{
     let text = text.trim_start_matches('\u{feff}');
     let rest = match text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))
     {
         Some(rest) => rest,
-        None => bail!("SKILL.md must start with a `---` frontmatter block"),
+        None if missing_ok => return Ok((F::default(), text.trim().to_string())),
+        None => bail!("missing a `---` frontmatter block"),
     };
     let mut fm_lines: Vec<&str> = Vec::new();
     let mut body_start: Option<usize> = None;
@@ -288,7 +291,7 @@ pub fn parse_frontmatter(text: &str) -> crate::Result<(SkillFrontmatter, String)
     let Some(body_start) = body_start else {
         bail!("unterminated frontmatter: missing closing `---`");
     };
-    let frontmatter: SkillFrontmatter = serde_yaml::from_str(&fm_lines.join("\n"))
+    let frontmatter: F = serde_yaml::from_str(&fm_lines.join("\n"))
         .map_err(|err| anyhow::anyhow!("invalid frontmatter YAML: {err}"))?;
     Ok((frontmatter, rest[body_start..].trim().to_string()))
 }
@@ -542,24 +545,26 @@ mod tests {
     fn parse_frontmatter_reads_optional_fields_and_body() {
         let text = "---\nname: my-skill\ndescription: does things\nlicense: MIT\n\
                     allowed-tools: [read_file]\nmetadata:\n  x: 1\n---\n\nDo it.\n";
-        let (fm, body) = parse_frontmatter(text).unwrap();
+        let (fm, body) = parse_frontmatter::<SkillFrontmatter>(text, false).unwrap();
         assert_eq!(fm.name, "my-skill");
         assert_eq!(fm.description, "does things");
         assert_eq!(fm.license.as_deref(), Some("MIT"));
-        let expected: Vec<String> = vec!["read_file".to_string()];
-        assert_eq!(fm.allowed_tools.as_deref(), Some(expected.as_slice()));
         assert_eq!(fm.metadata, Some(json!({"x": 1})));
         assert_eq!(body, "Do it.");
     }
 
     #[test]
     fn parse_frontmatter_rejects_malformed_blocks() {
-        assert!(parse_frontmatter("no frontmatter").is_err());
-        assert!(parse_frontmatter("---\nname: x\ndescription: y\n").is_err());
+        assert!(parse_frontmatter::<SkillFrontmatter>("no frontmatter", false).is_err());
+        assert!(
+            parse_frontmatter::<SkillFrontmatter>("---\nname: x\ndescription: y\n", false).is_err()
+        );
         // 缺 description。
-        assert!(parse_frontmatter("---\nname: x\n---\nbody\n").is_err());
+        assert!(parse_frontmatter::<SkillFrontmatter>("---\nname: x\n---\nbody\n", false).is_err());
         // 非法 YAML。
-        assert!(parse_frontmatter("---\nname: [unclosed\n---\n").is_err());
+        assert!(
+            parse_frontmatter::<SkillFrontmatter>("---\nname: [unclosed\n---\n", false).is_err()
+        );
     }
 
     #[test]

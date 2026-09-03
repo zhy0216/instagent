@@ -139,10 +139,6 @@ mod tests {
 pub struct ProviderDef {
     pub name: String,
     pub engine: EngineKind,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
     /// 密钥只能走环境变量（第三版 §2.10）。
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -174,8 +170,6 @@ pub struct ModelDef {
     pub name: String,
     #[serde(default)]
     pub context_limit: Option<u32>,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
 }
 
 /// `engine: "proxy"` 的拉起配置（第三版 §2.4）。

@@ -128,31 +128,17 @@ pub fn plugin_surfaces(plugin: &Plugin) -> instagent::Result<Vec<Surface>> {
 
 /// 用户层 settings 里的 `trustedPlugins`。
 pub fn user_trusted() -> instagent::Result<Vec<String>> {
-    let path = instagent::config::config_dir()?.join("settings.json");
-    let settings = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<Settings>(&text)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
-        Err(err) => return Err(err.into()),
-    };
-    Ok(settings.trusted_plugins)
+    Ok(Settings::load_user()?.trusted_plugins)
 }
 
 /// 记入用户层 settings 的 `trustedPlugins`（只动信任字段，不合并其他层）。
 pub fn persist_trust(name: &str) -> instagent::Result<()> {
-    let path = instagent::config::config_dir()?.join("settings.json");
-    let mut settings = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<Settings>(&text)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
-        Err(err) => return Err(err.into()),
-    };
+    let mut settings = Settings::load_user()?;
     if !settings.trusted_plugins.iter().any(|t| t == name) {
         settings.trusted_plugins.push(name.to_string());
     }
     settings
-        .save(
-            &PathBuf::from("/"),
-            instagent::settings::SettingsLayer::User,
-        )
+        .save_user()
         .with_context(|| format!("persist trustedPlugins for `{name}`"))
 }
 
@@ -227,9 +213,7 @@ mod tests {
         fixtures::add_provider(&plugin_dir, fixtures::proxy_provider());
 
         let plugin = Plugin {
-            manifest: instagent::plugin::manifest::read_manifest(&plugin_dir)
-                .unwrap()
-                .manifest,
+            manifest: instagent::plugin::manifest::read_manifest(&plugin_dir).unwrap(),
             root: plugin_dir,
             source: instagent::plugin::PluginSource::User,
         };
@@ -276,9 +260,7 @@ mod tests {
         let plugin_dir = env.user_plugin("trustme");
         fixtures::add_exec_surfaces(&plugin_dir);
         let plugin = Plugin {
-            manifest: instagent::plugin::manifest::read_manifest(&plugin_dir)
-                .unwrap()
-                .manifest,
+            manifest: instagent::plugin::manifest::read_manifest(&plugin_dir).unwrap(),
             root: plugin_dir,
             source: instagent::plugin::PluginSource::User,
         };
@@ -332,9 +314,7 @@ mod tests {
         assert!(out2.is_empty());
         let quiet = env.user_plugin("silent");
         let quiet = Plugin {
-            manifest: instagent::plugin::manifest::read_manifest(&quiet)
-                .unwrap()
-                .manifest,
+            manifest: instagent::plugin::manifest::read_manifest(&quiet).unwrap(),
             root: quiet,
             source: instagent::plugin::PluginSource::User,
         };

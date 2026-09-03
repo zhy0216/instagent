@@ -109,7 +109,6 @@ struct Route {
 #[derive(Default)]
 struct Routes {
     forward: HashMap<String, Route>,
-    reverse: HashMap<(usize, String), String>,
 }
 
 /// 汇总多个来源，按模型可见名路由（名字映射表在实现里，双向且会话内稳定）。
@@ -162,9 +161,6 @@ impl Registry {
                         name: spec.name.clone(),
                     },
                 );
-                routes
-                    .reverse
-                    .insert((idx, spec.name.clone()), visible.clone());
                 let mut spec = spec;
                 spec.name = visible;
                 specs.push(spec);
@@ -186,12 +182,6 @@ impl Registry {
             }
             None => ToolOutput::err(format!("unknown tool: {}", call.name)),
         }
-    }
-
-    /// 反查：模型可见名 → (来源 id, 来源内真实工具名)。
-    pub async fn route_of(&self, visible: &str) -> Option<(String, String)> {
-        let route = self.lookup(visible).await?;
-        Some((self.sources[route.source].id().to_string(), route.name))
     }
 
     async fn lookup(&self, visible: &str) -> Option<Route> {
@@ -363,11 +353,6 @@ mod tests {
             "加前缀后的可见名要能路由回未加前缀的真名"
         );
         assert!(registry.call(&call("nope"), &ctx).await.is_error);
-
-        assert_eq!(
-            registry.route_of("gamma__dup").await,
-            Some(("cmd:gamma".to_string(), "dup".to_string()))
-        );
     }
 
     #[tokio::test]

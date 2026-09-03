@@ -66,7 +66,7 @@ pub fn load_bundled() -> crate::Result<Plugin> {
 /// 进程全局 `INSTAGENT_DATA_DIR`）。
 pub(crate) fn load_bundled_at(base: &Path) -> crate::Result<Plugin> {
     let root = materialize_at(base)?;
-    let manifest = read_manifest(&root)?.manifest;
+    let manifest = read_manifest(&root)?;
     if manifest.name != BUNDLED_PLUGIN_NAME {
         bail!(
             "bundled plugin.json declares name `{}` (expected `{BUNDLED_PLUGIN_NAME}`)",
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_and_loads_with_validated_manifest() {
+    fn materializes_and_loads_bundled_manifest() {
         let env = isolated();
         let plugin = load_bundled_at(env.data.path()).unwrap();
         assert_eq!(plugin.manifest.name, BUNDLED_PLUGIN_NAME);
@@ -193,7 +193,6 @@ mod tests {
             env.data.path().join(BUNDLED_PLUGIN_NAME),
             "materialized under the given data root"
         );
-        assert_eq!(plugin.manifest.min_kernel(), Some("0.1"));
     }
 
     #[test]

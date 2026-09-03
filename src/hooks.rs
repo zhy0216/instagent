@@ -22,14 +22,14 @@ use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
-use crate::subprocess::drain;
-use crate::subprocess::read_all;
+use crate::subprocess::wait_and_drain;
+use crate::subprocess::write_stdin;
+use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 
 /// 默认超时 30s（§2.7）。
@@ -495,35 +495,12 @@ async fn run_hook(
     };
 
     // 载荷后台写 stdin（防大输入死锁；脚本不读时 BrokenPipe 忽略）。
-    let bytes = payload.as_bytes().to_vec();
-    if let Some(mut stdin) = child.child_mut().stdin.take() {
-        tokio::spawn(async move {
-            let _ = stdin.write_all(&bytes).await;
-            let _ = stdin.shutdown().await;
-        });
-    }
-    let mut stdout_task = tokio::spawn(read_all(
-        child.child_mut().stdout.take().expect("stdout piped"),
-    ));
-    let mut stderr_task = tokio::spawn(read_all(
-        child.child_mut().stderr.take().expect("stderr piped"),
-    ));
-
-    let mut timed_out = false;
-    let exit_code = tokio::select! {
-        biased;
-        _ = tokio::time::sleep(timeout) => {
-            timed_out = true;
-            None
-        }
-        status = child.child_mut().wait() => status.ok().and_then(|s| s.code()),
-    };
-    if timed_out {
-        drop(child); // 进程组守卫：SIGKILL 整组（含孙进程）
-    }
-    let stdout = drain(&mut stdout_task).await;
-    let stderr = drain(&mut stderr_task).await;
-    if timed_out {
+    write_stdin(&mut child, payload.as_bytes());
+    let run = wait_and_drain(child, timeout, None).await;
+    let exit_code = run.exit_code();
+    let stdout = run.stdout;
+    let stderr = run.stderr;
+    if run.outcome == Outcome::TimedOut {
         tracing::warn!(
             "hook `{}` 超时 {timeout:?}，按 on_failure 处理",
             hook.command
@@ -604,9 +581,9 @@ mod tests {
     fn plugin_set(roots: &[&Path]) -> PluginSet {
         let mut set = PluginSet::default();
         for root in roots {
-            let validated = crate::plugin::manifest::read_manifest(root).unwrap();
+            let manifest = crate::plugin::manifest::read_manifest(root).unwrap();
             set.plugins.push(Plugin {
-                manifest: validated.manifest,
+                manifest,
                 root: root.to_path_buf(),
                 source: PluginSource::Extra,
             });

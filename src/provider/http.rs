@@ -8,12 +8,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::time::Duration;
-use std::time::SystemTime;
 
-use chrono::DateTime;
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -27,7 +22,7 @@ use serde_json::Value;
 use crate::error::ProviderError;
 
 /// 429 / 500 / 502 / 503 / 529 重试（goose retry.rs）。
-pub const RETRYABLE_STATUSES: [u16; 5] = [429, 500, 502, 503, 529];
+const RETRYABLE_STATUSES: [u16; 5] = [429, 500, 502, 503, 529];
 pub const MAX_RETRIES: u32 = 3;
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const BACKOFF_FACTOR: u32 = 2;
@@ -329,34 +324,14 @@ fn duration_from_finite_secs(secs: f64) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs.min(MAX_RETRY_AFTER_SECS)))
 }
 
-/// `Retry-After` 按 RFC 7231 §7.1.3：非负整数秒，或 HTTP-date（过去时间
-/// 当"立即可重试"的 `Duration::ZERO`，而不是丢弃提示退回指数退避）。
+/// `Retry-After`：只认非负整数秒（OpenAI / Anthropic / OpenRouter 实际都发
+/// 整数秒；HTTP-date 形式不解析，退回指数退避）。
 fn parse_retry_after_header(value: &str) -> Option<Duration> {
-    if let Ok(secs) = value.parse::<u64>() {
-        return duration_from_finite_secs(secs as f64);
-    }
-    let target = parse_http_date(value)?;
-    let delay = target
-        .duration_since(SystemTime::now())
-        .unwrap_or(Duration::ZERO);
-    duration_from_finite_secs(delay.as_secs_f64())
-}
-
-/// RFC 7231 §7.1.1.1 要求接收方接受的三种 HTTP-date 形式，一律按 GMT 解释。
-fn parse_http_date(value: &str) -> Option<SystemTime> {
-    let value = value.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc2822(value) {
-        return Some(SystemTime::from(dt));
-    }
-    if let Some(rest) = value.strip_suffix(" GMT") {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(rest, "%A, %d-%b-%y %H:%M:%S") {
-            return Some(SystemTime::from(Utc.from_utc_datetime(&naive)));
-        }
-    }
-    if let Ok(naive) = NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
-        return Some(SystemTime::from(Utc.from_utc_datetime(&naive)));
-    }
-    None
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|secs| duration_from_finite_secs(secs as f64))
 }
 
 #[cfg(test)]
@@ -472,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_header_seconds_http_date_and_cap() {
+    fn retry_after_header_seconds_parsed_and_capped() {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
         assert_eq!(
@@ -480,16 +455,14 @@ mod tests {
             Some(Duration::from_secs(2))
         );
 
+        // 非整数秒（含 HTTP-date）不解析：退回指数退避。
         headers.insert(RETRY_AFTER, HeaderValue::from_static("1e30"));
         assert_eq!(extract_retry_after(&headers, &Value::Null), None);
         headers.insert(
             RETRY_AFTER,
             HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
         );
-        assert_eq!(
-            extract_retry_after(&headers, &Value::Null),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(extract_retry_after(&headers, &Value::Null), None);
 
         headers.insert(RETRY_AFTER, HeaderValue::from_static("99999999999999"));
         assert_eq!(

@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -21,6 +22,19 @@ pub enum Mode {
     Approve,
     /// 不给模型工具。
     Chat,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "auto" => Mode::Auto,
+            "approve" => Mode::Approve,
+            "chat" => Mode::Chat,
+            other => anyhow::bail!("invalid mode `{other}` (expected auto|approve|chat)"),
+        })
+    }
 }
 
 /// `~/.config/instagent/config.yaml` 的完整形状。
@@ -131,12 +145,9 @@ fn apply_env_overrides(config: &mut Config) -> crate::Result<()> {
         config.model = Some(value);
     }
     if let Some(value) = env_override("INSTAGENT_MODE") {
-        config.mode = match value.to_ascii_lowercase().as_str() {
-            "auto" => Mode::Auto,
-            "approve" => Mode::Approve,
-            "chat" => Mode::Chat,
-            other => anyhow::bail!("invalid INSTAGENT_MODE: {other} (expected auto|approve|chat)"),
-        };
+        config.mode = value
+            .parse()
+            .with_context(|| format!("invalid INSTAGENT_MODE: {value}"))?;
     }
     Ok(())
 }

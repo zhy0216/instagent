@@ -15,7 +15,6 @@ use serde_json::json;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use instagent::config::Config;
 use instagent::message::Message;
 use instagent::plugin::manifest::PluginManifest;
 use instagent::plugin::Plugin;
@@ -38,8 +37,6 @@ fn proxy_def(args: Vec<String>, env: BTreeMap<String, String>, timeout_secs: u64
     ProviderDef {
         name: "fake".to_string(),
         engine: EngineKind::Proxy,
-        display_name: None,
-        description: None,
         api_key_env: None,
         base_url: None,
         headers: BTreeMap::from([("x-target-port".to_string(), "${PORT}".to_string())]),
@@ -312,7 +309,6 @@ async fn registry_proxy_engine_starts_fake_provider_end_to_end() {
             license: None,
             keywords: vec![],
             extensions: BTreeMap::new(),
-            unknown: BTreeMap::new(),
         },
         root: plugin_dir,
         source: PluginSource::User,
@@ -321,7 +317,7 @@ async fn registry_proxy_engine_starts_fake_provider_end_to_end() {
         plugins: vec![plugin],
         skipped: vec![],
     };
-    let registry = ProviderRegistry::from_plugins(&set, &Config::default()).expect("load registry");
+    let registry = ProviderRegistry::from_plugins(&set).expect("load registry");
     let provider = registry.get("px").await.expect("proxy engine starts");
     assert_eq!(provider.name(), "px");
     let messages = vec![Message::user_text("ping".to_string())];

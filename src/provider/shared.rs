@@ -6,14 +6,12 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use regex::Regex;
 use serde_json::Value;
 
 use crate::error::ProviderError;
@@ -33,11 +31,15 @@ pub const MAX_FUNCTION_NAME_LENGTH: usize = 64;
 /// Anthropic 字符集相同，两引擎共用）。
 /// 幂等：sanitize(sanitize(x)) == sanitize(x)。
 pub fn sanitize_function_name(name: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[^A-Za-z0-9_-]").unwrap());
-    let sanitized: String = re
-        .replace_all(name, "_")
+    let sanitized: String = name
         .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(MAX_FUNCTION_NAME_LENGTH)
         .collect();
     if sanitized.is_empty() {
@@ -272,8 +274,6 @@ pub mod testutil {
         ProviderDef {
             name: name.into(),
             engine,
-            display_name: None,
-            description: None,
             api_key_env: None,
             base_url: base_url.map(str::to_string),
             headers: BTreeMap::new(),

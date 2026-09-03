@@ -247,7 +247,7 @@ async fn summarize(
         messages: std::slice::from_ref(&user),
         tools: &[],
         max_tokens: agent.cfg.max_tokens,
-        temperature: agent.cfg.temperature,
+        temperature: None,
     };
     let mut stream = agent.provider.stream(request).await?;
     let mut text = String::new();

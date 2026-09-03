@@ -54,7 +54,6 @@ pub use event::Event;
 pub struct AgentCfg {
     pub model: String,
     pub max_tokens: u32,
-    pub temperature: Option<f32>,
     pub mode: Mode,
     /// 默认 1000（goose agent.rs:85），可配。
     pub max_turns: u32,
@@ -128,7 +127,6 @@ impl Agent {
             cfg: AgentCfg {
                 model,
                 max_tokens: config.max_tokens,
-                temperature: None,
                 mode: config.mode,
                 max_turns: config.max_turns,
                 context_limit,
@@ -393,7 +391,7 @@ impl Agent {
             messages: &session.messages,
             tools: &specs,
             max_tokens: self.cfg.max_tokens,
-            temperature: self.cfg.temperature,
+            temperature: None, // 待有配置来源再打开
         };
 
         let mut stream = tokio::select! {
@@ -708,7 +706,6 @@ mod tests {
             cfg: AgentCfg {
                 model: "mock-model".into(),
                 max_tokens: 1024,
-                temperature: None,
                 mode,
                 max_turns: 10,
                 context_limit,
@@ -1202,9 +1199,7 @@ mod tests {
 
         let mut set = PluginSet::default();
         set.plugins.push(Plugin {
-            manifest: crate::plugin::manifest::read_manifest(&root)
-                .unwrap()
-                .manifest,
+            manifest: crate::plugin::manifest::read_manifest(&root).unwrap(),
             root,
             source: PluginSource::Extra,
         });

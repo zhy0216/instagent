@@ -38,7 +38,6 @@ use crate::message::Role;
 use crate::message::Usage;
 use crate::provider::http::is_done;
 use crate::provider::http::HttpClient;
-use crate::provider::http::RetryPolicy;
 use crate::provider::http::SseEvent;
 use crate::provider::shared::arguments_or_empty;
 use crate::provider::shared::engine_parts;
@@ -63,7 +62,6 @@ pub struct OpenAiProvider {
     pub def: ProviderDef,
     /// 从 `def.api_key_env` 指定的环境变量读取；无 `api_key_env` 时为空串。
     pub api_key: String,
-    /// HTTP / SSE / 重试层；测试可注入小退避的 [`RetryPolicy`]。
     pub http: HttpClient,
 }
 
@@ -77,12 +75,6 @@ impl OpenAiProvider {
             api_key,
             http,
         })
-    }
-
-    /// 测试 / `10` registry 可换退避策略而不换 def。
-    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.http = self.http.clone().with_retry(retry);
-        self
     }
 
     /// def 自带 headers + `Authorization: Bearer`（密钥为空则不发该头）。
@@ -413,7 +405,6 @@ mod tests {
     use crate::provider::shared::testutil as tu;
     use crate::provider::shared::testutil::collect;
     use crate::provider::shared::testutil::event_to_json;
-    use crate::provider::shared::testutil::fast_retry;
     use crate::provider::shared::testutil::sse_body;
     use crate::provider::shared::MAX_FUNCTION_NAME_LENGTH;
     use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
@@ -1079,10 +1070,6 @@ mod tests {
             OpenAiProvider::new(&with_timeout).unwrap().http.timeout,
             Duration::from_secs(30)
         );
-        let fast = provider.clone().with_retry(fast_retry());
-        assert_eq!(fast.http.retry.initial_backoff, Duration::from_millis(1));
-        // with_retry 不改 def / api_key。
-        assert_eq!(fast.def, provider.def);
     }
 
     #[tokio::test]

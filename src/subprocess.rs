@@ -8,13 +8,18 @@
 //! 弥补 tokio / rmcp 只杀直接子进程的缺口。shell / MCP stdio / hooks / proxy 都复用这里。
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::transport::TokioChildProcess;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStderr;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "linux")]
 use std::sync::{mpsc, OnceLock};
@@ -189,29 +194,121 @@ pub fn git_command() -> std::process::Command {
     command
 }
 
-/// 进程退出 / 被杀后给输出管道最多 500ms 收尾（同 builtin shell）。
-pub(crate) const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// 进程退出 / 被杀后给输出管道最多 500ms 收尾（后台进程占着管道时不等死）。
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// 读子进程流到 EOF（lossy UTF-8），读失败返回空串。
-pub(crate) async fn read_all<R>(mut reader: R) -> String
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let mut buf = Vec::new();
-    if reader.read_to_end(&mut buf).await.is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&buf).into_owned()
+/// 等待结果（超时 / 取消都不带退出码）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Exited(Option<i32>),
+    TimedOut,
+    Cancelled,
 }
 
-/// 进程组 kill 后的限时残留输出收集：超时则 abort 读取任务并返回空串。
-pub(crate) async fn drain(handle: &mut JoinHandle<String>) -> String {
-    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *handle).await {
-        Ok(Ok(text)) => text,
-        _ => {
-            handle.abort();
-            String::new()
+/// [`wait_and_drain`] 的结果：结局 + 两路全量输出 + 收尾截断标记。
+pub(crate) struct RunOutput {
+    pub outcome: Outcome,
+    pub stdout: String,
+    pub stderr: String,
+    /// 退出后某路输出读取被 drain 超时切断（后台进程占管道）。
+    pub drained_short: bool,
+}
+
+impl RunOutput {
+    pub fn exit_code(&self) -> Option<i32> {
+        match self.outcome {
+            Outcome::Exited(code) => code,
+            _ => None,
         }
+    }
+}
+
+/// 载荷后台写 stdin（防大输入死锁；脚本不读时 BrokenPipe 忽略）。
+pub(crate) fn write_stdin(child: &mut ProcessGroupChild, payload: &[u8]) {
+    if let Some(mut stdin) = child.child_mut().stdin.take() {
+        let bytes = payload.to_vec();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+}
+
+/// 把管道一路读进共享缓冲（截断在渲染阶段做，全文要能落盘；
+/// drain 超时时 partial 输出仍可读）。
+async fn pump<R>(mut reader: R, buffer: Arc<Mutex<String>>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buffer
+                    .lock()
+                    .await
+                    .push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// 等一个 pump 任务收尾，超时则 abort 并返回已收集的 partial + 截断标记。
+async fn finish_pump(task: &mut JoinHandle<()>, buffer: &Arc<Mutex<String>>) -> (String, bool) {
+    let timed_out = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *task)
+        .await
+        .is_err();
+    if timed_out {
+        task.abort();
+        let _ = task.await;
+    }
+    let text = buffer.lock().await.clone();
+    (text, timed_out)
+}
+
+/// 跑子进程的统一编排：两路管道 pump 输出 → 带取消/超时的等待 →
+/// 非正常退出 drop [`ProcessGroupChild`] SIGKILL 整组 → 限时收尾两路输出。
+/// `cancel` 为 `None` 时不监听取消。
+pub(crate) async fn wait_and_drain(
+    mut child: ProcessGroupChild,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> RunOutput {
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let mut stdout_task = tokio::spawn(pump(
+        child.child_mut().stdout.take().expect("stdout piped"),
+        Arc::clone(&stdout_buffer),
+    ));
+    let mut stderr_task = tokio::spawn(pump(
+        child.child_mut().stderr.take().expect("stderr piped"),
+        Arc::clone(&stderr_buffer),
+    ));
+
+    let token = cancel.cloned().unwrap_or_default();
+    let outcome = {
+        let wait = child.child_mut().wait();
+        tokio::select! {
+            biased;
+            _ = token.cancelled(), if cancel.is_some() => Outcome::Cancelled,
+            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
+            status = wait => Outcome::Exited(status.ok().and_then(|s| s.code())),
+        }
+    };
+    // 超时/取消：drop ProcessGroupChild 对整组 SIGKILL（03 的进程组守卫）。
+    if !matches!(outcome, Outcome::Exited(_)) {
+        drop(child);
+    }
+
+    let (stdout, stdout_cut) = finish_pump(&mut stdout_task, &stdout_buffer).await;
+    let (stderr, stderr_cut) = finish_pump(&mut stderr_task, &stderr_buffer).await;
+    RunOutput {
+        outcome,
+        stdout,
+        stderr,
+        drained_short: stdout_cut || stderr_cut,
     }
 }
 
@@ -308,21 +405,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_all_collects_until_eof() {
-        assert_eq!(read_all(&b"hello hooks"[..]).await, "hello hooks");
+    async fn wait_and_drain_collects_output_and_exit_code() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo out; echo err >&2; exit 4")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = ProcessGroupChild::spawn(&mut command).expect("spawn sh");
+        let out = wait_and_drain(child, Duration::from_secs(10), None).await;
+        assert_eq!(out.outcome, Outcome::Exited(Some(4)));
+        assert_eq!(out.exit_code(), Some(4));
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+        assert!(!out.drained_short);
     }
 
     #[tokio::test]
-    async fn drain_returns_text_on_time_and_gives_up_on_timeout() {
-        let mut done = tokio::spawn(async { "text".to_string() });
-        assert_eq!(drain(&mut done).await, "text");
-
-        let mut stalled = tokio::spawn(async { std::future::pending::<String>().await });
-        let started = std::time::Instant::now();
-        assert_eq!(drain(&mut stalled).await, "");
-        assert!(started.elapsed() >= OUTPUT_DRAIN_TIMEOUT);
-        let err = stalled.await.unwrap_err();
-        assert!(err.is_cancelled(), "stalled read task must be aborted");
+    async fn wait_and_drain_timeout_kills_and_reports() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 120")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = ProcessGroupChild::spawn(&mut command).expect("spawn sh");
+        let out = wait_and_drain(child, Duration::from_millis(50), None).await;
+        assert_eq!(out.outcome, Outcome::TimedOut);
+        assert_eq!(out.exit_code(), None);
     }
 
     #[test]

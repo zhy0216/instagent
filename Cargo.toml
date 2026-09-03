@@ -57,9 +57,9 @@ serde_yaml = "0.9"
 shellexpand = "3"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["full"] }
+# 只用 CancellationToken，默认 feature 即可（原 "full" 是多余的）。
+tokio-util = "0.7"
 tracing = "0.1"
-tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 

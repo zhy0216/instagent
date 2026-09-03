@@ -46,9 +46,32 @@ struct LayerFile {
 }
 
 impl Settings {
+    fn user_path() -> crate::Result<PathBuf> {
+        Ok(crate::config::config_dir()?.join("settings.json"))
+    }
+
+    /// 读用户层 settings（文件不存在 = 默认值）。
+    pub fn load_user() -> crate::Result<Settings> {
+        Ok(match std::fs::read_to_string(Self::user_path()?) {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+            Err(e) => return Err(e.into()),
+        })
+    }
+
+    /// 写回用户层。
+    pub fn save_user(&self) -> crate::Result<()> {
+        let path = Self::user_path()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
     /// 读三层文件并合并（local > project > user）。缺文件按该层无内容处理。
     pub fn merged(cwd: &Path) -> crate::Result<Settings> {
-        let user = read_layer(&crate::config::config_dir()?.join("settings.json"))?;
+        let user = read_layer(&Self::user_path()?)?;
         let project = read_layer(&project_settings_path(cwd, SettingsLayer::Project))?;
         let local = read_layer(&project_settings_path(cwd, SettingsLayer::Local))?;
         Ok(merge_layers([user, project, local]))

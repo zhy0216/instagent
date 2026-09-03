@@ -1,9 +1,9 @@
 //! `plugin.json`（Agent Plugins v1.0.0）解析与校验（第三版 §2.1、§2.2）。
 //!
 //! 客户端不联网取 schema：`$schema` 字符串必须命中 [`PLUGIN_SCHEMA_URL`]，
-//! 据此选择本地校验规则；缺失或版本不符即报错。未知顶层字段转成 warning
-//! （报告但不致命）；组件目录（`skills/`、`mcp.json`、`dev.instagent/`）
-//! 不存在不算错。
+//! 据此选择本地校验规则；缺失或版本不符即报错。未知顶层字段由 serde 直接
+//! 忽略（规范：客户端必须忽略不认识的字段）；组件目录（`skills/`、
+//! `mcp.json`、`dev.instagent/`）不存在不算错。
 //! name 规则参考 goose `plugins/formats/open_plugins.rs::validate_plugin_name`
 //! （只读，commit 4ad43df）。
 
@@ -15,8 +15,6 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-
-use crate::plugin::NAMESPACE;
 
 /// 客户端不联网取 schema，只用该字符串选择本地校验规则。
 pub const PLUGIN_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -35,7 +33,7 @@ pub enum Author {
     },
 }
 
-/// 规范顶层十个字段；未知字段进 `unknown`，报告但不致命。
+/// 规范顶层十个字段；未知字段 serde 直接忽略。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginManifest {
     #[serde(rename = "$schema", default)]
@@ -57,34 +55,13 @@ pub struct PluginManifest {
     /// 反域名命名空间 → 原始 JSON；客户端必须忽略自己不实现的命名空间。
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
-    /// 未知顶层字段（`04` 转成 warning 列表）。
-    #[serde(flatten, default)]
-    pub unknown: BTreeMap<String, Value>,
-}
-
-impl PluginManifest {
-    /// `extensions["dev.instagent"].minKernel`（第三版 §2.2 的小标志）；
-    /// 命名空间缺失、内容不是对象或值不是字符串时为 `None`。
-    pub fn min_kernel(&self) -> Option<&str> {
-        self.extensions
-            .get(NAMESPACE)
-            .and_then(|ns| ns.get("minKernel"))
-            .and_then(Value::as_str)
-    }
-}
-
-/// 校验产物：manifest + 非致命 warning（未知字段之类）。
-#[derive(Debug, Clone)]
-pub struct Validated {
-    pub manifest: PluginManifest,
-    pub warnings: Vec<String>,
 }
 
 /// 读 `<dir>/plugin.json` 并校验（规范 v1.0.0 位置，非 goose 草案路径）。
 ///
 /// 组件目录是否存在不影响结果（§2.1：不存在不算错），由 `05`/`06`/`15`
 /// 各自按约定位置读取。
-pub fn read_manifest(dir: &Path) -> crate::Result<Validated> {
+pub fn read_manifest(dir: &Path) -> crate::Result<PluginManifest> {
     let path = dir.join("plugin.json");
     let text =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
@@ -93,9 +70,8 @@ pub fn read_manifest(dir: &Path) -> crate::Result<Validated> {
     validate_manifest(manifest)
 }
 
-/// `$schema` 匹配 + `name` 规则 + `extensions[NAMESPACE]` 小标志；
-/// 未知顶层字段收进 warnings。
-fn validate_manifest(manifest: PluginManifest) -> crate::Result<Validated> {
+/// `$schema` 匹配 + `name` 规则。
+fn validate_manifest(manifest: PluginManifest) -> crate::Result<PluginManifest> {
     match manifest.schema.as_deref() {
         None => bail!("plugin.json must declare `$schema` (expected `{PLUGIN_SCHEMA_URL}`)"),
         Some(url) if url == PLUGIN_SCHEMA_URL => {}
@@ -106,29 +82,7 @@ fn validate_manifest(manifest: PluginManifest) -> crate::Result<Validated> {
 
     validate_plugin_name(&manifest.name)?;
 
-    let mut warnings = Vec::new();
-    for key in manifest.unknown.keys() {
-        warnings.push(format!(
-            "ignoring unknown top-level field `{key}` in plugin.json"
-        ));
-    }
-
-    if let Some(ext) = manifest.extensions.get(NAMESPACE) {
-        match ext {
-            Value::Object(map) => {
-                if map.get("minKernel").is_some_and(|v| !v.is_string()) {
-                    warnings.push(format!(
-                        "ignoring non-string `extensions[\"{NAMESPACE}\"].minKernel`"
-                    ));
-                }
-            }
-            _ => warnings.push(format!(
-                "ignoring `extensions[\"{NAMESPACE}\"]`: not a JSON object"
-            )),
-        }
-    }
-
-    Ok(Validated { manifest, warnings })
+    Ok(manifest)
 }
 
 /// name：1~64 字符，小写字母数字与 `-` `.`，首尾字母数字，不含 `--` `..`。
@@ -205,10 +159,8 @@ mod tests {
     #[test]
     fn valid_manifest_with_components_passes() {
         let dir = plugin_dir("valid");
-        let validated = read_manifest(dir.path()).unwrap();
-        let m = &validated.manifest;
+        let m = read_manifest(dir.path()).unwrap();
 
-        assert!(validated.warnings.is_empty(), "warnings: {validated:?}");
         assert_eq!(
             m.schema.as_deref(),
             Some("https://agent-plugins.org/schemas/1.0.0/plugin.schema.json")
@@ -229,9 +181,7 @@ mod tests {
         );
         assert_eq!(m.license.as_deref(), Some("Apache-2.0"));
         assert_eq!(m.keywords, vec!["groq".to_string(), "review".to_string()]);
-        assert_eq!(m.min_kernel(), Some("0.1"));
         assert!(m.extensions.contains_key("com.example.tools"));
-        assert!(m.unknown.is_empty());
     }
 
     #[test]
@@ -263,49 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_warn_but_not_fatal() {
+    fn unknown_fields_tolerated_not_fatal() {
         let dir = plugin_dir("unknown-fields");
-        let validated = read_manifest(dir.path()).unwrap();
-        assert_eq!(validated.manifest.name, "warned-plugin");
-        assert_eq!(validated.warnings.len(), 2, "{:?}", validated.warnings);
-        assert!(validated
-            .warnings
-            .iter()
-            .any(|w| w.contains("experimental")));
-        assert!(validated.warnings.iter().any(|w| w.contains("vendorExt")));
-        assert_eq!(validated.manifest.unknown["vendorExt"], Value::from("acme"));
+        assert_eq!(read_manifest(dir.path()).unwrap().name, "warned-plugin");
     }
 
     #[test]
     fn missing_component_dirs_are_ok() {
         let dir = plugin_dir("components-missing");
-        let validated = read_manifest(dir.path()).unwrap();
-        assert_eq!(validated.manifest.name, "bare-plugin");
-        assert!(validated.warnings.is_empty());
-        assert_eq!(validated.manifest.min_kernel(), None);
-    }
-
-    #[test]
-    fn bad_namespace_extension_and_minkernel_warn_only() {
-        let json = manifest_of("components-missing").replace(
-            "\"version\": \"0.1.0\",",
-            "\"version\": \"0.1.0\",\n  \"extensions\": {\n    \"dev.instagent\": 42\n  },",
-        );
-        let dir = dir_with_manifest(&json);
-        let validated = read_manifest(dir.path()).unwrap();
-        assert_eq!(validated.warnings.len(), 1, "{:?}", validated.warnings);
-        assert!(validated.warnings[0].contains("not a JSON object"));
-        assert_eq!(validated.manifest.min_kernel(), None);
-
-        let json = manifest_of("components-missing").replace(
-            "\"version\": \"0.1.0\",",
-            "\"version\": \"0.1.0\",\n  \"extensions\": {\n    \"dev.instagent\": { \"minKernel\": 1 } }\n,",
-        );
-        let dir = dir_with_manifest(&json);
-        let validated = read_manifest(dir.path()).unwrap();
-        assert_eq!(validated.warnings.len(), 1, "{:?}", validated.warnings);
-        assert!(validated.warnings[0].contains("minKernel"));
-        assert_eq!(validated.manifest.min_kernel(), None);
+        assert_eq!(read_manifest(dir.path()).unwrap().name, "bare-plugin");
     }
 
     #[test]

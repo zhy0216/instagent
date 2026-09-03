@@ -44,9 +44,6 @@ pub enum Input {
 /// 斜杠命令分发（纯函数：不依赖 editor / agent）。
 pub fn classify(line: &str, plugin_commands: &[SlashCommand]) -> Input {
     let line = line.trim();
-    if line.is_empty() {
-        return Input::Prompt(String::new());
-    }
     if !line.starts_with('/') {
         return Input::Prompt(line.to_string());
     }
@@ -61,9 +58,9 @@ pub fn classify(line: &str, plugin_commands: &[SlashCommand]) -> Input {
         "clear" => Input::Clear,
         "compact" => Input::Compact,
         "tools" => Input::Tools,
-        "mode" => match parse_mode(args) {
-            Some(mode) => Input::Mode(mode),
-            None => Input::BadMode(args.to_string()),
+        "mode" => match args.parse() {
+            Ok(mode) => Input::Mode(mode),
+            Err(_) => Input::BadMode(args.to_string()),
         },
         _ => {
             if let Some(cmd) = plugin_commands.iter().find(|c| c.name == name) {
@@ -72,15 +69,6 @@ pub fn classify(line: &str, plugin_commands: &[SlashCommand]) -> Input {
                 Input::Unknown(name.to_string())
             }
         }
-    }
-}
-
-fn parse_mode(arg: &str) -> Option<Mode> {
-    match arg.to_ascii_lowercase().as_str() {
-        "auto" => Some(Mode::Auto),
-        "approve" => Some(Mode::Approve),
-        "chat" => Some(Mode::Chat),
-        _ => None,
     }
 }
 
@@ -319,10 +307,5 @@ mod tests {
         );
         // 未知命令给可读名字。
         assert_eq!(classify("/nope x", &cmds), Input::Unknown("nope".into()));
-    }
-
-    #[test]
-    fn empty_line_prompts_empty_text() {
-        assert_eq!(classify("   ", &[]), Input::Prompt(String::new()));
     }
 }

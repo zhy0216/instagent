@@ -64,7 +64,7 @@ pub const SUMMARY_PREFIX: &str = "# Conversation Summary";
 /// 被打断 / 出错的 tool call 的补结果文本（第二版 §2.2 不变量 4）。
 pub const INTERRUPTED_TEXT: &str = "interrupted by user";
 
-fn now_ts() -> i64 {
+pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 

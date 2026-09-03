@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::bail;
-use serde_json::Value;
 
 use instagent::agent::Agent;
 use instagent::commands::load_commands;
@@ -23,7 +22,6 @@ use instagent::plugin::install;
 use instagent::plugin::install::plugin_data_dir;
 use instagent::plugin::Plugin;
 use instagent::plugin::PluginSet;
-use instagent::plugin::NAMESPACE;
 use instagent::provider::EngineKind;
 use instagent::provider::ProviderRegistry;
 use instagent::settings::Settings;
@@ -158,7 +156,7 @@ pub async fn build(opts: &AssemblyOpts, prompter: &mut Prompter<'_>) -> instagen
     };
 
     // provider：注册表按名字取引擎（重名要求 plugin/name 消歧，`10`）。
-    let providers = ProviderRegistry::from_plugins(&plugins, &config)?;
+    let providers = ProviderRegistry::from_plugins(&plugins)?;
     let provider_name = match config.provider.clone().filter(|p| !p.is_empty()) {
         Some(name) => name,
         None => {
@@ -186,7 +184,7 @@ pub async fn build(opts: &AssemblyOpts, prompter: &mut Prompter<'_>) -> instagen
     let def = providers.lookup(&provider_name)?;
     if def.engine == EngineKind::Proxy {
         // proxy 引擎会拉起本地命令：未信任插件直接拒绝。
-        if let Some(plugin) = find_provider_plugin(&plugins, &provider_name)? {
+        if let Ok(plugin) = providers.provider_plugin(&provider_name) {
             if !gates
                 .iter()
                 .any(|(p, _, granted)| *granted && p.manifest.name == plugin)
@@ -262,33 +260,6 @@ pub async fn build(opts: &AssemblyOpts, prompter: &mut Prompter<'_>) -> instagen
     })
 }
 
-/// provider 名 → 定义它的插件名（重名时返回第一个匹配，信任门控按最严处理）。
-fn find_provider_plugin(plugins: &PluginSet, provider: &str) -> instagent::Result<Option<String>> {
-    let bare = provider.rsplit('/').next().unwrap_or(provider);
-    for plugin in plugins.iter() {
-        let dir = plugin.root.join(NAMESPACE).join("providers");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if value.get("name").and_then(Value::as_str) == Some(bare) {
-                return Ok(Some(plugin.manifest.name.clone()));
-            }
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +267,7 @@ mod tests {
     use crate::cli::handlers;
     use instagent::message::Content;
     use instagent::session::Session;
+    use serde_json::Value;
     use std::io::Cursor;
     use std::path::Path;
     use wiremock::matchers::method;

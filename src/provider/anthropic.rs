@@ -38,7 +38,6 @@ use crate::message::Message;
 use crate::message::Role;
 use crate::message::Usage;
 use crate::provider::http::HttpClient;
-use crate::provider::http::RetryPolicy;
 use crate::provider::http::SseEvent;
 use crate::provider::shared::arguments_or_empty;
 use crate::provider::shared::engine_parts;
@@ -77,7 +76,6 @@ pub struct AnthropicProvider {
     /// 从 `def.api_key_env` 指定的环境变量读取；无 `api_key_env` 时为空串
     /// （裸网关 / 本地 proxy 场景，此时不发 `x-api-key` 头）。
     pub api_key: String,
-    /// HTTP / SSE / 重试层；测试可注入小退避的 [`RetryPolicy`]。
     pub http: HttpClient,
 }
 
@@ -91,12 +89,6 @@ impl AnthropicProvider {
             api_key,
             http,
         })
-    }
-
-    /// 测试 / registry 可换退避策略而不换 def（形状同 openai 引擎）。
-    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.http = self.http.clone().with_retry(retry);
-        self
     }
 
     /// def 自带 headers + `x-api-key` + `anthropic-version`（密钥为空则不发前者）。
@@ -536,13 +528,11 @@ mod tests {
     use crate::provider::shared::testutil as tu;
     use crate::provider::shared::testutil::collect;
     use crate::provider::shared::testutil::event_to_json;
-    use crate::provider::shared::testutil::fast_retry;
     use crate::provider::shared::testutil::sse_body;
     use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
     use futures::stream as fstream;
     use futures::StreamExt;
     use std::sync::Arc;
-    use std::time::Duration;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::Mock;
@@ -1093,10 +1083,6 @@ mod tests {
             keyless.request_headers()["anthropic-version"],
             ANTHROPIC_VERSION
         );
-        // with_retry 形状同 openai 引擎，不改 def / api_key。
-        let fast = keyless.clone().with_retry(fast_retry());
-        assert_eq!(fast.http.retry.initial_backoff, Duration::from_millis(1));
-        assert_eq!(fast.def, keyless.def);
     }
 
     #[tokio::test]

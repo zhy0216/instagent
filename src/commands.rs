@@ -105,30 +105,7 @@ pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<SlashCommand>> {
 
 /// 拆分 `---` frontmatter（缺失容忍：整篇是正文）。返回（元信息，正文）。
 fn parse_command_file(text: &str) -> crate::Result<(CommandFrontmatter, String)> {
-    let text = text.trim_start_matches('\u{feff}');
-    let Some(rest) = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    else {
-        return Ok((CommandFrontmatter::default(), text.trim().to_string()));
-    };
-    let mut fm_lines: Vec<&str> = Vec::new();
-    let mut body_start: Option<usize> = None;
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            body_start = Some(offset + line.len());
-            break;
-        }
-        fm_lines.push(line.trim_end_matches('\r'));
-        offset += line.len();
-    }
-    let Some(body_start) = body_start else {
-        anyhow::bail!("unterminated frontmatter: missing closing `---`");
-    };
-    let frontmatter: CommandFrontmatter = serde_yaml::from_str(&fm_lines.join("\n"))
-        .map_err(|err| anyhow::anyhow!("invalid frontmatter YAML: {err}"))?;
-    Ok((frontmatter, rest[body_start..].trim().to_string()))
+    crate::tools::skills::parse_frontmatter(text, true)
 }
 
 /// 命令正文 + 用户参数 → 一条用户消息文本（`/review security` 的展开）。
@@ -157,9 +134,9 @@ mod tests {
             format!(r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"{name}","version":"1.0.0"}}"#),
         )
         .unwrap();
-        let validated = crate::plugin::manifest::read_manifest(root).unwrap();
+        let manifest = crate::plugin::manifest::read_manifest(root).unwrap();
         Plugin {
-            manifest: validated.manifest,
+            manifest,
             root: root.to_path_buf(),
             source: PluginSource::Extra,
         }

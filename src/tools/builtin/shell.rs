@@ -11,15 +11,12 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
+use crate::subprocess::wait_and_drain;
+use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
@@ -32,46 +29,6 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// 超出时给前 50 行 / 10KB 预览，全文存临时文件并返回路径。
 pub const PREVIEW_LINES: usize = 50;
 pub const PREVIEW_BYTES: usize = 10 * 1024;
-
-/// 进程退出后给输出管道最多 500ms 收尾（后台进程占着管道时不等死）。
-/// 参考 goose developer/shell.rs:629 `OUTPUT_DRAIN_TIMEOUT_MILLIS`。
-const OUTPUT_DRAIN_TIMEOUT_MILLIS: u64 = 500;
-
-/// 把管道一路读进共享缓冲（截断在渲染阶段做，全文要能落盘）。
-async fn pump<R>(mut reader: R, buffer: Arc<Mutex<String>>)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let mut chunk = [0u8; 8192];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                buffer
-                    .lock()
-                    .await
-                    .push_str(&String::from_utf8_lossy(&chunk[..n]));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// 等一个 pump 任务收尾，超时则 abort 并标记截断。参考 goose 的 drain 分支。
-async fn finish_pump(task: &mut JoinHandle<()>, buffer: &Arc<Mutex<String>>) -> (String, bool) {
-    let timed_out = tokio::time::timeout(
-        Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MILLIS),
-        &mut *task,
-    )
-    .await
-    .is_err();
-    if timed_out {
-        task.abort();
-        let _ = task.await;
-    }
-    let text = buffer.lock().await.clone();
-    (text, timed_out)
-}
 
 /// 非 POSIX 登录 shell（fish/csh/tcsh/nu）会吞掉 heredoc、`$VAR`、`2>&1` 等
 /// POSIX 语法，所以不自动采用 `$SHELL`：优先 bash，其次才退回 `$SHELL`。
@@ -100,12 +57,6 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     })
 }
 
-enum Outcome {
-    Exited(Option<i32>),
-    TimedOut,
-    Cancelled,
-}
-
 /// 跑一条命令，返回 stdout、stderr、exit code 的组合格式（is_error = 非零退出码、
 /// 超时或被取消）。
 pub async fn run(
@@ -122,7 +73,7 @@ pub async fn run(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = match ProcessGroupChild::spawn(&mut cmd) {
+    let child = match ProcessGroupChild::spawn(&mut cmd) {
         Ok(child) => child,
         Err(e) => {
             return ToolOutput::err(format!(
@@ -132,40 +83,14 @@ pub async fn run(
         }
     };
 
-    let stdout_pipe = child.child_mut().stdout.take().expect("stdout piped");
-    let stderr_pipe = child.child_mut().stderr.take().expect("stderr piped");
-
-    let stdout_buffer = Arc::new(Mutex::new(String::new()));
-    let stderr_buffer = Arc::new(Mutex::new(String::new()));
-    let mut stdout_task = tokio::spawn(pump(stdout_pipe, Arc::clone(&stdout_buffer)));
-    let mut stderr_task = tokio::spawn(pump(stderr_pipe, Arc::clone(&stderr_buffer)));
-
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let outcome = {
-        let wait = child.child_mut().wait();
-        tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => Outcome::Cancelled,
-            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
-            status = wait => Outcome::Exited(status.ok().and_then(|s| s.code())),
-        }
-    };
-    // 超时/取消：drop ProcessGroupChild 对整组 SIGKILL（03 的进程组守卫）。
-    if !matches!(outcome, Outcome::Exited(_)) {
-        drop(child);
-    }
+    let run = wait_and_drain(child, timeout, Some(&ctx.cancel)).await;
 
-    let (stdout_raw, stdout_drain_cut) = finish_pump(&mut stdout_task, &stdout_buffer).await;
-    let (stderr_raw, stderr_drain_cut) = finish_pump(&mut stderr_task, &stderr_buffer).await;
-
-    let stdout = truncate_stream(&stdout_raw, "stdout");
-    let stderr = truncate_stream(&stderr_raw, "stderr");
-    let timed_out = matches!(outcome, Outcome::TimedOut);
-    let cancelled = matches!(outcome, Outcome::Cancelled);
-    let exit_code = match outcome {
-        Outcome::Exited(code) => code,
-        _ => None,
-    };
+    let stdout = truncate_stream(&run.stdout, "stdout");
+    let stderr = truncate_stream(&run.stderr, "stderr");
+    let timed_out = run.outcome == Outcome::TimedOut;
+    let cancelled = run.outcome == Outcome::Cancelled;
+    let exit_code = run.exit_code();
 
     let mut text = render_output(&stdout, &stderr, exit_code);
     if timed_out {
@@ -177,7 +102,7 @@ pub async fn run(
     if cancelled {
         text.push_str("note: command cancelled; the whole process group was killed.\n");
     }
-    if stdout_drain_cut || stderr_drain_cut {
+    if run.drained_short {
         text.push_str(
             "note: output collection was cut short after the shell exited \
              (backgrounded process?).\n",

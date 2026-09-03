@@ -16,14 +16,14 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
-use crate::subprocess::drain;
-use crate::subprocess::read_all;
+use crate::subprocess::wait_and_drain;
+use crate::subprocess::write_stdin;
+use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
@@ -144,12 +144,6 @@ fn expand_plugin_root(command: &str, plugin_root: &Path) -> String {
     command.replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
 }
 
-enum Outcome {
-    Exited(Option<i32>),
-    TimedOut,
-    Cancelled,
-}
-
 #[async_trait]
 impl ToolSource for CommandTools {
     fn id(&self) -> &str {
@@ -190,38 +184,12 @@ impl ToolSource for CommandTools {
 
         // input JSON 写 stdin（后台写，防大输入死锁；脚本不读 stdin 时 BrokenPipe 忽略）。
         let payload = serde_json::to_vec(&input).unwrap_or_else(|_| b"null".to_vec());
-        let write_task = child.child_mut().stdin.take().map(|mut stdin| {
-            tokio::spawn(async move {
-                let _ = stdin.write_all(&payload).await;
-                let _ = stdin.shutdown().await;
-            })
-        });
-        let _ = write_task; // 句柄随 child 结束自然完成，无需 join
-
-        let stdout_pipe = child.child_mut().stdout.take().expect("stdout piped");
-        let stderr_pipe = child.child_mut().stderr.take().expect("stderr piped");
-        let mut stdout_task = tokio::spawn(read_all(stdout_pipe));
-        let mut stderr_task = tokio::spawn(read_all(stderr_pipe));
+        write_stdin(&mut child, &payload);
 
         let timeout = Duration::from_secs(def.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        let outcome = {
-            let wait = child.child_mut().wait();
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => Outcome::Cancelled,
-                _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
-                status = wait => Outcome::Exited(status.ok().and_then(|s| s.code())),
-            }
-        };
-        // 超时/取消：drop ProcessGroupChild 对整组 SIGKILL（03 的进程组守卫）。
-        if !matches!(outcome, Outcome::Exited(_)) {
-            drop(child);
-        }
+        let run = wait_and_drain(child, timeout, Some(&ctx.cancel)).await;
 
-        let stdout = drain(&mut stdout_task).await;
-        let stderr = drain(&mut stderr_task).await;
-
-        let (exit_code, note) = match outcome {
+        let (exit_code, note) = match run.outcome {
             Outcome::Exited(code) => (code, String::new()),
             Outcome::TimedOut => (
                 None,
@@ -232,6 +200,8 @@ impl ToolSource for CommandTools {
             ),
             Outcome::Cancelled => (None, "cancelled; killed the process group. ".to_string()),
         };
+        let stdout = run.stdout;
+        let stderr = run.stderr;
         let failed = !matches!(exit_code, Some(0));
         let text = if failed {
             let code = exit_code
@@ -311,9 +281,9 @@ mod tests {
     fn plugin_set(plugins: &[&Path]) -> PluginSet {
         let mut set = PluginSet::default();
         for root in plugins {
-            let validated = crate::plugin::manifest::read_manifest(root).unwrap();
+            let manifest = crate::plugin::manifest::read_manifest(root).unwrap();
             set.plugins.push(Plugin {
-                manifest: validated.manifest,
+                manifest,
                 root: root.to_path_buf(),
                 source: crate::plugin::PluginSource::Extra,
             });

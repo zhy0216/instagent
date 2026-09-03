@@ -46,10 +46,6 @@ pub struct Session {
     pub path: PathBuf,
 }
 
-fn now_ts() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
 impl Session {
     /// `<data_dir>/sessions/`，data_dir：`INSTAGENT_DATA_DIR` 环境变量优先，
     /// 否则 etcetera（XDG）的 `~/.local/share/instagent`。
@@ -77,7 +73,7 @@ impl Session {
             .with_context(|| format!("create sessions dir {}", dir.display()))?;
         let header = SessionHeader {
             id: Uuid::new_v4().to_string(),
-            created: now_ts(),
+            created: crate::message::now_ts(),
             cwd: cwd.to_path_buf(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -365,7 +361,7 @@ mod tests {
         Message {
             role,
             content: vec![Content::Text(text.into())],
-            ts: now_ts(),
+            ts: crate::message::now_ts(),
             usage: None,
         }
     }
