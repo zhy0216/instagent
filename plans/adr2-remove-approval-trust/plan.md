@@ -106,3 +106,11 @@ REPL 冒烟：`cargo run -- chat --help` 不再出现 `--mode`；
   install enable/disable 使用，保留。
 - **假设：** usage.md §5 整节删除后目录锚点需同步，章节号保留原编号跳号
   或顺移均可，以 diff 最小为准。
+
+## 执行结果
+
+- 01-remove-permission-code.md ✅ → commit `d2ebbc8`（feat!: 移除 permission UI——approval.rs、trust.rs、Mode 三态整体删除，ADR 0002），已归档 `todos/done/`。
+- 02-sync-docs.md ✅ → commit `590b90e`（docs: ADR 0002 落地后文档同步），已归档 `todos/done/`。
+- 校验：两任务各自在独立 worktree 通过 cargo fmt --check / cargo clippy --all-targets -D warnings / cargo test 全绿；残留检查 rg 无 permission 概念命中（仅 INSTAGENT_MODEL、/v1/models 等子串误中）；chat/run --help 无 --mode，plugin install --help 无 --yes。
+- blocked / deferred：无。
+- 本轮 Herdr workspace（w26/w27）、worktree、任务分支已全部清理；provider_proxy::restart_is_bounded_to_once_per_call 在并行负载下出现过一次瞬时失败，单跑与复跑均绿，与本计划无关。
