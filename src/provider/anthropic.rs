@@ -25,15 +25,10 @@
 //! （`src/agent/compact.rs` 读 `usage.input`）看到完整上下文。
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::time::Duration;
 
-use anyhow::Context;
 use async_trait::async_trait;
-use futures::stream;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use serde_json::json;
 use serde_json::Value;
 
@@ -45,14 +40,23 @@ use crate::message::Usage;
 use crate::provider::http::HttpClient;
 use crate::provider::http::RetryPolicy;
 use crate::provider::http::SseEvent;
-use crate::provider::openai::sanitize_function_name;
+use crate::provider::shared::arguments_or_empty;
+use crate::provider::shared::engine_parts;
+use crate::provider::shared::headers_with_auth;
+use crate::provider::shared::parse_chunk;
+use crate::provider::shared::require_base_url;
+use crate::provider::shared::sanitize_function_name;
+use crate::provider::shared::sanitized_tool_names;
+use crate::provider::shared::to_provider_error;
+use crate::provider::shared::PendingCall;
+use crate::provider::shared::StreamEngine;
+use crate::provider::shared::StreamState;
 use crate::provider::EngineKind;
 use crate::provider::Provider;
 use crate::provider::ProviderDef;
 use crate::provider::Request;
 use crate::provider::StopReason;
 use crate::provider::StreamEvent;
-use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
 use crate::tools::ToolSpec;
 
 /// goose `ANTHROPIC_API_VERSION`（goose-providers/src/anthropic.rs:54）。
@@ -79,31 +83,13 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     /// 校验 def（engine=anthropic、base_url 必填），按 `api_key_env` 读密钥，
-    /// 按 `timeout_seconds` 建 client。
+    /// 按 `timeout_seconds` 建 client（构造骨架在共享层 [`engine_parts`]）。
     pub fn new(def: &ProviderDef) -> crate::Result<Self> {
-        anyhow::ensure!(
-            def.engine == EngineKind::Anthropic,
-            "provider {} is not an anthropic engine",
-            def.name
-        );
-        anyhow::ensure!(
-            def.base_url.as_deref().is_some_and(|u| !u.is_empty()),
-            "provider {} missing base_url",
-            def.name
-        );
-        let api_key = match def.api_key_env.as_deref() {
-            Some(var) => std::env::var(var)
-                .with_context(|| format!("provider {} requires env var {var}", def.name))?,
-            None => String::new(),
-        };
-        let timeout = Duration::from_secs(
-            def.timeout_seconds
-                .unwrap_or(DEFAULT_PROVIDER_TIMEOUT.as_secs()),
-        );
+        let (api_key, http) = engine_parts(def, EngineKind::Anthropic)?;
         Ok(Self {
             def: def.clone(),
             api_key,
-            http: HttpClient::new(timeout)?,
+            http,
         })
     }
 
@@ -115,15 +101,14 @@ impl AnthropicProvider {
 
     /// def 自带 headers + `x-api-key` + `anthropic-version`（密钥为空则不发前者）。
     fn request_headers(&self) -> BTreeMap<String, String> {
-        let mut headers = self.def.headers.clone();
-        headers.insert(
+        let mut auth = vec![(
             "anthropic-version".to_string(),
             ANTHROPIC_VERSION.to_string(),
-        );
+        )];
         if !self.api_key.is_empty() {
-            headers.insert("x-api-key".to_string(), self.api_key.clone());
+            auth.push(("x-api-key".to_string(), self.api_key.clone()));
         }
-        headers
+        headers_with_auth(&self.def, auth)
     }
 }
 
@@ -137,9 +122,7 @@ impl Provider for AnthropicProvider {
         &self,
         req: Request<'_>,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let base_url = self.def.base_url.as_deref().ok_or_else(|| {
-            ProviderError::Transport(format!("provider {} missing base_url", self.def.name))
-        })?;
+        let base_url = require_base_url(&self.def)?;
         let url = messages_url(base_url);
         let body = build_request_body(&req).map_err(to_provider_error)?;
         let sse = self
@@ -159,13 +142,6 @@ fn messages_url(base_url: &str) -> String {
         format!("{base}/messages")
     } else {
         format!("{base}/v1/messages")
-    }
-}
-
-fn to_provider_error(err: anyhow::Error) -> ProviderError {
-    match err.downcast::<ProviderError>() {
-        Ok(pe) => pe,
-        Err(err) => ProviderError::Transport(err.to_string()),
     }
 }
 
@@ -258,25 +234,22 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
     out
 }
 
-/// [`ToolSpec`] → `{name, description, input_schema}`；sanitize 后重名报错
-/// （复用 openai 引擎的 `[A-Za-z0-9_-]{1,64}` 规则，Anthropic 字符集相同），
+/// [`ToolSpec`] → `{name, description, input_schema}`；sanitize + 重名报错在
+/// 共享层 [`sanitized_tool_names`]（`[A-Za-z0-9_-]{1,64}`，Anthropic 字符集相同），
 /// 最后一个 spec 打 cache_control（goose `format_tools` :489~517）。
 fn format_tools(tools: &[ToolSpec]) -> crate::Result<Vec<Value>> {
-    let mut seen = HashSet::new();
-    let mut out: Vec<Value> = Vec::new();
-    for tool in tools {
-        let name = sanitize_function_name(&tool.name);
-        anyhow::ensure!(
-            seen.insert(name.clone()),
-            "duplicate tool name after sanitize: {}",
-            tool.name
-        );
-        out.push(json!({
-            "name": name,
-            "description": tool.description,
-            "input_schema": anthropic_flavored_input_schema(&tool.input_schema),
-        }));
-    }
+    let names = sanitized_tool_names(tools)?;
+    let mut out: Vec<Value> = tools
+        .iter()
+        .zip(names)
+        .map(|(tool, name)| {
+            json!({
+                "name": name,
+                "description": tool.description,
+                "input_schema": anthropic_flavored_input_schema(&tool.input_schema),
+            })
+        })
+        .collect();
     if let Some(last) = out.last_mut() {
         // 工具定义整段缓存为单一前缀（goose :507~513）。
         last.as_object_mut()
@@ -297,13 +270,6 @@ fn anthropic_flavored_input_schema(schema: &Value) -> Value {
 // ---------------------------------------------------------------------------
 // 响应侧：SSE 事件流 → StreamEvent
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Default)]
-struct PendingCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
 
 /// 流内 usage 累加器：message_start 给 input/cache，message_delta 给 output，
 /// 字段级合并（delta 上报的字段赢，goose `merge_delta_usage` 语义）。
@@ -350,212 +316,182 @@ impl UsageAccum {
     }
 }
 
-struct StreamState {
-    events: BoxStream<'static, crate::Result<SseEvent>>,
-    out: VecDeque<Result<StreamEvent, ProviderError>>,
-    /// 按 content block `index` 累积未完成的 tool_use。
-    tools: BTreeMap<i64, PendingCall>,
+/// anthropic 引擎流状态：共享 [`StreamState`] + `tools_seen`
+/// （tool 块在各自 content_block_stop 时就已 flush，收尾时无残留可查）
+/// + usage 累加器。
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    st: StreamState,
     tools_seen: bool,
     usage: UsageAccum,
-    stop: Option<String>,
-    ended: bool,
+}
+
+impl AnthropicStreamState {
+    /// 单个 SSE 事件 → 状态迁移 / 事件产出；事件类型取 data 的 `type` 字段，
+    /// 缺省时回落到 `event:` 行（两者正常情况下相同）。
+    fn apply_event(&mut self, data: &Value, event_name: Option<&str>) -> Result<(), ProviderError> {
+        let event_type = data
+            .get("type")
+            .and_then(Value::as_str)
+            .or(event_name)
+            .unwrap_or("");
+        match event_type {
+            EVENT_MESSAGE_START => {
+                if let Some(usage) = data.pointer("/message/usage") {
+                    self.usage.merge(usage);
+                }
+            }
+            EVENT_CONTENT_BLOCK_START => {
+                let block = data.get("content_block");
+                // thinking / redacted_thinking 等块类型 v1 不进消息模型，静默跳过。
+                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
+                    let index = data.get("index").and_then(Value::as_i64);
+                    let id = block.and_then(|b| b.get("id")).and_then(Value::as_str);
+                    let name = block.and_then(|b| b.get("name")).and_then(Value::as_str);
+                    if let (Some(index), Some(id), Some(name)) = (index, id, name) {
+                        self.st.tools.insert(
+                            index,
+                            PendingCall {
+                                id: id.to_string(),
+                                name: name.to_string(),
+                                arguments: String::new(),
+                            },
+                        );
+                    }
+                }
+            }
+            EVENT_CONTENT_BLOCK_DELTA => {
+                let Some(delta) = data.get("delta") else {
+                    return Ok(());
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                self.st
+                                    .out
+                                    .push_back(Ok(StreamEvent::TextDelta(text.to_string())));
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        // 全部拼完再 parse：这里只累积片段。
+                        if let Some(call) = data
+                            .get("index")
+                            .and_then(Value::as_i64)
+                            .and_then(|index| self.st.tools.get_mut(&index))
+                        {
+                            if let Some(part) = delta.get("partial_json").and_then(Value::as_str) {
+                                call.arguments.push_str(part);
+                            }
+                        }
+                    }
+                    // thinking_delta / signature_delta 及其它未知 delta：忽略。
+                    _ => {}
+                }
+            }
+            EVENT_CONTENT_BLOCK_STOP => {
+                if let Some(call) = data
+                    .get("index")
+                    .and_then(Value::as_i64)
+                    .and_then(|index| self.st.tools.remove(&index))
+                {
+                    self.flush_tool(call)?;
+                }
+            }
+            EVENT_MESSAGE_DELTA => {
+                if let Some(usage) = data.get("usage") {
+                    self.usage.merge(usage);
+                }
+                if let Some(reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    if !reason.is_empty() {
+                        self.st.stop = Some(reason.to_string());
+                    }
+                }
+            }
+            EVENT_MESSAGE_STOP => {
+                // 新版 API 会在 message_stop 再报一次全量 usage。
+                if let Some(usage) = data.get("usage") {
+                    self.usage.merge(usage);
+                }
+                self.finalize();
+            }
+            EVENT_ERROR => {
+                return Err(map_stream_error(data.get("error").unwrap_or(&Value::Null)));
+            }
+            // ping 与未知事件类型：跳过（goose :1167~1171 同款宽容）。
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 块停止（或收尾）时 flush 一个 tool_use：Start → 完整 JSON Delta → End。
+    /// 空参数当 `{}`（content_block_start 的 `input: {}` 后没有任何 delta 的形态）。
+    fn flush_tool(&mut self, call: PendingCall) -> Result<(), ProviderError> {
+        if !call.arguments.trim().is_empty() {
+            serde_json::from_str::<Value>(&call.arguments).map_err(|err| {
+                ProviderError::Transport(format!(
+                    "invalid tool input JSON for `{}`: {err}",
+                    call.id
+                ))
+            })?;
+        }
+        self.tools_seen = true;
+        self.st.out.push_back(Ok(StreamEvent::ToolUseStart {
+            id: call.id,
+            name: call.name,
+        }));
+        self.st
+            .out
+            .push_back(Ok(StreamEvent::ToolUseDelta(arguments_or_empty(
+                call.arguments,
+            ))));
+        self.st.out.push_back(Ok(StreamEvent::ToolUseEnd));
+        Ok(())
+    }
+}
+
+impl StreamEngine for AnthropicStreamState {
+    fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>> {
+        &mut self.st.out
+    }
+
+    fn ended(&mut self) -> &mut bool {
+        &mut self.st.ended
+    }
+
+    fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
+        match parse_chunk(ev)? {
+            Some(chunk) => self.apply_event(&chunk, ev.event.as_deref()),
+            None => Ok(()),
+        }
+    }
+
+    /// `message_stop` / 断流收尾：未停止的 tool 块按 index 升序补 flush，再发 `Done`。
+    fn finalize(&mut self) {
+        if self.st.ended {
+            return;
+        }
+        self.st.ended = true;
+        for (_, call) in std::mem::take(&mut self.st.tools) {
+            if let Err(err) = self.flush_tool(call) {
+                // 截断的 tool 块 JSON 非法：以流错误终止，不再补 Done。
+                self.st.out.push_back(Err(err));
+                return;
+            }
+        }
+        let usage = self.usage.usage();
+        let stop_reason = map_stop_reason(self.st.stop.as_deref(), self.tools_seen);
+        self.st
+            .out
+            .push_back(Ok(StreamEvent::Done { usage, stop_reason }));
+    }
 }
 
 fn sse_to_stream_events(
     events: BoxStream<'static, crate::Result<SseEvent>>,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    let state = StreamState {
-        events,
-        out: VecDeque::new(),
-        tools: BTreeMap::new(),
-        tools_seen: false,
-        usage: UsageAccum::default(),
-        stop: None,
-        ended: false,
-    };
-    stream::unfold(state, |mut st| async move {
-        loop {
-            if let Some(item) = st.out.pop_front() {
-                return Some((item, st));
-            }
-            if st.ended {
-                return None;
-            }
-            match st.events.next().await {
-                Some(Ok(ev)) => {
-                    let data = ev.data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<Value>(data) {
-                        Ok(chunk) => {
-                            if let Err(err) = apply_event(&chunk, ev.event.as_deref(), &mut st) {
-                                st.out.push_back(Err(err));
-                                st.ended = true;
-                            }
-                        }
-                        Err(err) => {
-                            st.out.push_back(Err(ProviderError::Transport(format!(
-                                "malformed SSE chunk {data:?}: {err}"
-                            ))));
-                            st.ended = true;
-                        }
-                    }
-                }
-                Some(Err(err)) => {
-                    st.out.push_back(Err(to_provider_error(err)));
-                    st.ended = true;
-                }
-                // 断流（无 message_stop）也要收尾，否则 loop 永远等不到 Done。
-                None => finalize(&mut st),
-            }
-        }
-    })
-    .boxed()
-}
-
-/// 单个 SSE 事件 → 状态迁移 / 事件产出；事件类型取 data 的 `type` 字段，
-/// 缺省时回落到 `event:` 行（两者正常情况下相同）。
-fn apply_event(
-    data: &Value,
-    event_name: Option<&str>,
-    st: &mut StreamState,
-) -> Result<(), ProviderError> {
-    let event_type = data
-        .get("type")
-        .and_then(Value::as_str)
-        .or(event_name)
-        .unwrap_or("");
-    match event_type {
-        EVENT_MESSAGE_START => {
-            if let Some(usage) = data.pointer("/message/usage") {
-                st.usage.merge(usage);
-            }
-        }
-        EVENT_CONTENT_BLOCK_START => {
-            let block = data.get("content_block");
-            // thinking / redacted_thinking 等块类型 v1 不进消息模型，静默跳过。
-            if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
-                let index = data.get("index").and_then(Value::as_i64);
-                let id = block.and_then(|b| b.get("id")).and_then(Value::as_str);
-                let name = block.and_then(|b| b.get("name")).and_then(Value::as_str);
-                if let (Some(index), Some(id), Some(name)) = (index, id, name) {
-                    st.tools.insert(
-                        index,
-                        PendingCall {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            arguments: String::new(),
-                        },
-                    );
-                }
-            }
-        }
-        EVENT_CONTENT_BLOCK_DELTA => {
-            let Some(delta) = data.get("delta") else {
-                return Ok(());
-            };
-            match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") => {
-                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            st.out
-                                .push_back(Ok(StreamEvent::TextDelta(text.to_string())));
-                        }
-                    }
-                }
-                Some("input_json_delta") => {
-                    // 全部拼完再 parse：这里只累积片段。
-                    if let Some(call) = data
-                        .get("index")
-                        .and_then(Value::as_i64)
-                        .and_then(|index| st.tools.get_mut(&index))
-                    {
-                        if let Some(part) = delta.get("partial_json").and_then(Value::as_str) {
-                            call.arguments.push_str(part);
-                        }
-                    }
-                }
-                // thinking_delta / signature_delta 及其它未知 delta：忽略。
-                _ => {}
-            }
-        }
-        EVENT_CONTENT_BLOCK_STOP => {
-            if let Some(call) = data
-                .get("index")
-                .and_then(Value::as_i64)
-                .and_then(|index| st.tools.remove(&index))
-            {
-                flush_tool(call, st)?;
-            }
-        }
-        EVENT_MESSAGE_DELTA => {
-            if let Some(usage) = data.get("usage") {
-                st.usage.merge(usage);
-            }
-            if let Some(reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                if !reason.is_empty() {
-                    st.stop = Some(reason.to_string());
-                }
-            }
-        }
-        EVENT_MESSAGE_STOP => {
-            // 新版 API 会在 message_stop 再报一次全量 usage。
-            if let Some(usage) = data.get("usage") {
-                st.usage.merge(usage);
-            }
-            finalize(st);
-        }
-        EVENT_ERROR => {
-            return Err(map_stream_error(data.get("error").unwrap_or(&Value::Null)));
-        }
-        // ping 与未知事件类型：跳过（goose :1167~1171 同款宽容）。
-        _ => {}
-    }
-    Ok(())
-}
-
-/// 块停止（或收尾）时 flush 一个 tool_use：Start → 完整 JSON Delta → End。
-/// 空参数当 `{}`（content_block_start 的 `input: {}` 后没有任何 delta 的形态）。
-fn flush_tool(call: PendingCall, st: &mut StreamState) -> Result<(), ProviderError> {
-    if !call.arguments.trim().is_empty() {
-        serde_json::from_str::<Value>(&call.arguments).map_err(|err| {
-            ProviderError::Transport(format!("invalid tool input JSON for `{}`: {err}", call.id))
-        })?;
-    }
-    st.tools_seen = true;
-    st.out.push_back(Ok(StreamEvent::ToolUseStart {
-        id: call.id,
-        name: call.name,
-    }));
-    st.out.push_back(Ok(StreamEvent::ToolUseDelta(
-        if call.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            call.arguments
-        },
-    )));
-    st.out.push_back(Ok(StreamEvent::ToolUseEnd));
-    Ok(())
-}
-
-/// `message_stop` / 断流收尾：未停止的 tool 块按 index 升序补 flush，再发 `Done`。
-fn finalize(st: &mut StreamState) {
-    if st.ended {
-        return;
-    }
-    st.ended = true;
-    for (_, call) in std::mem::take(&mut st.tools) {
-        if let Err(err) = flush_tool(call, st) {
-            // 截断的 tool 块 JSON 非法：以流错误终止，不再补 Done。
-            st.out.push_back(Err(err));
-            return;
-        }
-    }
-    st.out.push_back(Ok(StreamEvent::Done {
-        usage: st.usage.usage(),
-        stop_reason: map_stop_reason(st.stop.as_deref(), st.tools_seen),
-    }));
+    crate::provider::shared::sse_to_stream_events(AnthropicStreamState::default(), events)
 }
 
 /// `stop_reason` → [`StopReason`]；无 stop_reason 但有 tool 调用时按 ToolUse
@@ -597,86 +533,41 @@ mod tests {
     use super::*;
     use crate::provider::context_limit_for;
     use crate::provider::http::SseParser;
+    use crate::provider::shared::testutil as tu;
+    use crate::provider::shared::testutil::collect;
+    use crate::provider::shared::testutil::event_to_json;
+    use crate::provider::shared::testutil::fast_retry;
+    use crate::provider::shared::testutil::sse_body;
+    use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
     use futures::stream as fstream;
+    use futures::StreamExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
 
-    fn fast_retry() -> RetryPolicy {
-        RetryPolicy {
-            max_retries: crate::provider::http::MAX_RETRIES,
-            initial_backoff: Duration::from_millis(1),
-            factor: crate::provider::http::BACKOFF_FACTOR,
-            cap: Duration::from_millis(20),
-        }
-    }
-
     fn def(base_url: Option<&str>) -> ProviderDef {
-        ProviderDef {
-            name: "test-anthropic".into(),
-            engine: EngineKind::Anthropic,
-            display_name: None,
-            description: None,
-            api_key_env: None,
-            base_url: base_url.map(str::to_string),
-            headers: BTreeMap::new(),
-            timeout_seconds: None,
-            models: vec![],
-            proxy: None,
-        }
+        tu::def("test-anthropic", EngineKind::Anthropic, base_url)
     }
 
     fn provider_at(base_url: &str, api_key: &str) -> AnthropicProvider {
-        let mut headers = BTreeMap::new();
-        headers.insert("x-instagent-test".to_string(), "yes".to_string());
+        let (def, http) = tu::provider_parts("test-anthropic", EngineKind::Anthropic, base_url);
         AnthropicProvider {
-            def: ProviderDef {
-                headers,
-                ..def(Some(base_url))
-            },
+            def,
             api_key: api_key.to_string(),
-            http: HttpClient::new(Duration::from_secs(5))
-                .unwrap()
-                .with_retry(fast_retry()),
+            http,
         }
     }
 
     fn request<'a>(messages: &'a [Message], tools: &'a [ToolSpec]) -> Request<'a> {
-        Request {
-            model: "claude-sonnet-4-5",
-            system: "be terse",
-            messages,
-            tools,
-            max_tokens: 4096,
-            temperature: Some(0.5),
-        }
-    }
-
-    async fn collect(
-        stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
-    ) -> Result<Vec<StreamEvent>, ProviderError> {
-        let mut out = Vec::new();
-        while let Some(ev) = stream.next().await {
-            out.push(ev?);
-        }
-        Ok(out)
-    }
-
-    fn sse_body(text: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "text/event-stream")
-            .set_body_string(text)
+        tu::request("claude-sonnet-4-5", 4096, messages, tools)
     }
 
     async fn mount_once(server: &MockServer, response: ResponseTemplate) {
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(response)
-            .mount(server)
-            .await;
+        tu::mount_once(server, "/v1/messages", response).await;
     }
 
     // ---- 请求侧 ----
@@ -836,41 +727,13 @@ mod tests {
 
     // ---- 响应侧状态机 ----
 
-    fn event_to_json(ev: &StreamEvent) -> Value {
-        match ev {
-            StreamEvent::TextDelta(text) => json!({"kind": "text_delta", "text": text}),
-            StreamEvent::ToolUseStart { id, name } => {
-                json!({"kind": "tool_use_start", "id": id, "name": name})
-            }
-            StreamEvent::ToolUseDelta(arguments) => {
-                json!({"kind": "tool_use_delta", "arguments": arguments})
-            }
-            StreamEvent::ToolUseEnd => json!({"kind": "tool_use_end"}),
-            StreamEvent::Done { usage, stop_reason } => {
-                json!({"kind": "done", "usage": usage, "stop_reason": stop_reason})
-            }
-        }
-    }
-
     /// 原始 SSE 文本 → SseParser → 状态机 → StreamEvent 列表（不经网络）。
     async fn run_sse(text: &str) -> Vec<StreamEvent> {
-        let mut parser = SseParser::default();
-        let events = parser.feed(text);
-        assert!(parser.buffer.trim().is_empty(), "fixture 必须以空行结尾");
-        let input: BoxStream<'static, crate::Result<SseEvent>> =
-            fstream::iter(events.into_iter().map(Ok)).boxed();
-        let mut stream = sse_to_stream_events(input);
-        collect(&mut stream).await.expect("fixture stream ok")
+        tu::run_sse(text, sse_to_stream_events).await
     }
 
     fn fixture_pair(name: &str) -> (String, Value) {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/anthropic");
-        let sse = std::fs::read_to_string(format!("{dir}/{name}.sse")).expect(name);
-        let expected: Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{dir}/{name}.expected.json")).expect(name),
-        )
-        .expect("expected json");
-        (sse, expected)
+        tu::fixture_pair("anthropic", name)
     }
 
     // M2 · SSE fixture 对照（样本自 goose formats/anthropic.rs 测试段

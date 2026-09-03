@@ -9,6 +9,7 @@ pub mod http;
 pub mod openai;
 pub mod proxy;
 pub mod registry;
+mod shared;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

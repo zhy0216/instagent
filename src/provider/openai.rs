@@ -24,17 +24,10 @@
 //! 构造入参 = provider JSON 定义，供 `10` registry 调用。
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
-use std::time::Duration;
 
-use anyhow::Context;
 use async_trait::async_trait;
-use futures::stream;
 use futures::stream::BoxStream;
-use futures::StreamExt;
-use regex::Regex;
 use serde_json::json;
 use serde_json::Value;
 
@@ -43,20 +36,27 @@ use crate::message::Content;
 use crate::message::Message;
 use crate::message::Role;
 use crate::message::Usage;
+use crate::provider::http::is_done;
 use crate::provider::http::HttpClient;
 use crate::provider::http::RetryPolicy;
 use crate::provider::http::SseEvent;
+use crate::provider::shared::arguments_or_empty;
+use crate::provider::shared::engine_parts;
+use crate::provider::shared::headers_with_auth;
+use crate::provider::shared::parse_chunk;
+use crate::provider::shared::require_base_url;
+use crate::provider::shared::sanitize_function_name;
+use crate::provider::shared::sanitized_tool_names;
+use crate::provider::shared::to_provider_error;
+use crate::provider::shared::StreamEngine;
+use crate::provider::shared::StreamState;
 use crate::provider::EngineKind;
 use crate::provider::Provider;
 use crate::provider::ProviderDef;
 use crate::provider::Request;
 use crate::provider::StopReason;
 use crate::provider::StreamEvent;
-use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
 use crate::tools::ToolSpec;
-
-/// OpenAI function name 长度上限（goose 用 128，OpenAI 文档口径 64，从 todo）。
-const MAX_FUNCTION_NAME_LENGTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -69,31 +69,13 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// 校验 def（engine=openai、base_url 必填），按 `api_key_env` 读密钥，
-    /// 按 `timeout_seconds` 建 client。
+    /// 按 `timeout_seconds` 建 client（构造骨架在共享层 [`engine_parts`]）。
     pub fn new(def: &ProviderDef) -> crate::Result<Self> {
-        anyhow::ensure!(
-            def.engine == EngineKind::Openai,
-            "provider {} is not an openai engine",
-            def.name
-        );
-        anyhow::ensure!(
-            def.base_url.as_deref().is_some_and(|u| !u.is_empty()),
-            "provider {} missing base_url",
-            def.name
-        );
-        let api_key = match def.api_key_env.as_deref() {
-            Some(var) => std::env::var(var)
-                .with_context(|| format!("provider {} requires env var {var}", def.name))?,
-            None => String::new(),
-        };
-        let timeout = Duration::from_secs(
-            def.timeout_seconds
-                .unwrap_or(DEFAULT_PROVIDER_TIMEOUT.as_secs()),
-        );
+        let (api_key, http) = engine_parts(def, EngineKind::Openai)?;
         Ok(Self {
             def: def.clone(),
             api_key,
-            http: HttpClient::new(timeout)?,
+            http,
         })
     }
 
@@ -105,14 +87,13 @@ impl OpenAiProvider {
 
     /// def 自带 headers + `Authorization: Bearer`（密钥为空则不发该头）。
     fn request_headers(&self) -> BTreeMap<String, String> {
-        let mut headers = self.def.headers.clone();
-        if !self.api_key.is_empty() {
-            headers.insert(
+        let auth = (!self.api_key.is_empty()).then(|| {
+            (
                 "authorization".to_string(),
                 format!("Bearer {}", self.api_key),
-            );
-        }
-        headers
+            )
+        });
+        headers_with_auth(&self.def, auth)
     }
 }
 
@@ -126,9 +107,7 @@ impl Provider for OpenAiProvider {
         &self,
         req: Request<'_>,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let base_url = self.def.base_url.as_deref().ok_or_else(|| {
-            ProviderError::Transport(format!("provider {} missing base_url", self.def.name))
-        })?;
+        let base_url = require_base_url(&self.def)?;
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let body = build_request_body(&req).map_err(to_provider_error)?;
         let sse = self
@@ -137,13 +116,6 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(to_provider_error)?;
         Ok(sse_to_stream_events(sse))
-    }
-}
-
-fn to_provider_error(err: anyhow::Error) -> ProviderError {
-    match err.downcast::<ProviderError>() {
-        Ok(pe) => pe,
-        Err(err) => ProviderError::Transport(err.to_string()),
     }
 }
 
@@ -250,219 +222,161 @@ fn tool_arguments(input: &Value) -> String {
 }
 
 /// [`ToolSpec`] → `{type:"function", function:{name,description,parameters}}`；
-/// sanitize 后重名直接报错（goose formats/openai.rs format_tools 同款防御）。
+/// sanitize + 重名报错在共享层 [`sanitized_tool_names`]
+/// （goose formats/openai.rs format_tools 同款防御）。
 fn format_tools(tools: &[ToolSpec]) -> crate::Result<Vec<Value>> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for tool in tools {
-        let name = sanitize_function_name(&tool.name);
-        anyhow::ensure!(
-            seen.insert(name.clone()),
-            "duplicate tool name after sanitize: {}",
-            tool.name
-        );
-        out.push(json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": tool.description,
-                "parameters": tool.input_schema,
-            }
-        }));
-    }
-    Ok(out)
-}
-
-/// 怪癖 2：只允许 `[A-Za-z0-9_-]`，非法字符替换为 `_`，超长截断到 64
-/// （goose formats/openai.rs:1918 sanitize_function_name 的规则，长度取 64）。
-/// 幂等：sanitize(sanitize(x)) == sanitize(x)。
-pub fn sanitize_function_name(name: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[^A-Za-z0-9_-]").unwrap());
-    let sanitized: String = re
-        .replace_all(name, "_")
-        .chars()
-        .take(MAX_FUNCTION_NAME_LENGTH)
-        .collect();
-    if sanitized.is_empty() {
-        // 空名同样不合法（{1,64}），给一个稳定的占位名。
-        "tool".to_string()
-    } else {
-        sanitized
-    }
+    let names = sanitized_tool_names(tools)?;
+    Ok(tools
+        .iter()
+        .zip(names)
+        .map(|(tool, name)| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }
+            })
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
 // 响应侧：SSE 事件流 → StreamEvent
 // ---------------------------------------------------------------------------
 
+/// openai 引擎流状态：共享 [`StreamState`] + usage 累积
+/// （tool_calls 按 `delta.tool_calls[].index` 累积，第二版 §6 风险 1）。
 #[derive(Debug, Default)]
-struct PendingCall {
-    id: String,
-    name: String,
-    arguments: String,
+struct OpenAiStreamState {
+    st: StreamState,
+    usage: Usage,
 }
 
-struct StreamState {
-    events: BoxStream<'static, crate::Result<SseEvent>>,
-    out: VecDeque<Result<StreamEvent, ProviderError>>,
-    /// 按 `delta.tool_calls[].index` 累积（第二版 §6 风险 1）。
-    tools: BTreeMap<i64, PendingCall>,
-    usage: Usage,
-    finish: Option<String>,
-    ended: bool,
+impl OpenAiStreamState {
+    /// 单个流式 chunk：文本即时出 TextDelta，tool_calls 按 index 累积，
+    /// usage / finish_reason 记录到最后（`Done` 在收尾钩子统一发）。
+    fn apply_chunk(&mut self, chunk: &Value) -> Result<(), ProviderError> {
+        if let Some(err) = chunk.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(ProviderError::Transport(format!(
+                "provider error in stream: {msg}"
+            )));
+        }
+        if let Some(usage) = usage_from_chunk(chunk) {
+            self.usage = usage;
+        }
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        else {
+            return Ok(());
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            // 空串 finish_reason 不是终止信号（ollama / 部分网关会发 ""）。
+            if !reason.is_empty() {
+                self.st.stop = Some(reason.to_string());
+            }
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(());
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                self.st
+                    .out
+                    .push_back(Ok(StreamEvent::TextDelta(text.to_string())));
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (position, call) in calls.iter().enumerate() {
+                let index = call
+                    .get("index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(position as i64);
+                let pending = self.st.tools.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() && pending.id.is_empty() {
+                        pending.id = id.to_string();
+                    }
+                }
+                let Some(function) = call.get("function") else {
+                    continue;
+                };
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    if !name.is_empty() && pending.name.is_empty() {
+                        pending.name = name.to_string();
+                    }
+                }
+                // arguments 可能缺省 / null（goose 的 delta 测试覆盖过）。
+                if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+                    pending.arguments.push_str(args);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StreamEngine for OpenAiStreamState {
+    fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>> {
+        &mut self.st.out
+    }
+
+    fn ended(&mut self) -> &mut bool {
+        &mut self.st.ended
+    }
+
+    fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
+        if is_done(ev) {
+            self.finalize();
+            return Ok(());
+        }
+        match parse_chunk(ev)? {
+            Some(chunk) => self.apply_chunk(&chunk),
+            None => Ok(()),
+        }
+    }
+
+    /// `[DONE]` / 断流收尾：tool 事件按 index 升序整组 flush，再发 `Done`。
+    fn finalize(&mut self) {
+        if self.st.ended {
+            return;
+        }
+        self.st.ended = true;
+        let stop_reason = match self.st.stop.as_deref() {
+            // 没收到 finish_reason 但有 tool_calls：按 ToolUse 收尾更可用。
+            None if !self.st.tools.is_empty() => StopReason::ToolUse,
+            reason => map_stop_reason(reason),
+        };
+        for (_, call) in std::mem::take(&mut self.st.tools) {
+            // 怪癖 4 的响应侧：空 arguments 当 `{}`。
+            let arguments = arguments_or_empty(call.arguments);
+            self.st.out.push_back(Ok(StreamEvent::ToolUseStart {
+                id: call.id,
+                name: call.name,
+            }));
+            self.st
+                .out
+                .push_back(Ok(StreamEvent::ToolUseDelta(arguments)));
+            self.st.out.push_back(Ok(StreamEvent::ToolUseEnd));
+        }
+        self.st.out.push_back(Ok(StreamEvent::Done {
+            usage: self.usage,
+            stop_reason,
+        }));
+    }
 }
 
 fn sse_to_stream_events(
     events: BoxStream<'static, crate::Result<SseEvent>>,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    let state = StreamState {
-        events,
-        out: VecDeque::new(),
-        tools: BTreeMap::new(),
-        usage: Usage::default(),
-        finish: None,
-        ended: false,
-    };
-    stream::unfold(state, |mut st| async move {
-        loop {
-            if let Some(item) = st.out.pop_front() {
-                return Some((item, st));
-            }
-            if st.ended {
-                return None;
-            }
-            match st.events.next().await {
-                Some(Ok(ev)) => {
-                    if crate::provider::http::is_done(&ev) {
-                        finalize(&mut st);
-                    } else {
-                        let data = ev.data.trim();
-                        if !data.is_empty() {
-                            match serde_json::from_str::<Value>(data) {
-                                Ok(chunk) => {
-                                    if let Err(err) = apply_chunk(&chunk, &mut st) {
-                                        st.out.push_back(Err(err));
-                                        st.ended = true;
-                                    }
-                                }
-                                Err(err) => {
-                                    st.out.push_back(Err(ProviderError::Transport(format!(
-                                        "malformed SSE chunk {data:?}: {err}"
-                                    ))));
-                                    st.ended = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(Err(err)) => {
-                    st.out.push_back(Err(to_provider_error(err)));
-                    st.ended = true;
-                }
-                // 断流（无 [DONE]）也要收尾，否则 loop 永远等不到 Done。
-                None => finalize(&mut st),
-            }
-        }
-    })
-    .boxed()
-}
-
-/// 单个流式 chunk：文本即时出 TextDelta，tool_calls 按 index 累积，
-/// usage / finish_reason 记录到最后（`Done` 在 [`finalize`] 统一发）。
-fn apply_chunk(chunk: &Value, st: &mut StreamState) -> Result<(), ProviderError> {
-    if let Some(err) = chunk.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        return Err(ProviderError::Transport(format!(
-            "provider error in stream: {msg}"
-        )));
-    }
-    if let Some(usage) = usage_from_chunk(chunk) {
-        st.usage = usage;
-    }
-    let Some(choice) = chunk
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-    else {
-        return Ok(());
-    };
-    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-        // 空串 finish_reason 不是终止信号（ollama / 部分网关会发 ""）。
-        if !reason.is_empty() {
-            st.finish = Some(reason.to_string());
-        }
-    }
-    let Some(delta) = choice.get("delta") else {
-        return Ok(());
-    };
-    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            st.out
-                .push_back(Ok(StreamEvent::TextDelta(text.to_string())));
-        }
-    }
-    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for (position, call) in calls.iter().enumerate() {
-            let index = call
-                .get("index")
-                .and_then(Value::as_i64)
-                .unwrap_or(position as i64);
-            let pending = st.tools.entry(index).or_default();
-            if let Some(id) = call.get("id").and_then(Value::as_str) {
-                if !id.is_empty() && pending.id.is_empty() {
-                    pending.id = id.to_string();
-                }
-            }
-            let Some(function) = call.get("function") else {
-                continue;
-            };
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                if !name.is_empty() && pending.name.is_empty() {
-                    pending.name = name.to_string();
-                }
-            }
-            // arguments 可能缺省 / null（goose 的 delta 测试覆盖过）。
-            if let Some(args) = function.get("arguments").and_then(Value::as_str) {
-                pending.arguments.push_str(args);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `[DONE]` / 断流收尾：tool 事件按 index 升序整组 flush，再发 `Done`。
-fn finalize(st: &mut StreamState) {
-    if st.ended {
-        return;
-    }
-    st.ended = true;
-    let stop_reason = match st.finish.as_deref() {
-        // 没收到 finish_reason 但有 tool_calls：按 ToolUse 收尾更可用。
-        None if !st.tools.is_empty() => StopReason::ToolUse,
-        reason => map_stop_reason(reason),
-    };
-    for (_, call) in std::mem::take(&mut st.tools) {
-        // 怪癖 4 的响应侧：空 arguments 当 `{}`。
-        let arguments = if call.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            call.arguments
-        };
-        st.out.push_back(Ok(StreamEvent::ToolUseStart {
-            id: call.id,
-            name: call.name,
-        }));
-        st.out.push_back(Ok(StreamEvent::ToolUseDelta(arguments)));
-        st.out.push_back(Ok(StreamEvent::ToolUseEnd));
-    }
-    st.out.push_back(Ok(StreamEvent::Done {
-        usage: st.usage,
-        stop_reason,
-    }));
+    crate::provider::shared::sse_to_stream_events(OpenAiStreamState::default(), events)
 }
 
 /// `finish_reason` → [`StopReason`]。
@@ -496,86 +410,42 @@ fn usage_from_chunk(chunk: &Value) -> Option<Usage> {
 mod tests {
     use super::*;
     use crate::provider::http::SseParser;
+    use crate::provider::shared::testutil as tu;
+    use crate::provider::shared::testutil::collect;
+    use crate::provider::shared::testutil::event_to_json;
+    use crate::provider::shared::testutil::fast_retry;
+    use crate::provider::shared::testutil::sse_body;
+    use crate::provider::shared::MAX_FUNCTION_NAME_LENGTH;
+    use crate::provider::DEFAULT_PROVIDER_TIMEOUT;
     use futures::stream as fstream;
+    use futures::StreamExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
 
-    fn fast_retry() -> RetryPolicy {
-        RetryPolicy {
-            max_retries: crate::provider::http::MAX_RETRIES,
-            initial_backoff: Duration::from_millis(1),
-            factor: crate::provider::http::BACKOFF_FACTOR,
-            cap: Duration::from_millis(20),
-        }
-    }
-
     fn def(base_url: Option<&str>) -> ProviderDef {
-        ProviderDef {
-            name: "test-openai".into(),
-            engine: EngineKind::Openai,
-            display_name: None,
-            description: None,
-            api_key_env: None,
-            base_url: base_url.map(str::to_string),
-            headers: BTreeMap::new(),
-            timeout_seconds: None,
-            models: vec![],
-            proxy: None,
-        }
+        tu::def("test-openai", EngineKind::Openai, base_url)
     }
 
     fn provider_at(base_url: &str, api_key: &str) -> OpenAiProvider {
-        let mut headers = BTreeMap::new();
-        headers.insert("x-instagent-test".to_string(), "yes".to_string());
+        let (def, http) = tu::provider_parts("test-openai", EngineKind::Openai, base_url);
         OpenAiProvider {
-            def: ProviderDef {
-                headers,
-                ..def(Some(base_url))
-            },
+            def,
             api_key: api_key.to_string(),
-            http: HttpClient::new(Duration::from_secs(5))
-                .unwrap()
-                .with_retry(fast_retry()),
+            http,
         }
     }
 
     fn request<'a>(messages: &'a [Message], tools: &'a [ToolSpec]) -> Request<'a> {
-        Request {
-            model: "gpt-4o",
-            system: "be terse",
-            messages,
-            tools,
-            max_tokens: 1024,
-            temperature: Some(0.5),
-        }
-    }
-
-    async fn collect(
-        stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
-    ) -> Result<Vec<StreamEvent>, ProviderError> {
-        let mut out = Vec::new();
-        while let Some(ev) = stream.next().await {
-            out.push(ev?);
-        }
-        Ok(out)
-    }
-
-    fn sse_body(text: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "text/event-stream")
-            .set_body_string(text)
+        tu::request("gpt-4o", 1024, messages, tools)
     }
 
     async fn mount_once(server: &MockServer, response: ResponseTemplate) {
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(response)
-            .mount(server)
-            .await;
+        tu::mount_once(server, "/v1/chat/completions", response).await;
     }
 
     // ---- 怪癖 1~4：请求侧格式化 ----
@@ -727,41 +597,13 @@ mod tests {
 
     // ---- 响应侧状态机 ----
 
-    fn event_to_json(ev: &StreamEvent) -> Value {
-        match ev {
-            StreamEvent::TextDelta(text) => json!({"kind": "text_delta", "text": text}),
-            StreamEvent::ToolUseStart { id, name } => {
-                json!({"kind": "tool_use_start", "id": id, "name": name})
-            }
-            StreamEvent::ToolUseDelta(arguments) => {
-                json!({"kind": "tool_use_delta", "arguments": arguments})
-            }
-            StreamEvent::ToolUseEnd => json!({"kind": "tool_use_end"}),
-            StreamEvent::Done { usage, stop_reason } => {
-                json!({"kind": "done", "usage": usage, "stop_reason": stop_reason})
-            }
-        }
-    }
-
     /// 原始 SSE 文本 → SseParser → 状态机 → StreamEvent 列表（不经网络）。
     async fn run_sse(text: &str) -> Vec<StreamEvent> {
-        let mut parser = SseParser::default();
-        let events = parser.feed(text);
-        assert!(parser.buffer.trim().is_empty(), "fixture 必须以空行结尾");
-        let input: BoxStream<'static, crate::Result<SseEvent>> =
-            fstream::iter(events.into_iter().map(Ok)).boxed();
-        let mut stream = sse_to_stream_events(input);
-        collect(&mut stream).await.expect("fixture stream ok")
+        tu::run_sse(text, sse_to_stream_events).await
     }
 
     fn fixture_pair(name: &str) -> (String, Value) {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openai");
-        let sse = std::fs::read_to_string(format!("{dir}/{name}.sse")).expect(name);
-        let expected: Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{dir}/{name}.expected.json")).expect(name),
-        )
-        .expect("expected json");
-        (sse, expected)
+        tu::fixture_pair("openai", name)
     }
 
     // J2 · SSE fixture 对照（样本自 goose formats/openai.rs 测试段抄改：
