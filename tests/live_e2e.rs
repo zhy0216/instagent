@@ -8,8 +8,8 @@
 //! `session `、`▶`），prompt 命令式写死，从不查自然语言措辞（防 flake）。
 //!
 //! 用例表对应 `plans/live-e2e/plan.md`：a1/a2 run 全链路，b1/b2 会话管理，
-//! c1/c2 模式与审批白名单，d1–d5 插件链路（command tool / hooks / skill /
-//! 斜杠命令，消费 `tests/fixtures/liveplug`），e1 环境变量覆盖。
+//! d1–d5 插件链路（command tool / hooks / skill / 斜杠命令，消费
+//! `tests/fixtures/liveplug`），e1 环境变量覆盖。
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -81,7 +81,6 @@ impl Sandbox {
             .env("INSTAGENT_AGENTS_DIR", self.agents.path())
             .env_remove("INSTAGENT_PROVIDER")
             .env_remove("INSTAGENT_MODEL")
-            .env_remove("INSTAGENT_MODE")
             .env_remove("RUST_LOG");
         cmd
     }
@@ -109,15 +108,6 @@ impl Sandbox {
         )
         .unwrap();
         self.write_config_yaml(&live_config_yaml(&live_model(), ""));
-    }
-
-    /// 预信任 `liveplug`（§5.2：可执行组件不走交互确认）。
-    fn trust_liveplug(&self) {
-        std::fs::write(
-            self.config.path().join("settings.json"),
-            r#"{"trustedPlugins":["liveplug"]}"#,
-        )
-        .unwrap();
     }
 
     fn sessions_dir(&self) -> PathBuf {
@@ -176,7 +166,7 @@ fn session_id_of(stderr: &str) -> String {
 const SHELL_ECHO_MANGO: &str = "用 shell 工具执行命令 echo MANGO_77，并把命令输出原样报告。";
 const REPLY_OK_ONLY: &str = "只回复两个字母 OK，不要输出任何其他内容。";
 
-// ---- T2：核心链路 a1 / a2 / b1 / b2 / c1 / c2 / e1 ----
+// ---- T2：核心链路 a1 / a2 / b1 / b2 / e1 ----
 
 /// a1：`run -t` 最简一轮——回复 + `usage:`（stdout）+ `session <id>`（stderr）。
 #[tokio::test]
@@ -288,61 +278,6 @@ async fn live_b2_chat_remember_resume() {
     assert!(stdout.contains("BLUE_OTTER_3"), "{stdout}");
 }
 
-/// c1：`--mode chat` 不给模型工具——请求用 shell 也不会出现 `▶`。
-#[tokio::test]
-async fn live_c1_chat_mode_has_no_tools() {
-    if !has_key() {
-        return;
-    }
-    let sandbox = Sandbox::new();
-    sandbox.install_live_provider();
-
-    let out = output(sandbox.cmd(&[
-        "run",
-        "--mode",
-        "chat",
-        "-t",
-        "用 shell 工具执行命令 echo HI_42，并把命令输出原样报告。",
-    ]))
-    .await;
-    assert_ok(&out, "c1 run --mode chat");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("▶"),
-        "chat 模式不应有任何工具调用: {stdout}"
-    );
-}
-
-/// c2：approve 白名单——无 `always_allow` 时 shell 被拒，配上后放行。
-#[tokio::test]
-async fn live_c2_approve_whitelist() {
-    if !has_key() {
-        return;
-    }
-    let sandbox = Sandbox::new();
-    sandbox.install_live_provider();
-
-    // run 非交互：approve 模式下未命中白名单的调用直接拒绝（无 `▶ shell`）。
-    let denied = output(sandbox.cmd(&["run", "--mode", "approve", "-t", SHELL_ECHO_MANGO])).await;
-    assert_ok(&denied, "c2 approve 无白名单");
-    let stdout = String::from_utf8_lossy(&denied.stdout);
-    assert!(
-        !stdout.contains("▶ shell"),
-        "未配白名单时 shell 应被拒: {stdout}"
-    );
-
-    // 配 `always_allow: [shell]` 后同一任务放行。
-    sandbox.write_config_yaml(&live_config_yaml(
-        &live_model(),
-        "always_allow:\n  - shell\n",
-    ));
-    let allowed = output(sandbox.cmd(&["run", "--mode", "approve", "-t", SHELL_ECHO_MANGO])).await;
-    assert_ok(&allowed, "c2 approve 配白名单");
-    let stdout = String::from_utf8_lossy(&allowed.stdout);
-    assert!(stdout.contains("▶ shell"), "{stdout}");
-    assert!(stdout.contains("MANGO_77"), "{stdout}");
-}
-
 /// e1：`INSTAGENT_MODEL` 覆盖 config 里故意写错的模型名（§4.2）。
 #[tokio::test]
 async fn live_e1_env_model_override() {
@@ -371,7 +306,6 @@ async fn live_d1_plugin_command_tool() {
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    sandbox.trust_liveplug();
     let plugin = liveplug_fixture().display().to_string();
 
     let out = output(sandbox.cmd(&[
@@ -396,7 +330,6 @@ async fn live_d2_plugin_hook_blocks_shell() {
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    sandbox.trust_liveplug();
     let plugin = liveplug_fixture().display().to_string();
 
     let out = output(sandbox.cmd(&[
@@ -424,7 +357,6 @@ async fn live_d3_plugin_hook_payloads() {
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    sandbox.trust_liveplug();
     let plugin = liveplug_fixture().display().to_string();
 
     let out = output(sandbox.cmd(&[
@@ -459,7 +391,6 @@ async fn live_d4_plugin_skill() {
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    sandbox.trust_liveplug();
     let plugin = liveplug_fixture().display().to_string();
 
     let out = output(sandbox.cmd(&[
@@ -483,7 +414,6 @@ async fn live_d5_plugin_slash_command() {
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    sandbox.trust_liveplug();
     let plugin = liveplug_fixture().display().to_string();
 
     let out = output_with_stdin(

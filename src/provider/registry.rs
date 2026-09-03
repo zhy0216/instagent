@@ -123,7 +123,7 @@ impl ProviderRegistry {
         Ok(&self.resolve(name)?.def)
     }
 
-    /// 定义该 provider 的插件名（信任门控用）。
+    /// 定义该 provider 的插件名。
     pub fn provider_plugin(&self, name: &str) -> Result<String> {
         Ok(self.resolve(name)?.plugin.clone())
     }

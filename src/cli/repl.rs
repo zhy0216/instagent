@@ -1,8 +1,8 @@
 //! REPL（第二版 §2.11）：rustyline 循环 + 斜杠命令 + Ctrl-C。
 //!
 //! Ctrl-C：第一次取消当前轮（cancel token），第二次退出；空闲时第一次
-//! 提示、第二次退出。斜杠命令：`/exit` `/clear` `/compact` `/mode <m>`
-//! `/tools` `/help` + `17` 的插件斜杠命令（动态展开进 prompt）。
+//! 提示、第二次退出。斜杠命令：`/exit` `/clear` `/compact` `/tools`
+//! `/help` + `17` 的插件斜杠命令（动态展开进 prompt）。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -18,7 +18,6 @@ use instagent::agent::compact;
 use instagent::agent::TurnResult;
 use instagent::commands::expand;
 use instagent::commands::SlashCommand;
-use instagent::config::Mode;
 use instagent::session::Session;
 
 use super::assembly::Runtime;
@@ -33,12 +32,9 @@ pub enum Input {
     Compact,
     Help,
     Tools,
-    Mode(Mode),
     Exit,
     /// 未知斜杠命令（携带命令名）。
     Unknown(String),
-    /// `mode` 参数非法。
-    BadMode(String),
 }
 
 /// 斜杠命令分发（纯函数：不依赖 editor / agent）。
@@ -58,10 +54,6 @@ pub fn classify(line: &str, plugin_commands: &[SlashCommand]) -> Input {
         "clear" => Input::Clear,
         "compact" => Input::Compact,
         "tools" => Input::Tools,
-        "mode" => match args.parse() {
-            Ok(mode) => Input::Mode(mode),
-            Err(_) => Input::BadMode(args.to_string()),
-        },
         _ => {
             if let Some(cmd) = plugin_commands.iter().find(|c| c.name == name) {
                 Input::Prompt(expand(cmd, args))
@@ -69,14 +61,6 @@ pub fn classify(line: &str, plugin_commands: &[SlashCommand]) -> Input {
                 Input::Unknown(name.to_string())
             }
         }
-    }
-}
-
-fn mode_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Auto => "auto",
-        Mode::Approve => "approve",
-        Mode::Chat => "chat",
     }
 }
 
@@ -90,15 +74,9 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
     let _ = editor.load_history(&history);
 
     println!(
-        "instagent · provider {} · model {} · mode {} · session {}\n(type /help, Ctrl-D or /exit to quit)",
-        rt.provider_name,
-        rt.model,
-        mode_name(rt.agent.cfg.mode),
-        session.header.id
+        "instagent · provider {} · model {} · session {}\n(type /help, Ctrl-D or /exit to quit)",
+        rt.provider_name, rt.model, session.header.id
     );
-
-    // 接 CLI 审批通道（approve 模式用；`16` 的 Confirm trait）。
-    rt.agent.approval.confirm = Some(Arc::new(render::CliConfirm));
 
     let mut quit = false;
     let mut idle_ctrl_c = 0u32;
@@ -135,7 +113,7 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
                 quit = run_turn(rt, session, text).await?;
             }
             Input::Exit => break,
-            Input::Help => print_help(&rt.slash_commands, rt.agent.cfg.mode),
+            Input::Help => print_help(&rt.slash_commands),
             Input::Clear => {
                 session.rewrite(Vec::new())?;
                 println!("(context cleared)");
@@ -152,14 +130,6 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
                         one_line(&spec.description)
                     );
                 }
-            }
-            Input::Mode(mode) => {
-                rt.agent.cfg.mode = mode;
-                rt.agent.approval.mode = mode;
-                println!("(mode = {})", mode_name(mode));
-            }
-            Input::BadMode(arg) => {
-                println!("usage: /mode auto|approve|chat (got {arg:?})");
             }
             Input::Unknown(name) => {
                 println!("unknown command /{name}; /help lists commands");
@@ -231,15 +201,13 @@ async fn compact_now(rt: &mut Runtime, session: &mut Session) -> instagent::Resu
     Ok(())
 }
 
-fn print_help(plugin_commands: &[SlashCommand], mode: Mode) {
+fn print_help(plugin_commands: &[SlashCommand]) {
     println!(
         "/exit /quit  quit\n\
          /clear       drop conversation context\n\
          /compact     force compaction now\n\
-         /mode <m>    auto | approve | chat (current: {})\n\
          /tools       list visible tools\n\
-         /help        this message",
-        mode_name(mode)
+         /help        this message"
     );
     if plugin_commands.is_empty() {
         return;
@@ -287,15 +255,6 @@ mod tests {
         assert_eq!(classify("/clear", &cmds), Input::Clear);
         assert_eq!(classify("/compact", &cmds), Input::Compact);
         assert_eq!(classify("/tools", &cmds), Input::Tools);
-    }
-
-    #[test]
-    fn mode_parsing_is_case_insensitive_and_strict() {
-        let cmds = [];
-        assert_eq!(classify("/mode AUTO", &cmds), Input::Mode(Mode::Auto));
-        assert_eq!(classify("/mode chat", &cmds), Input::Mode(Mode::Chat));
-        assert_eq!(classify("/mode", &cmds), Input::BadMode(String::new()));
-        assert_eq!(classify("/mode yolo", &cmds), Input::BadMode("yolo".into()));
     }
 
     #[test]

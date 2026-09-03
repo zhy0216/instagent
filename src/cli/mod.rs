@@ -1,20 +1,17 @@
-//! CLI（第二版 §2.11；第三版 §2.10 信任、§8 完整图景）：
+//! CLI（第二版 §2.11；第三版 §8 完整图景）：
 //! clap 入口 + chat / run / sessions / plugin 四个子命令与运行时装配。
 //!
 //! 本模块只在 `main.rs` 里声明（`src/cli/**` 不在 lib 模块树，`00` 的约定）；
-//! 装配见 [`assembly`]，信任确认见 [`trust`]，REPL 见 [`repl`]。
+//! 装配见 [`assembly`]，REPL 见 [`repl`]。
 
 pub mod assembly;
 pub mod handlers;
 pub mod render;
 pub mod repl;
-pub mod trust;
 
 use clap::Parser;
 use clap::Subcommand;
 use std::path::PathBuf;
-
-use instagent::config::Mode;
 
 #[derive(Parser)]
 #[command(name = "instagent", version, about = "插件为核心的最小 agent")]
@@ -25,7 +22,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// 交互式 REPL（rustyline；/exit /clear /compact /mode /tools /help）
+    /// 交互式 REPL（rustyline；/exit /clear /compact /tools /help）
     Chat {
         /// 恢复会话：id 或 "last"
         #[arg(long)]
@@ -34,14 +31,11 @@ pub enum Commands {
         cwd: Option<PathBuf>,
         #[arg(short, long)]
         model: Option<String>,
-        /// auto | approve | chat
-        #[arg(long)]
-        mode: Option<Mode>,
         /// 开发时临时加载插件路径
         #[arg(long = "plugin")]
         plugin: Vec<PathBuf>,
     },
-    /// 无交互跑一条任务（审批按 auto，结束打印最终回复和 usage）
+    /// 无交互跑一条任务（结束打印最终回复和 usage）
     Run {
         #[arg(short = 't', long)]
         task: String,
@@ -49,9 +43,6 @@ pub enum Commands {
         cwd: Option<PathBuf>,
         #[arg(short, long)]
         model: Option<String>,
-        /// auto | approve | chat（默认 auto）
-        #[arg(long)]
-        mode: Option<Mode>,
         #[arg(long = "plugin")]
         plugin: Vec<PathBuf>,
     },
@@ -83,9 +74,6 @@ pub enum PluginAction {
         source: String,
         #[arg(long)]
         auto_update: bool,
-        /// 跳过信任确认
-        #[arg(long = "yes")]
-        yes: bool,
     },
     List,
     Update {
@@ -93,9 +81,6 @@ pub enum PluginAction {
     },
     Enable {
         name: String,
-        /// 跳过信任确认
-        #[arg(long = "yes")]
-        yes: bool,
     },
     Disable {
         name: String,
@@ -113,16 +98,14 @@ pub async fn run() -> anyhow::Result<()> {
             resume,
             cwd,
             model,
-            mode,
             plugin,
-        } => handlers::chat(resume, cwd, model, mode, plugin).await,
+        } => handlers::chat(resume, cwd, model, plugin).await,
         Commands::Run {
             task,
             cwd,
             model,
-            mode,
             plugin,
-        } => handlers::run(task, cwd, model, mode, plugin).await,
+        } => handlers::run(task, cwd, model, plugin).await,
         Commands::Sessions { action } => handlers::sessions(action),
         Commands::Plugin { action } => handlers::plugin(action),
     }
@@ -182,7 +165,7 @@ pub(crate) mod fixtures {
             std::env::set_var("INSTAGENT_CONFIG_DIR", env.config.path());
             std::env::set_var("INSTAGENT_DATA_DIR", env.data.path());
             std::env::set_var("INSTAGENT_AGENTS_DIR", env.agents.path());
-            for key in ["INSTAGENT_PROVIDER", "INSTAGENT_MODEL", "INSTAGENT_MODE"] {
+            for key in ["INSTAGENT_PROVIDER", "INSTAGENT_MODEL"] {
                 std::env::remove_var(key);
             }
             env
@@ -212,32 +195,6 @@ pub(crate) mod fixtures {
         .unwrap();
     }
 
-    /// 会执行命令的组件：hooks + command tool。
-    pub(crate) fn add_exec_surfaces(plugin: &Path) {
-        let ns = plugin.join(NAMESPACE);
-        std::fs::create_dir_all(ns.join("tools")).unwrap();
-        let script = plugin.join("guard.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(
-            ns.join("hooks.json"),
-            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"${PLUGIN_ROOT}/guard.sh"}]}]}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            ns.join("tools/weather.json"),
-            r#"{"name":"weather","description":"get weather","input_schema":{"type":"object"},"command":"${PLUGIN_ROOT}/guard.sh"}"#,
-        )
-        .unwrap();
-    }
-
-    pub(crate) fn add_mcp_json(plugin: &Path, servers: serde_json::Value) {
-        std::fs::write(
-            plugin.join("mcp.json"),
-            serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers })).unwrap(),
-        )
-        .unwrap();
-    }
-
     pub(crate) fn add_provider(plugin: &Path, def: serde_json::Value) {
         let dir = plugin.join(NAMESPACE).join("providers");
         std::fs::create_dir_all(&dir).unwrap();
@@ -254,14 +211,6 @@ pub(crate) mod fixtures {
             "name": "fake",
             "engine": "openai",
             "base_url": base_url,
-        })
-    }
-
-    pub(crate) fn proxy_provider() -> serde_json::Value {
-        serde_json::json!({
-            "name": "pxy",
-            "engine": "proxy",
-            "proxy": { "command": "./serve.sh", "args": ["--port", "${PORT}"] },
         })
     }
 

@@ -1,41 +1,14 @@
 //! 配置（第二版 §2.10；第三版 §2.10：无 `mcp:` 段，多 `plugins` 额外路径）。
 //!
-//! 读 `~/.config/instagent/config.yaml`，叠加 `INSTAGENT_{PROVIDER,MODEL,MODE}`
+//! 读 `~/.config/instagent/config.yaml`，叠加 `INSTAGENT_{PROVIDER,MODEL}`
 //! 环境变量覆盖；不接系统 keyring。用户级目录可被 `INSTAGENT_CONFIG_DIR`
 //! 覆盖（测试用），与 `session.rs` 的 `INSTAGENT_DATA_DIR` 同一约定。
 
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::Context as _;
 use serde::Deserialize;
 use serde::Serialize;
-
-/// 审批模式（第二版 §2.8）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// 全放行。
-    Auto,
-    /// 白名单放行，其余问用户（默认）。
-    #[default]
-    Approve,
-    /// 不给模型工具。
-    Chat,
-}
-
-impl std::str::FromStr for Mode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "auto" => Mode::Auto,
-            "approve" => Mode::Approve,
-            "chat" => Mode::Chat,
-            other => anyhow::bail!("invalid mode `{other}` (expected auto|approve|chat)"),
-        })
-    }
-}
 
 /// `~/.config/instagent/config.yaml` 的完整形状。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,7 +21,6 @@ pub struct Config {
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub max_tokens: u32,
-    pub mode: Mode,
     /// 默认 1000（goose agent.rs:85）。
     pub max_turns: u32,
     /// 覆盖模型前缀小表（第二版 §2.3）。
@@ -57,8 +29,6 @@ pub struct Config {
     pub compaction_threshold: f32,
     /// 默认 $SHELL。
     pub shell: Option<String>,
-    /// 审批白名单；`16` 的 AllowAlways 即时写回。
-    pub always_allow: Vec<String>,
     /// 额外插件搜索路径。
     pub plugins: Vec<PathBuf>,
 }
@@ -71,12 +41,10 @@ impl Default for Config {
             api_key_env: None,
             api_key: None,
             max_tokens: 8192,
-            mode: Mode::default(),
             max_turns: 1000,
             context_limit: None,
             compaction_threshold: 0.8,
             shell: None,
-            always_allow: Vec::new(),
             plugins: Vec::new(),
         }
     }
@@ -116,21 +84,6 @@ impl Config {
         }
         Ok(config)
     }
-
-    /// 写回用户级 config.yaml（`always_allow` 持久化用，第二版 §2.8），
-    /// 文件权限 0600（可能含 `api_key`）。
-    pub fn save(&self) -> crate::Result<()> {
-        let dir = config_dir()?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("config.yaml");
-        std::fs::write(&path, serde_yaml::to_string(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    }
 }
 
 fn env_override(name: &str) -> Option<String> {
@@ -143,11 +96,6 @@ fn apply_env_overrides(config: &mut Config) -> crate::Result<()> {
     }
     if let Some(value) = env_override("INSTAGENT_MODEL") {
         config.model = Some(value);
-    }
-    if let Some(value) = env_override("INSTAGENT_MODE") {
-        config.mode = value
-            .parse()
-            .with_context(|| format!("invalid INSTAGENT_MODE: {value}"))?;
     }
     Ok(())
 }
@@ -168,7 +116,7 @@ mod tests {
         let guard = lock_env();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("INSTAGENT_CONFIG_DIR", dir.path());
-        for key in ["INSTAGENT_PROVIDER", "INSTAGENT_MODEL", "INSTAGENT_MODE"] {
+        for key in ["INSTAGENT_PROVIDER", "INSTAGENT_MODEL"] {
             std::env::remove_var(key);
         }
         (guard, dir)
@@ -180,29 +128,35 @@ mod tests {
         let cwd = Path::new("/tmp/project");
         let config = Config::load(cwd).unwrap();
         assert_eq!(config, Config::default());
-        assert_eq!(config.mode, Mode::Approve);
         assert_eq!(config.max_turns, 1000);
         assert!((config.compaction_threshold - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn save_load_round_trip() {
+    fn load_reads_full_yaml() {
         let (_guard, dir) = temp_config_dir();
         let config = Config {
             provider: Some("openai".into()),
             model: Some("gpt-4o".into()),
             api_key_env: Some("OPENAI_API_KEY".into()),
+            api_key: None,
             max_tokens: 4096,
-            mode: Mode::Chat,
             max_turns: 50,
             context_limit: Some(200_000),
             compaction_threshold: 0.65,
             shell: Some("/bin/zsh".into()),
-            always_allow: vec!["read".into(), "everything__echo".into()],
             plugins: vec![dir.path().join("extra-plugins")],
-            ..Config::default()
         };
-        config.save().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            format!(
+                "provider: openai\nmodel: gpt-4o\napi_key_env: OPENAI_API_KEY\n\
+                 max_tokens: 4096\nmax_turns: 50\ncontext_limit: 200000\n\
+                 compaction_threshold: 0.65\nshell: /bin/zsh\nplugins:\n  - {}\n",
+                dir.path().join("extra-plugins").display()
+            ),
+        )
+        .unwrap();
         let loaded = Config::load(Path::new("/tmp/project")).unwrap();
         assert_eq!(loaded, config);
     }
@@ -219,8 +173,6 @@ mod tests {
         assert_eq!(config.provider.as_deref(), Some("openai"));
         assert_eq!(config.model.as_deref(), Some("gpt-5"));
         assert_eq!(config.max_tokens, 8192);
-        assert_eq!(config.mode, Mode::Approve);
-        assert!(config.always_allow.is_empty());
     }
 
     #[test]
@@ -228,24 +180,14 @@ mod tests {
         let (_guard, dir) = temp_config_dir();
         std::fs::write(
             dir.path().join("config.yaml"),
-            "provider: openai\nmodel: gpt-5\nmode: chat\n",
+            "provider: openai\nmodel: gpt-5\n",
         )
         .unwrap();
         std::env::set_var("INSTAGENT_PROVIDER", "proxy");
         std::env::set_var("INSTAGENT_MODEL", "overridden-model");
-        std::env::set_var("INSTAGENT_MODE", "auto");
         let config = Config::load(Path::new("/tmp/project")).unwrap();
         assert_eq!(config.provider.as_deref(), Some("proxy"));
         assert_eq!(config.model.as_deref(), Some("overridden-model"));
-        assert_eq!(config.mode, Mode::Auto);
-    }
-
-    #[test]
-    fn invalid_mode_env_is_error() {
-        let (_guard, _dir) = temp_config_dir();
-        std::env::set_var("INSTAGENT_MODE", "yolo");
-        let err = Config::load(Path::new("/tmp/project")).unwrap_err();
-        assert!(err.to_string().contains("INSTAGENT_MODE"));
     }
 
     #[test]

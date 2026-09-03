@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::Mock;
@@ -85,7 +84,6 @@ impl Sandbox {
             .env("INSTAGENT_AGENTS_DIR", self.agents.path())
             .env_remove("INSTAGENT_PROVIDER")
             .env_remove("INSTAGENT_MODEL")
-            .env_remove("INSTAGENT_MODE")
             .env_remove("RUST_LOG");
         cmd
     }
@@ -116,11 +114,6 @@ impl Sandbox {
     fn sessions_dir(&self) -> PathBuf {
         self.data.path().join("sessions")
     }
-
-    fn user_settings(&self) -> serde_json::Value {
-        let text = std::fs::read_to_string(self.config.path().join("settings.json")).unwrap();
-        serde_json::from_str(&text).unwrap()
-    }
 }
 
 /// 跑完拿输出：进程组 + `kill_on_drop(true)`（仓库约定），整体超时兜底。
@@ -130,26 +123,6 @@ async fn output(mut cmd: tokio::process::Command) -> Output {
         .await
         .expect("instagent 二进制执行超时")
         .expect("spawn instagent 二进制")
-}
-
-/// 同 [`output`]，但先经 stdin 喂一段输入（信任确认走 BufRead stdin）。
-async fn output_with_stdin(mut cmd: tokio::process::Command, stdin: &[u8]) -> Output {
-    // tokio 的 spawn 默认继承 stdio，wait_with_output 需要显式 piped。
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    instagent::subprocess::configure_subprocess(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn instagent 二进制");
-    let mut child_stdin = child.stdin.take().unwrap();
-    child_stdin
-        .write_all(stdin)
-        .await
-        .expect("write stdin to instagent");
-    drop(child_stdin);
-    tokio::time::timeout(TIMEOUT, child.wait_with_output())
-        .await
-        .expect("instagent 二进制执行超时")
-        .expect("wait instagent 二进制")
 }
 
 fn assert_ok(output: &Output, ctx: &str) {
@@ -254,23 +227,17 @@ async fn sessions_list_and_rm_round_trip() {
     assert!(!rm.status.success(), "rm 不存在的会话应以错误退出");
 }
 
-// ---- T4：plugin install / list / show / disable / enable + 信任确认 ----
+// ---- T4：plugin install / list / show / disable / enable ----
 
 #[tokio::test]
-async fn plugin_install_list_show_disable_enable_with_yes() {
+async fn plugin_install_list_show_disable_enable() {
     let sandbox = Sandbox::new();
     let source = trusty_plugin_fixture().display().to_string();
 
-    let install = output(sandbox.cmd(&["plugin", "install", &source, "--yes"])).await;
-    assert_ok(&install, "plugin install --yes");
+    let install = output(sandbox.cmd(&["plugin", "install", &source])).await;
+    assert_ok(&install, "plugin install");
     let stdout = String::from_utf8_lossy(&install.stdout);
     assert!(stdout.contains("installed `trustme` v1.0.0"), "{stdout}");
-    assert!(stdout.contains("plugin `trustme` trusted"), "{stdout}");
-    assert_eq!(
-        sandbox.user_settings()["trustedPlugins"],
-        serde_json::json!(["trustme"]),
-        "--yes 应把名字写进沙箱 settings.json 的 trustedPlugins"
-    );
 
     let list = output(sandbox.cmd(&["plugin", "list"])).await;
     assert_ok(&list, "plugin list");
@@ -285,16 +252,11 @@ async fn plugin_install_list_show_disable_enable_with_yes() {
         "name: trustme",
         "version: 1.0.0",
         "enabled: true",
-        "trusted: true",
         "source: ",
         "auto-update: false",
-        "commands:",
-        "[hook]",
-        "[tool]",
     ] {
         assert!(stdout.contains(expected), "show 缺 `{expected}`: {stdout}");
     }
-    assert!(stdout.contains("guard.sh"), "{stdout}");
 
     let disable = output(sandbox.cmd(&["plugin", "disable", "trustme"])).await;
     assert_ok(&disable, "plugin disable");
@@ -303,51 +265,12 @@ async fn plugin_install_list_show_disable_enable_with_yes() {
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("disabled"), "{stdout}");
 
-    let enable = output(sandbox.cmd(&["plugin", "enable", "trustme", "--yes"])).await;
-    assert_ok(&enable, "plugin enable --yes");
+    let enable = output(sandbox.cmd(&["plugin", "enable", "trustme"])).await;
+    assert_ok(&enable, "plugin enable");
     assert!(String::from_utf8_lossy(&enable.stdout).contains("enabled trustme"));
     let list = output(sandbox.cmd(&["plugin", "list"])).await;
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("enabled"), "{stdout}");
-}
-
-#[tokio::test]
-async fn plugin_trust_confirmation_via_piped_stdin() {
-    let sandbox = Sandbox::new();
-    let source = trusty_plugin_fixture().display().to_string();
-
-    // install 答 n：列出全部命令但不信任、不落 trustedPlugins。
-    let install = output_with_stdin(sandbox.cmd(&["plugin", "install", &source]), b"n\n").await;
-    assert_ok(&install, "plugin install (答 n)");
-    let stdout = String::from_utf8_lossy(&install.stdout);
-    assert!(
-        stdout.contains("wants to run the following commands"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("trust plugin `trustme`? [y]es / [n]o:"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("[hook]") && stdout.contains("[tool]"),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("plugin `trustme` trusted"), "{stdout}");
-    assert!(
-        !sandbox.config.path().join("settings.json").exists(),
-        "拒绝后不应写 trustedPlugins"
-    );
-
-    // enable 答 y：触发信任确认并写 trustedPlugins。
-    let enable = output_with_stdin(sandbox.cmd(&["plugin", "enable", "trustme"]), b"y\n").await;
-    assert_ok(&enable, "plugin enable (答 y)");
-    let stdout = String::from_utf8_lossy(&enable.stdout);
-    assert!(stdout.contains("enabled trustme"), "{stdout}");
-    assert!(stdout.contains("plugin `trustme` trusted"), "{stdout}");
-    assert_eq!(
-        sandbox.user_settings()["trustedPlugins"],
-        serde_json::json!(["trustme"])
-    );
 }
 
 // ---- T5：--plugin PATH 临时加载（开发插件目录内联 provider）----

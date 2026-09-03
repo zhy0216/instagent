@@ -1,5 +1,4 @@
-//! loop → UI 的单向事件（第二版 §2.5）。审批不走事件（需要答案，走
-//! `agent::approval::Confirm` 回调）。
+//! loop → UI 的单向事件（第二版 §2.5）。
 
 use serde_json::Value;
 

@@ -3,8 +3,8 @@
 //! 读取并合并 `~/.config/instagent/settings.json`（User）→
 //! `<project>/.config/instagent/settings.json`（Project）→
 //! 同目录 `settings.local.json`（Local）。优先级 local > project > user：
-//! 同名插件以最高层出现的字段为准（enabled/disabled 互斥覆盖；trusted
-//! 独立取并集）。启用判定逻辑在 `05`。
+//! 同名插件以最高层出现的字段为准（enabled/disabled 互斥覆盖）。
+//! 启用判定逻辑在 `05`。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -31,8 +31,6 @@ pub struct Settings {
     /// 写了即白名单模式；没写则"除 `disabled_plugins` 外全启用"。
     pub enabled_plugins: Vec<String>,
     pub disabled_plugins: Vec<String>,
-    /// 首次启用确认的结果（第三版 §2.10 信任），CLI 接线在 `18`。
-    pub trusted_plugins: Vec<String>,
 }
 
 /// 单个文件里的形状：区分"字段缺失"（None）与"写了空数组"（Some(vec![])），
@@ -42,7 +40,6 @@ pub struct Settings {
 struct LayerFile {
     enabled_plugins: Option<Vec<String>>,
     disabled_plugins: Option<Vec<String>>,
-    trusted_plugins: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -77,7 +74,7 @@ impl Settings {
         Ok(merge_layers([user, project, local]))
     }
 
-    /// 写回指定层（`18` 的 enable/disable 与信任确认用）。
+    /// 写回指定层（`18` 的 enable/disable 用）。
     pub fn save(&self, cwd: &Path, layer: SettingsLayer) -> crate::Result<()> {
         let path = match layer {
             SettingsLayer::User => crate::config::config_dir()?.join("settings.json"),
@@ -121,9 +118,6 @@ fn merge_layers(layers: [Option<LayerFile>; 3]) -> Settings {
         push_unclaimed(&mut merged.enabled_plugins, &enabled, &claimed);
         push_unclaimed(&mut merged.disabled_plugins, &disabled, &claimed);
         claimed.extend(enabled.into_iter().chain(disabled));
-        if let Some(trusted) = &file.trusted_plugins {
-            push_new(&mut merged.trusted_plugins, trusted);
-        }
     }
     merged
 }
@@ -131,14 +125,6 @@ fn merge_layers(layers: [Option<LayerFile>; 3]) -> Settings {
 fn push_unclaimed(dest: &mut Vec<String>, names: &[String], claimed: &HashSet<String>) {
     for name in names {
         if !claimed.contains(name.as_str()) && !dest.contains(name) {
-            dest.push(name.clone());
-        }
-    }
-}
-
-fn push_new(dest: &mut Vec<String>, names: &[String]) {
-    for name in names {
-        if !dest.contains(name) {
             dest.push(name.clone());
         }
     }
@@ -174,7 +160,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_json(
             &user.path().join("settings.json"),
-            r#"{"enabledPlugins":["u"],"trustedPlugins":["t-u"]}"#,
+            r#"{"enabledPlugins":["u"]}"#,
         );
         write_json(
             &project_settings_path(project.path(), SettingsLayer::Project),
@@ -187,7 +173,6 @@ mod tests {
         let settings = Settings::merged(project.path()).unwrap();
         assert_eq!(settings.enabled_plugins, vec!["p", "u"]);
         assert_eq!(settings.disabled_plugins, vec!["l"]);
-        assert_eq!(settings.trusted_plugins, vec!["t-u"]);
     }
 
     #[test]
@@ -216,31 +201,12 @@ mod tests {
     }
 
     #[test]
-    fn trusted_plugins_merge_independently() {
-        let (_guard, user) = temp_user_dir();
-        let project = tempfile::tempdir().unwrap();
-        write_json(
-            &user.path().join("settings.json"),
-            r#"{"trustedPlugins":["a","b"]}"#,
-        );
-        write_json(
-            &project_settings_path(project.path(), SettingsLayer::Project),
-            r#"{"disabledPlugins":["a"],"trustedPlugins":["a","c"]}"#,
-        );
-        let settings = Settings::merged(project.path()).unwrap();
-        // "a" 被 project 的 disabled 认领，不影响 user 层的 trusted 记录。
-        assert_eq!(settings.disabled_plugins, vec!["a"]);
-        assert_eq!(settings.trusted_plugins, vec!["a", "c", "b"]);
-    }
-
-    #[test]
     fn save_round_trips_per_layer() {
         let (_guard, user) = temp_user_dir();
         let project = tempfile::tempdir().unwrap();
         let settings = Settings {
             enabled_plugins: vec!["x".into()],
             disabled_plugins: vec!["y".into()],
-            trusted_plugins: vec!["x".into()],
         };
         for layer in [
             SettingsLayer::User,

@@ -63,11 +63,6 @@ impl ToolOutput {
             is_error: true,
         }
     }
-
-    /// 审批拒绝：以 is_error 结果回给模型（"user denied: <reason>"）。
-    pub fn denied(reason: &str) -> Self {
-        Self::err(format!("user denied: {reason}"))
-    }
 }
 
 /// 一次待执行的工具调用（由 `Content::ToolUse` 而来）。

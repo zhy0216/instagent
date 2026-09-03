@@ -1,6 +1,5 @@
 //! 子命令处理：chat / run / sessions / plugin（第二版 §2.11，plugin 见第三版 §2.10）。
 
-use std::io::BufRead;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -8,19 +7,15 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use instagent::agent::TurnResult;
-use instagent::config::Mode;
 use instagent::hooks::HookEvent;
 use instagent::plugin::install;
 use instagent::plugin::install::InstallOptions;
 use instagent::plugin::install::InstallSource;
-use instagent::plugin::Plugin;
 use instagent::session::Session;
 
 use super::assembly;
 use super::assembly::AssemblyOpts;
-use super::assembly::Prompter;
 use super::repl;
-use super::trust;
 use super::PluginAction;
 use super::SessionsAction;
 
@@ -29,29 +24,15 @@ pub async fn chat(
     resume: Option<String>,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    mode: Option<Mode>,
     plugin: Vec<PathBuf>,
 ) -> instagent::Result<()> {
     let cwd = resolve_cwd(cwd)?;
     let opts = AssemblyOpts {
         cwd: cwd.clone(),
         model,
-        mode,
         cli_plugins: plugin,
-        assume_yes: false,
-        interactive: true,
     };
-    // 信任确认在 REPL 启动前完成；提前释放 stdin 锁，避免与 rustyline 抢缓冲。
-    let mut rt = {
-        let stdin = std::io::stdin();
-        let mut reader: Box<dyn BufRead> = Box::new(stdin.lock());
-        let mut output = std::io::stdout();
-        let mut prompter = Prompter {
-            input: &mut reader,
-            output: &mut output,
-        };
-        assembly::build(&opts, &mut prompter).await?
-    };
+    let mut rt = assembly::build(&opts).await?;
     print_notes(&rt.notes, &mut std::io::stdout());
 
     let mut session =
@@ -71,33 +52,21 @@ pub async fn chat(
     result
 }
 
-/// `instagent run -t "..."`：无交互跑一条任务；审批按 auto，打印最终回复和 usage。
+/// `instagent run -t "..."`：无交互跑一条任务；打印最终回复和 usage。
 pub async fn run(
     task: String,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    mode: Option<Mode>,
     plugin: Vec<PathBuf>,
 ) -> instagent::Result<()> {
     let cwd = resolve_cwd(cwd)?;
     let opts = AssemblyOpts {
         cwd: cwd.clone(),
         model,
-        mode: Some(mode.unwrap_or(Mode::Auto)),
         cli_plugins: plugin,
-        assume_yes: false,
-        interactive: false,
     };
     let mut stderr = std::io::stderr();
-    let rt = {
-        let stdin = std::io::stdin();
-        let mut reader: Box<dyn BufRead> = Box::new(stdin.lock());
-        let mut prompter = Prompter {
-            input: &mut reader,
-            output: &mut stderr,
-        };
-        assembly::build(&opts, &mut prompter).await?
-    };
+    let rt = assembly::build(&opts).await?;
     print_notes(&rt.notes, &mut stderr);
 
     let mut session = Session::create(&cwd, &rt.provider_name, &rt.model)?;
@@ -198,17 +167,14 @@ pub fn sessions_list_rows() -> instagent::Result<Vec<String>> {
     Ok(rows)
 }
 
-/// `instagent plugin ...` 子命令（接 `07` 数据层 + 信任确认）。
+/// `instagent plugin ...` 子命令（接 `07` 数据层）。
 pub fn plugin(action: PluginAction) -> instagent::Result<()> {
     let cwd = std::env::current_dir()?;
-    let stdin = std::io::stdin();
-    let mut reader: Box<dyn BufRead> = Box::new(stdin.lock());
     let mut out = std::io::stdout();
     match action {
         PluginAction::Install {
             source,
             auto_update,
-            yes,
         } => {
             let src = if Path::new(&source).is_dir() {
                 InstallSource::Path(PathBuf::from(&source))
@@ -224,7 +190,6 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
                 plugin.manifest.version,
                 plugin.root.display()
             )?;
-            confirm_trust(&plugin, yes, &mut reader, &mut out)?;
         }
         PluginAction::List => {
             let installed = install::list(&cwd)?;
@@ -269,11 +234,9 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
                 }
             }
         }
-        PluginAction::Enable { name, yes } => {
+        PluginAction::Enable { name } => {
             install::enable(&name).with_context(|| format!("enable {name}"))?;
             writeln!(out, "enabled {name}")?;
-            let item = install::show(&cwd, &name)?;
-            confirm_trust(&item.plugin, yes, &mut reader, &mut out)?;
         }
         PluginAction::Disable { name } => {
             install::disable(&name).with_context(|| format!("disable {name}"))?;
@@ -311,34 +274,7 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
                 }
                 None => writeln!(out, "source: (manual copy)")?,
             }
-            let trusted = trust::user_trusted()?.iter().any(|t| t == &manifest.name);
-            writeln!(out, "trusted: {trusted}")?;
-            let surfaces = trust::plugin_surfaces(&item.plugin)?;
-            if surfaces.is_empty() {
-                writeln!(out, "commands: (none)")?;
-            } else {
-                writeln!(out, "commands:")?;
-                for surface in surfaces {
-                    writeln!(out, "  [{}] {}", surface.kind, surface.command)?;
-                }
-            }
         }
-    }
-    Ok(())
-}
-
-/// 安装 / 启用后的首次信任确认（`--yes` 跳过）。
-fn confirm_trust(
-    plugin: &Plugin,
-    yes: bool,
-    reader: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> instagent::Result<()> {
-    let mut trusted = trust::user_trusted()?;
-    let surfaces = trust::plugin_surfaces(plugin)?;
-    let granted = trust::ensure_trusted(plugin, &surfaces, &mut trusted, yes, reader, out)?;
-    if granted && !surfaces.is_empty() {
-        writeln!(out, "plugin `{}` trusted", plugin.manifest.name)?;
     }
     Ok(())
 }

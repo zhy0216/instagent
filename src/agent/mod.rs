@@ -8,7 +8,6 @@
 //! [`Agent::run_session_event`]，由 `18` 的会话生命周期调用。
 //! `hooks` 为 None 时行为与未接 hooks 完全一致。
 
-pub mod approval;
 pub mod compact;
 pub mod event;
 pub mod prompt;
@@ -23,7 +22,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::config::Mode;
 use crate::hooks::HookContext;
 use crate::hooks::HookDecision;
 use crate::hooks::HookEvent;
@@ -44,9 +42,6 @@ use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
 use crate::ProviderError;
 
-pub use approval::Approval;
-pub use approval::Confirm;
-pub use approval::Decision;
 pub use event::Event;
 
 /// loop 的行为参数（从 `01` Config 装配而来）。
@@ -54,7 +49,6 @@ pub use event::Event;
 pub struct AgentCfg {
     pub model: String,
     pub max_tokens: u32,
-    pub mode: Mode,
     /// 默认 1000（goose agent.rs:85），可配。
     pub max_turns: u32,
     /// registry 四级顺序解析后的值（`10`）；`assemble` 里没有 registry，
@@ -68,7 +62,6 @@ pub struct Agent {
     pub cfg: AgentCfg,
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<Registry>,
-    pub approval: Approval,
     /// 无 hooks 插件时为 None（`17`）。
     pub hooks: Option<Arc<Hooks>>,
     /// 系统提示注入位：每个 MCP server 的 instructions（含 server 名前缀），
@@ -121,20 +114,16 @@ impl Agent {
         let context_limit = config
             .context_limit
             .unwrap_or_else(|| crate::provider::context_limit_for(&model));
-        let approval = Approval::new(config.mode, config.always_allow.clone(), None)
-            .with_config(config.clone());
         Ok(Agent {
             cfg: AgentCfg {
                 model,
                 max_tokens: config.max_tokens,
-                mode: config.mode,
                 max_turns: config.max_turns,
                 context_limit,
                 compaction_threshold: config.compaction_threshold,
             },
             provider,
             tools: Arc::new(tools),
-            approval,
             hooks: hooks.map(Arc::new),
             mcp_instructions: Vec::new(),
             skill_lines: Vec::new(),
@@ -142,8 +131,8 @@ impl Agent {
     }
 
     /// 第二版 §2.5 伪代码：append user → 循环 {compact::maybe → stream_assistant
-    /// → append assistant → 无 tool call 即 Done → 逐个审批 + 串行执行 →
-    /// 结果合成一条 user 消息}。chat 模式请求不带 tools。
+    /// → append assistant → 无 tool call 即 Done → 串行执行 →
+    /// 结果合成一条 user 消息}。
     pub async fn run_turn(
         &self,
         session: &mut Session,
@@ -214,8 +203,8 @@ impl Agent {
         Ok(TurnResult::MaxTurns)
     }
 
-    /// 逐个执行 tool call：malformed / 取消短路 → 审批 → PreToolUse hook →
-    /// emit ToolStart → 执行 → emit ToolDone → PostToolUse hook → deny 分支。
+    /// 逐个执行 tool call：malformed / 取消短路 → PreToolUse hook →
+    /// emit ToolStart → 执行 → emit ToolDone → PostToolUse hook。
     /// 每个 call 产出一个 ToolResult，顺序与 calls 一致。
     async fn execute_calls(
         &self,
@@ -244,77 +233,58 @@ impl Agent {
                 results.push(Content::interrupted(call));
                 continue;
             }
-            let output = match self.approval.decide(call).await {
-                Decision::Allow | Decision::AllowAlways => {
-                    // hook 触发点：PreToolUse 在审批之后、调用之前；
-                    // 阻止 → is_error 结果，工具不执行。
-                    if let Some(hooks) = &self.hooks {
-                        let hook_ctx = hook_ctx(session, HookEvent::PreToolUse)
-                            .with_tool(call.name.clone(), Some(call.input.clone()));
-                        if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
-                            let text = format!("blocked by PreToolUse hook: {reason}");
-                            Self::emit(
-                                events,
-                                Event::ToolDone {
-                                    id: call.id.clone(),
-                                    preview: text.clone(),
-                                    is_error: true,
-                                    elapsed_ms: 0,
-                                },
-                            )
-                            .await;
-                            results.push(Content::tool_result(call, ToolOutput::err(text)));
-                            continue;
-                        }
-                    }
-                    Self::emit(
-                        events,
-                        Event::ToolStart {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                        },
-                    )
-                    .await;
-                    let started = Instant::now();
-                    let output = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
-                        out = self.tools.call(call, &ctx) => out,
-                    };
+            // hook 触发点：PreToolUse 在调用之前；阻止 → is_error 结果，工具不执行。
+            if let Some(hooks) = &self.hooks {
+                let hook_ctx = hook_ctx(session, HookEvent::PreToolUse)
+                    .with_tool(call.name.clone(), Some(call.input.clone()));
+                if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
+                    let text = format!("blocked by PreToolUse hook: {reason}");
                     Self::emit(
                         events,
                         Event::ToolDone {
                             id: call.id.clone(),
-                            preview: preview_text(&output.text),
-                            is_error: output.is_error,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        },
-                    )
-                    .await;
-                    // hook 触发点：PostToolUse 观察事件，决策忽略。
-                    if let Some(hooks) = &self.hooks {
-                        let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
-                            .with_tool(call.name.clone(), Some(call.input.clone()))
-                            .with_tool_output(output.text.clone());
-                        let _ = hooks.run(&hook_ctx).await;
-                    }
-                    output
-                }
-                Decision::Deny(reason) => {
-                    Self::emit(
-                        events,
-                        Event::ToolDone {
-                            id: call.id.clone(),
-                            preview: format!("user denied: {reason}"),
+                            preview: text.clone(),
                             is_error: true,
                             elapsed_ms: 0,
                         },
                     )
                     .await;
-                    ToolOutput::denied(&reason)
+                    results.push(Content::tool_result(call, ToolOutput::err(text)));
+                    continue;
                 }
+            }
+            Self::emit(
+                events,
+                Event::ToolStart {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                },
+            )
+            .await;
+            let started = Instant::now();
+            let output = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
+                out = self.tools.call(call, &ctx) => out,
             };
+            Self::emit(
+                events,
+                Event::ToolDone {
+                    id: call.id.clone(),
+                    preview: preview_text(&output.text),
+                    is_error: output.is_error,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            )
+            .await;
+            // hook 触发点：PostToolUse 观察事件，决策忽略。
+            if let Some(hooks) = &self.hooks {
+                let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
+                    .with_tool(call.name.clone(), Some(call.input.clone()))
+                    .with_tool_output(output.text.clone());
+                let _ = hooks.run(&hook_ctx).await;
+            }
             results.push(Content::tool_result(call, output));
         }
         results
@@ -372,11 +342,7 @@ impl Agent {
         cancel: &CancellationToken,
         events: &mpsc::Sender<Event>,
     ) -> crate::Result<AssistantStream> {
-        let specs = if self.approval.grants_tools() {
-            self.tools.list().await
-        } else {
-            Vec::new()
-        };
+        let specs = self.tools.list().await;
         let ctx = prompt::PromptContext {
             tools: &specs,
             cwd: &session.header.cwd,
@@ -545,7 +511,6 @@ mod tests {
     use crate::message::SUMMARY_PREFIX;
     use crate::session::SessionHeader;
     use crate::tools::BuiltinTools;
-    use crate::tools::ToolCall;
     use async_trait::async_trait;
     use futures::stream;
     use futures::stream::BoxStream;
@@ -668,52 +633,19 @@ mod tests {
         }
     }
 
-    struct FixedConfirm {
-        decision: Decision,
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl Confirm for FixedConfirm {
-        async fn confirm(&self, _call: &ToolCall) -> Decision {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.decision.clone()
-        }
-    }
-
-    fn confirm(decision: Decision) -> (Arc<FixedConfirm>, Arc<dyn Confirm>) {
-        let fixed = Arc::new(FixedConfirm {
-            decision,
-            calls: AtomicUsize::new(0),
-        });
-        let arc: Arc<dyn Confirm> = fixed.clone();
-        (fixed, arc)
-    }
-
-    fn auto() -> Approval {
-        Approval::new(Mode::Auto, vec![], None)
-    }
-
-    fn agent(
-        provider: Arc<MockProvider>,
-        mode: Mode,
-        context_limit: u32,
-        approval: Approval,
-    ) -> Agent {
+    fn agent(provider: Arc<MockProvider>, context_limit: u32) -> Agent {
         let mut registry = Registry::new();
         registry.register(Arc::new(BuiltinTools::new(None)));
         Agent {
             cfg: AgentCfg {
                 model: "mock-model".into(),
                 max_tokens: 1024,
-                mode,
                 max_turns: 10,
                 context_limit,
                 compaction_threshold: 0.8,
             },
             provider,
             tools: Arc::new(registry),
-            approval,
             hooks: None,
             mcp_instructions: Vec::new(),
             skill_lines: Vec::new(),
@@ -806,7 +738,7 @@ mod tests {
             ]),
             scripted(vec![StreamEvent::TextDelta("all done".into()), done(20, 3)]),
         ]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, events) = run(&agent, &mut session, "say hi").await;
@@ -830,7 +762,7 @@ mod tests {
         assert_eq!(first_text(&session.messages[3]), "all done");
         assert_eq!(session.messages[3].usage.unwrap().input, 20);
 
-        // 会话文件同步落盘（header + 4 条）；auto 模式带内置 5 工具。
+        // 会话文件同步落盘（header + 4 条）；请求带内置 5 工具。
         let raw = std::fs::read_to_string(&session.path).unwrap();
         assert_eq!(raw.lines().count(), 5);
         assert_eq!(provider.seen_tool_counts().await, vec![5, 5]);
@@ -849,93 +781,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_deny_becomes_error_tool_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = MockProvider::new(vec![
-            scripted(tool_use_shell("t1", "{\"command\": \"echo nope\"}")),
-            scripted(vec![
-                StreamEvent::TextDelta("ok, stopping".into()),
-                done(5, 2),
-            ]),
-        ]);
-        let (_counter, arc) = confirm(Decision::Deny("not now".into()));
-        let approval = Approval::new(Mode::Approve, vec![], Some(arc));
-        let agent = agent(provider.clone(), Mode::Approve, 100_000, approval);
-        let mut session = temp_session(dir.path());
-
-        let (result, events) = run(&agent, &mut session, "run it").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-
-        crate::message::validate(&session.messages).unwrap();
-        let results = tool_results(&session.messages[2]);
-        assert_eq!(results[0].1, "user denied: not now");
-        assert!(results[0].2);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::ToolDone { is_error: true, .. })));
-    }
-
-    #[tokio::test]
-    async fn approve_allow_always_skips_confirm_next_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = MockProvider::new(vec![
-            scripted(tool_use_shell("t1", "{\"command\": \"echo one\"}")),
-            scripted(tool_use_shell("t2", "{\"command\": \"echo two\"}")),
-            scripted(vec![StreamEvent::TextDelta("both ran".into()), done(9, 1)]),
-        ]);
-        let (counter, arc) = confirm(Decision::AllowAlways);
-        let approval = Approval::new(Mode::Approve, vec![], Some(arc));
-        let agent = agent(provider.clone(), Mode::Approve, 100_000, approval);
-        let mut session = temp_session(dir.path());
-
-        let (result, _events) = run(&agent, &mut session, "twice").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-        assert_eq!(
-            counter.calls.load(Ordering::SeqCst),
-            1,
-            "AllowAlways 写回后同会话不再问"
-        );
-        crate::message::validate(&session.messages).unwrap();
-        assert_eq!(session.messages.len(), 6);
-        for index in [2, 4] {
-            let results = tool_results(&session.messages[index]);
-            assert!(!results[0].2, "{}", results[0].1);
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_mode_sends_no_tools() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = MockProvider::new(vec![scripted(vec![
-            StreamEvent::TextDelta("chatting".into()),
-            done(4, 4),
-        ])]);
-        let agent = agent(
-            provider.clone(),
-            Mode::Chat,
-            100_000,
-            Approval::new(Mode::Chat, vec![], None),
-        );
-        let mut session = temp_session(dir.path());
-
-        let (result, _events) = run(&agent, &mut session, "hello").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-        crate::message::validate(&session.messages).unwrap();
-        assert_eq!(first_text(&session.messages[1]), "chatting");
-
-        let seen = provider.seen().await;
-        assert_eq!(seen.len(), 1);
-        assert_eq!(provider.seen_tool_counts().await, vec![0], "chat 不带工具");
-    }
-
-    #[tokio::test]
     async fn cancel_mid_stream_keeps_session_invariants() {
         let dir = tempfile::tempdir().unwrap();
         let token = CancellationToken::new();
         let mut events = vec![StreamEvent::TextDelta("partial".into())];
         events.extend(tool_use_shell("t1", "{\"command\": \"echo hi\"}"));
         let provider = MockProvider::new(vec![scripted_then_cancel(events, &token)]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, _events) = run_with(&agent, &mut session, "go", token).await;
@@ -957,7 +809,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let provider = MockProvider::new(vec![]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, _events) = run_with(&agent, &mut session, "go", token).await;
@@ -982,7 +834,7 @@ mod tests {
             ]),
             scripted(vec![StreamEvent::TextDelta("sorry".into()), done(6, 1)]),
         ]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, events) = run(&agent, &mut session, "bad args").await;
@@ -1008,7 +860,7 @@ mod tests {
             ]),
             scripted(vec![StreamEvent::TextDelta("a2".into()), done(50, 2)]),
         ]);
-        let agent = agent(provider.clone(), Mode::Auto, 1000, auto());
+        let agent = agent(provider.clone(), 1000);
         let mut session = temp_session(dir.path());
 
         let (result, _) = run(&agent, &mut session, "first question").await;
@@ -1065,7 +917,7 @@ mod tests {
             ]),
             scripted(vec![StreamEvent::TextDelta("a2".into()), done(60, 2)]),
         ]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, _) = run(&agent, &mut session, "first").await;
@@ -1095,7 +947,7 @@ mod tests {
             Scripted::Err(ProviderError::ContextOverflow),
             Scripted::Err(ProviderError::ContextOverflow),
         ]);
-        let agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let agent = agent(provider.clone(), 100_000);
         let mut session = temp_session(dir.path());
 
         let (result, events) = run(&agent, &mut session, "hi").await;
@@ -1135,11 +987,9 @@ mod tests {
         let config = Config {
             model: Some("claude-sonnet-4-5".into()),
             max_tokens: 4096,
-            mode: Mode::Auto,
             max_turns: 7,
             context_limit: None,
             compaction_threshold: 0.5,
-            always_allow: vec!["web__search".into()],
             ..Config::default()
         };
         let provider = MockProvider::new(vec![]);
@@ -1148,8 +998,6 @@ mod tests {
         assert_eq!(agent.cfg.max_turns, 7);
         assert_eq!(agent.cfg.context_limit, 200 * 1024);
         assert_eq!(agent.cfg.compaction_threshold, 0.5);
-        assert!(agent.approval.always_allow.contains("web__search"));
-        assert!(agent.approval.grants_tools());
     }
 
     #[test]
@@ -1214,7 +1062,7 @@ mod tests {
             .map(|i| scripted(vec![StreamEvent::TextDelta(format!("a{i}")), done(1, 1)]))
             .collect();
         let provider = MockProvider::new(steps);
-        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut agent = agent(provider.clone(), 100_000);
         agent.hooks = Some(Arc::new(hooks));
         let mut session = temp_session(dir.path());
 
@@ -1239,7 +1087,7 @@ mod tests {
             StreamEvent::TextDelta("finished".into()),
             done(1, 1),
         ])]);
-        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut agent = agent(provider.clone(), 100_000);
         agent.hooks = Some(Arc::new(hooks));
         let mut session = temp_session(dir.path());
 
@@ -1257,7 +1105,7 @@ mod tests {
             scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
             scripted(vec![StreamEvent::TextDelta("ok".into()), done(1, 1)]),
         ]);
-        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut agent = agent(provider.clone(), 100_000);
         agent.hooks = Some(Arc::new(hooks));
         let mut session = temp_session(dir.path());
 
@@ -1302,7 +1150,7 @@ mod tests {
             scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
             scripted(vec![StreamEvent::TextDelta("done".into()), done(1, 1)]),
         ]);
-        let mut agent = agent(provider.clone(), Mode::Auto, 100_000, auto());
+        let mut agent = agent(provider.clone(), 100_000);
         agent.hooks = Some(Arc::new(hooks));
         let mut session = temp_session(dir.path());
 
@@ -1337,7 +1185,7 @@ mod tests {
             )],
         );
         let provider = MockProvider::new(vec![]);
-        let mut hooked = agent(provider, Mode::Auto, 100_000, auto());
+        let mut hooked = agent(provider, 100_000);
         hooked.hooks = Some(Arc::new(hooks));
         let session = temp_session(dir.path());
 
@@ -1350,7 +1198,7 @@ mod tests {
         assert!(marker.exists(), "SessionStart 脚本应被执行");
 
         // 无 hooks 的 Agent：入口直接 Allow、不报错。
-        let plain = agent(MockProvider::new(vec![]), Mode::Auto, 100_000, auto());
+        let plain = agent(MockProvider::new(vec![]), 100_000);
         assert_eq!(
             plain
                 .run_session_event(HookEvent::SessionEnd, &session)

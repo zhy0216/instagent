@@ -1,17 +1,12 @@
-//! 渲染与审批提示（第二版 §2.11）：文本流式直接打印；工具调用打一行
+//! 渲染（第二版 §2.11）：文本流式直接打印；工具调用打一行
 //! `▶ shell  ls -la`，完成后打预览和耗时；每轮末尾打 usage；不做 markdown。
-//! 审批提示 `allow this call? [y]es / [a]lways / [n]o: ` 接 `16` 的 Confirm。
 
 use std::io::Write;
 
-use async_trait::async_trait;
 use serde_json::Value;
 
-use instagent::agent::Confirm;
-use instagent::agent::Decision;
 use instagent::agent::Event;
 use instagent::message::Usage;
-use instagent::tools::ToolCall;
 
 /// 单轮渲染状态（打印机任务独占）。
 #[derive(Default)]
@@ -114,33 +109,6 @@ fn truncate_one_line(text: &str) -> String {
     format!("{head}…")
 }
 
-/// 审批输入行 → 决策：trim + 忽略大小写；`y`/`yes` 放行一次，
-/// `a`/`always` 永久放行，其余（含 `n`/`no`/空/未知）拒绝。
-fn parse_confirm(line: &str) -> Decision {
-    match line.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Decision::Allow,
-        "a" | "always" => Decision::AllowAlways,
-        other => Decision::Deny(format!("user answered {other:?}")),
-    }
-}
-
-/// CLI 审批回调：阻塞读 stdin（v1 唯一实现；loop 走 `16` 的 Confirm trait）。
-pub struct CliConfirm;
-
-#[async_trait]
-impl Confirm for CliConfirm {
-    async fn confirm(&self, call: &ToolCall) -> Decision {
-        println!("  {}", call_summary(&call.name, &call.input));
-        print!("allow this call? [y]es / [a]lways / [n]o: ");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-            return Decision::Deny("no answer (EOF)".to_string());
-        }
-        parse_confirm(&line)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,42 +150,5 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.last_usage.unwrap().input, 12);
-    }
-
-    #[test]
-    fn parse_confirm_maps_approval_inputs() {
-        assert_eq!(parse_confirm("y"), Decision::Allow);
-        assert_eq!(parse_confirm("Y"), Decision::Allow);
-        assert_eq!(parse_confirm("yes"), Decision::Allow);
-        assert_eq!(parse_confirm("YES"), Decision::Allow);
-        assert_eq!(parse_confirm("a"), Decision::AllowAlways);
-        assert_eq!(parse_confirm("Always"), Decision::AllowAlways);
-        // 拒绝分支：n/no 与未知输入同路，原因带回显（trim+小写后）。
-        assert_eq!(
-            parse_confirm("n"),
-            Decision::Deny("user answered \"n\"".into())
-        );
-        assert_eq!(
-            parse_confirm("NO"),
-            Decision::Deny("user answered \"no\"".into())
-        );
-        assert_eq!(
-            parse_confirm(""),
-            Decision::Deny("user answered \"\"".into())
-        );
-        assert_eq!(
-            parse_confirm("\n"),
-            Decision::Deny("user answered \"\"".into())
-        );
-        assert_eq!(
-            parse_confirm("  Y  "),
-            Decision::Allow,
-            "前后空白（含换行）被 trim"
-        );
-        assert_eq!(parse_confirm("  Always\t\n"), Decision::AllowAlways);
-        assert_eq!(
-            parse_confirm("maybe"),
-            Decision::Deny("user answered \"maybe\"".into())
-        );
     }
 }

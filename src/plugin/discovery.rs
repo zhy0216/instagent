@@ -388,7 +388,6 @@ mod tests {
         let settings = Settings {
             enabled_plugins: vec!["a".into()],
             disabled_plugins: vec!["a".into()], // 与白名单冲突时白名单说了算
-            trusted_plugins: vec![],
         };
         let set = discover(env.agents.path(), &settings, &[], &[]).unwrap();
         assert_eq!(names(&set), ["a"]);

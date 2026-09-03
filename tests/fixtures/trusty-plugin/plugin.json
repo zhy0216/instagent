@@ -2,5 +2,5 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "trustme",
   "version": "1.0.0",
-  "description": "e2e fixture: hooks + command tool surfaces for trust confirmation"
+  "description": "e2e fixture: hooks + command tool surfaces"
 }
