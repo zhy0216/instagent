@@ -88,3 +88,16 @@ TOKEN_PLAN_API_KEY=... cargo test --test live_e2e   # 真链路 ~15 次调用
 ```
 
 执行单元单一（一个测试文件 + 一组夹具），不再拆 todos 队列。
+
+## 执行结果
+
+2026-09-03 由 herdr-finish-plan 并行执行并合入 `main`：
+
+- `65594bc` test(fixtures) ← `todos/01-liveplug-fixtures.md`（已归档 `todos/done/`）：`tests/fixtures/liveplug/` 静态夹具（echoer command tool、PreToolUse guard + SessionStart/PostToolUse 载荷落盘 `${PLUGIN_ROOT}/.hook-out/`、secret skill、greet 斜杠命令）。
+- `93b9b2e` test(live) ← `todos/02-live-e2e-tests.md`（已归档 `todos/done/`）：`tests/live_e2e.rs`，TOKEN_PLAN_API_KEY 门控 + Sandbox 骨架（180s）+ live provider + a1–e1 全 12 用例。
+
+校验：每步合并前协调器在 worktree 亲自跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿（live 用例无 key 全 skip）。真链路实跑：02 执行时本机有 key，核心链路 a1/a2/b1/b2/c1/c2/e1 7 例真模型全绿；rebase 后 d1–d5 对 01 最终交付夹具实跑 5/5 全绿。
+
+断言对计划的校准（见 02 commit message）：`▶`/`usage:`/回复实际走 stdout、`session ` 走 stderr；被 hook/审批阻止的调用不 emit `▶`；hooks 环境白名单无 `PLUGIN_DATA`，d3 按 `.hook-out/` 落盘断言。
+
+blocked/deferred：无。残留风险：live 用例依赖真模型服从命令式 prompt，未做自动重试（按计划出现真实 flake 再加）。
