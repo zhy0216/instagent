@@ -41,7 +41,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 
 1. `done/01-policy-decisions.md` ✅ — 完成。ADR 0003 落地六项决策（D1–D6），解锁所有策略相关实现。
 2. `done/02-session-boundary.md` ✅ — 完成。validate_session_id 白名单、salvage 原子写回+有界时间戳备份、0700/0600 权限、rename 失败清理、list/`last` 诊断跳过。
-3. `03-settings-atomic-merge.md` — 依赖：01。
+3. `done/03-settings-atomic-merge.md` ✅ — 完成。`write_private_atomic` 原子私有写入（同目录 tmp + 0600 + sync + rename + 失败清理），user/project/local 三层 save/load 共用；`merge_layers` 落 ADR 0003 D5 三态（缺失延续/非空认领/显式 `[]` 终值锁定）；install 侧 enable/disable 与 install metadata 复用同一写入；`.gitignore` 追加 project-local settings pattern（示例模板仍可提交）。依赖：01。
 4. `done/04-file-tool-budgets.md` ✅ — 完成。fs/tree/skills/image 阻塞逻辑移入 `spawn_blocking` 并按行/按块检查取消；tree 增加 entries/字节/输出/深度/时间五预算与结构化截断 note（`depth=0` 受内部深度兜底）；read/edit/write 与 skill 文件设字节上限（metadata 预检 + `take(MAX+1)` 兜底增长竞态）；skill description 强制非空、supporting file 明确 no-follow；image 摘要带 base64 负载大小供后续总预算观测（新增 22 测试，取消耗时实测 ≤0.5ms）。
 5. `done/05-subprocess-collector.md` ✅ — 完成。`run_bounded` 硬上限 collector（越限杀组、保留摘要、增量 UTF-8），`wait_and_drain` 无 pipe 改带上下文错误。
 6. `done/06-process-tool-isolation.md` ✅ — 完成。shell/command/hooks 接入 `run_bounded` 显式预算（越限杀组、保留可操作摘要，`wait_and_drain` 兼容入口随之删除）；`${PLUGIN_ROOT}` 改经环境变量传递不拼 `sh -c`，command 工具接入共享 env baseline + manifest allowlist；hook 失败全量可见（spawn/超时/超限/无决策 warning 带插件/事件/命令/原因），on_failure 缺省 fail-open、显式 block 为 fail-closed；shell spill 加会话标记/随机后缀 + TTL 清理 + 失败诊断；tool JSON 定义 64KiB 读取上限带来源诊断。含空格/引号/换行路径与 env 隔离测试。

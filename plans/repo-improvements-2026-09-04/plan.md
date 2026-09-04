@@ -219,3 +219,33 @@ bash scripts/ci.sh
 - **凭据**：删除或启用 config API key 字段是产品选择，未决前不应悄悄改变优先级。
 - **历史文档**：`docs/goose-*.md` 是只读参考，不应被当作当前功能清单；只加清晰的历史标记和当前映射。
 - **依赖**：结构化图片、secure openat、fuzz 和平台发布可能需要新增依赖/工具链，必须单独批准，不在本方案中隐式引入。
+
+## 执行结果（2026-09-05 Herdr finish-plan 全队列落地）
+
+21 个 todo 全部合入 `main`（每任务一个 worktree、一个最终 commit，共 21 个 commit），`todos/` 下仅剩 `README.md`，全部条目归档到 `todos/done/`。协调器对每个任务做了独立复核（单 commit、范围、验收证据）与仓库级校验（`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`，按需加 `cargo rustdoc --lib -- -D warnings` / `cargo check --release --all-targets` / `bash scripts/ci.sh`），全部经 rebase + `git merge --ff-only` 串行合入。最终全绿：lib 395 + main 12 + cli_e2e 15 + live 10 + mcp 14 + proxy 7（含 converter 11 个 python 测试），`cargo rustdoc --lib -- -D warnings` 零警告。
+
+| todo | commit | 说明 |
+|---|---|---|
+| 01-policy-decisions | `2f895d3` | 新增 ADR 0003，六项决策 D1–D6 |
+| 02-session-boundary | `b859f07` | `validate_session_id`、salvage 原子写回、0700/0600、有界备份 |
+| 03-settings-atomic-merge | `10bbe88` | `write_private_atomic` + tri-state 合并 + local settings gitignore |
+| 04-file-tool-budgets | `9a63c4f` | fs/tree/skills/image 预算、取消、symlink 语义 |
+| 05-subprocess-collector | `6f5897c` | `run_bounded` 硬上限 collector、增量 UTF-8 |
+| 06-process-tool-isolation | `c43fa15` | shell/command/hooks 有界输出、env 隔离、hook 策略（删除已死 `wait_and_drain` 兼容入口） |
+| 07-plugin-install-resilience | `0f89ba0` | git 超时/进程组、替换回滚、孤儿清理 |
+| 08-config-provider-validation | `af37f9b` | D1 落地、字段校验、schema 补齐、context_limit 诊断（附带 4 处注释级 rustdoc 修复） |
+| 09-message-contract | `02c878c` | role/content 矩阵、统一边界校验 |
+| 10-mcp-inventory | `8fa3966` | 部分失败容错、timeout、清单缓存、D2 env |
+| 11-agent-event-contract | `a353175` | event 背压/drop、残缺 stream、hook warning |
+| 12-cli-stream-and-e2e | `54da6d0` | D4 输出契约、15 个 e2e（含 repl/live 断言同步） |
+| 13-parallel-tools | `7dece0a` | 只读有界并行 + 图片两级预算 + parallel 计划重写 |
+| 14-manifest-schema | `a32fb4f` | manifest 形状/跨字段校验（非 SemVer 依规范只 warn） |
+| 15-discovery-diagnostics | `71041f6` | 来源诊断、枚举可见性、`whitelist()`/`plugin_enabled()` 三态接线（含 settings `enabled_locked` 最小改动） |
+| 16-docs-and-rustdoc | `85664ec` | 工具数 6、历史标记、rustdoc 8→0 |
+| 17-ci-release-metadata | `e073781` | 发布元数据、toolchain 1.94.0/MSRV 1.93、CI 门禁、A8 采样 |
+| 18-provider-converter | `74ef6d9` | converter source 注入 + fixture/round-trip |
+| 19-agent-module-split | `73bd2bc` | agent 拆出私有 `exec` 模块（`lib.rs` 未动，公开路径 re-export） |
+| 20-hooks-provider-split | `5d9b248` | hooks/openai 按职责整理为私有单元 |
+| 21-install-module-split | `a91051d` | install 拆五个私有子模块 + list 启用判定闭环 |
+
+blocked/deferred：无（队列内零阻塞）。已知残留与后续建议：① provider proxy `free_port()` TOCTOU readiness 竞态（17 已复现 1/24 并记录回归命令，修复点在 `src/`，待后续任务）；② provider_proxy timing 与 live 网络 flake 在高并发下偶发（A8 已知，与改动无共享路径）；③ live 空闲双击 Ctrl-C 的 PTY 分支未覆盖（无 PTY 依赖可用）；④ 空会话 spill 目录清理挂载点（12/21 后续 CLI 任务可接）；⑤ 完整 openat containment、blob 图片存储、fuzz/覆盖率门槛仍在 RM1–RM6/T6 roadmap，未入队。
