@@ -252,3 +252,25 @@ cargo test
   其图片支持需要 rmcp `ContentBlock::Image` 的搬运，另开任务。
 - 基线确认：改动面全部在列明文件内，`src/lib.rs` 模块树与 `Cargo.toml`
   依赖清单（`todos/01` 锁定）零变更。
+
+## 执行结果（2026-09-04，herdr-finish-plan 并行执行）
+
+5 项 todo 全部合入 main（d458481 → 60ab3d4），均已归档到
+`plans/image-support/todos/done/`，README 状态全部 ✅：
+
+| Commit | Todo | 内容 |
+|---|---|---|
+| 82cb393 | 01-data-model | `ImageData` + `ToolOutput.image` + `Content::Image` 变体、两处穷举占位臂、serde round-trip / untagged 回归测试 |
+| 961b803 | 05-compact-placeholder | 占位臂文案核对 + "base64 不进摘要器" 测试 |
+| aa330ef | 04-openai-serialization | `format_messages` user 含图时 parts 数组（`image_url` data URL），无图逐字不变，怪癖 3 保持 |
+| 29d00d4 | 03-loop-wiring | `execute_calls` 拆 `output.image` 进同条 user 消息 + stub ToolSource loop 级测试（含 resume 字节不变） |
+| 60ab3d4 | 02-read-image-tool | `read_image` 工具：手写 base64（RFC 4648 已知答案）、魔数嗅探、20MB 上限稀疏防御、错误文案、注册与端到端测试（goose 搬运处已在 commit message 注明） |
+
+- 每个任务经 worktree 独立复核 + rebase（README 状态行交叠按并存解决）+
+  协调器亲自跑 `cargo fmt --check` / `cargo clippy --all-targets -D warnings` /
+  `cargo test` 全绿后 `--ff-only` 合入；零依赖变更、`src/lib.rs` 未动。
+- 遗留：`src/tools/mod.rs` 头部文档注释"内核 5 工具"表述已陈旧（现 6 工具），
+  本项约束不改该文件，留给后续顺手改。
+- 环境观察：并行负载下集成套件偶发 flaky（`live_e2e::live_d2_*`、
+  `provider_proxy::connection_crash_*` 各见过一次，单独重跑均绿），与图片
+  改动无关。
