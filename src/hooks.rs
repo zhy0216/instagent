@@ -49,8 +49,11 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 /// Stop 连续阻止上限（goose 默认 8），防死循环。
 pub const STOP_BLOCK_LIMIT: u32 = 8;
-/// 载荷字段按事件省略，`event` 与 `session_id` 必有。
-const EMPTY_REASON_DENY: &str = "denied by plugin hook";
+
+// ---------------------------------------------------------------------------
+// 协议类型：事件 / 载荷 / hook 定义 / 决策（对外契约面，字段与判定规则逐字
+// 沿用 goose §2.7）
+// ---------------------------------------------------------------------------
 
 /// v1 六个事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -99,7 +102,8 @@ impl std::fmt::Display for HookEvent {
     }
 }
 
-/// stdin 载荷 JSON（字段名照 goose HookContext 的 v1 子集）。
+/// stdin 载荷 JSON（字段名照 goose HookContext 的 v1 子集）。载荷字段按事件
+/// 省略，`event` 与 `session_id` 必有。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookContext {
     pub event: HookEvent,
@@ -228,6 +232,10 @@ pub struct Hooks {
     plugin_env: BTreeMap<String, Vec<String>>,
 }
 
+// ---------------------------------------------------------------------------
+// 汇总与入口：load / run 编排；实现拆入下面四个私有单元
+// ---------------------------------------------------------------------------
+
 impl Hooks {
     /// 加载：`dev.instagent/hooks.json`，没有则回退草案位置
     /// `hooks/hooks.json`；matcher 预编译。命令里的 `${PLUGIN_ROOT}` 不在加载期
@@ -236,70 +244,7 @@ impl Hooks {
     pub fn load(plugins: &PluginSet) -> crate::Result<Hooks> {
         let mut out = Hooks::default();
         for plugin in plugins.iter() {
-            let Some(path) = hooks_file_path(plugin) else {
-                continue;
-            };
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let parsed: HooksFile = serde_json::from_str(&text)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            let declared = declared_env(plugin);
-            if !declared.is_empty() {
-                out.plugin_env
-                    .insert(plugin.manifest.name.clone(), declared);
-            }
-            for (event_name, groups) in parsed.hooks {
-                let Some(event) = HookEvent::from_name(&event_name) else {
-                    tracing::warn!("{}: 忽略未知 hook 事件 `{event_name}`", path.display());
-                    continue;
-                };
-                for group in groups {
-                    let HookMatcherGroup {
-                        matcher: matcher_src,
-                        hooks: raw_hooks,
-                    } = group;
-                    let matcher = match matcher_src.as_deref().filter(|s| !s.is_empty()) {
-                        Some(pattern) => match Regex::new(pattern) {
-                            Ok(re) => Some(re),
-                            Err(err) => {
-                                tracing::warn!(
-                                    "{}: matcher `{pattern}` 不是合法正则（{err}），跳过该 rule",
-                                    path.display()
-                                );
-                                continue;
-                            }
-                        },
-                        None => None,
-                    };
-                    let hooks: Vec<HookDef> = raw_hooks
-                        .into_iter()
-                        .filter(|hook| {
-                            let keep = hook.r#type.as_deref().is_none_or(|t| t == "command");
-                            if !keep {
-                                tracing::warn!(
-                                    "{}: 忽略不支持的 hook 类型 `{}`",
-                                    path.display(),
-                                    hook.r#type.as_deref().unwrap_or_default()
-                                );
-                            }
-                            keep
-                        })
-                        .collect();
-                    if hooks.is_empty() {
-                        continue;
-                    }
-                    out.entries.push(RegisteredHook {
-                        plugin: plugin.manifest.name.clone(),
-                        plugin_root: plugin.root.clone(),
-                        event,
-                        matcher,
-                        group: HookMatcherGroup {
-                            matcher: matcher_src,
-                            hooks,
-                        },
-                    });
-                }
-            }
+            load_plugin_hooks(&mut out, plugin)?;
         }
         Ok(out)
     }
@@ -362,6 +307,93 @@ impl Hooks {
     }
 }
 
+// ---------------------------------------------------------------------------
+// manifest loading：hooks.json 定位 / 解析 / 条目注册
+// ---------------------------------------------------------------------------
+
+/// manifest loading：装载单个插件的 hooks.json 进汇总。没有 hooks 文件 →
+/// 不注册任何东西；读取 / 解析失败带文件路径上报。同时收集该插件的
+/// 环境白名单名（env/policy 单元的 [`declared_env`]）。
+fn load_plugin_hooks(out: &mut Hooks, plugin: &Plugin) -> crate::Result<()> {
+    let Some(path) = hooks_file_path(plugin) else {
+        return Ok(());
+    };
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: HooksFile =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let declared = declared_env(plugin);
+    if !declared.is_empty() {
+        out.plugin_env
+            .insert(plugin.manifest.name.clone(), declared);
+    }
+    for (event_name, groups) in parsed.hooks {
+        let Some(event) = HookEvent::from_name(&event_name) else {
+            tracing::warn!("{}: 忽略未知 hook 事件 `{event_name}`", path.display());
+            continue;
+        };
+        register_event_groups(&mut out.entries, plugin, &path, event, groups);
+    }
+    Ok(())
+}
+
+/// manifest loading：注册一个事件下的全部 matcher 组。非法正则 → 跳过整条
+/// rule（warn）；非 `command` 类型 → 跳过该条（warn）；全部被跳过的组不注册。
+fn register_event_groups(
+    entries: &mut Vec<RegisteredHook>,
+    plugin: &Plugin,
+    path: &Path,
+    event: HookEvent,
+    groups: Vec<HookMatcherGroup>,
+) {
+    for group in groups {
+        let HookMatcherGroup {
+            matcher: matcher_src,
+            hooks: raw_hooks,
+        } = group;
+        let matcher = match matcher_src.as_deref().filter(|s| !s.is_empty()) {
+            Some(pattern) => match Regex::new(pattern) {
+                Ok(re) => Some(re),
+                Err(err) => {
+                    tracing::warn!(
+                        "{}: matcher `{pattern}` 不是合法正则（{err}），跳过该 rule",
+                        path.display()
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let hooks: Vec<HookDef> = raw_hooks
+            .into_iter()
+            .filter(|hook| {
+                let keep = hook.r#type.as_deref().is_none_or(|t| t == "command");
+                if !keep {
+                    tracing::warn!(
+                        "{}: 忽略不支持的 hook 类型 `{}`",
+                        path.display(),
+                        hook.r#type.as_deref().unwrap_or_default()
+                    );
+                }
+                keep
+            })
+            .collect();
+        if hooks.is_empty() {
+            continue;
+        }
+        entries.push(RegisteredHook {
+            plugin: plugin.manifest.name.clone(),
+            plugin_root: plugin.root.clone(),
+            event,
+            matcher,
+            group: HookMatcherGroup {
+                matcher: matcher_src,
+                hooks,
+            },
+        });
+    }
+}
+
 /// `dev.instagent/hooks.json` 优先，回退 goose 草案位置 `hooks/hooks.json`。
 fn hooks_file_path(plugin: &Plugin) -> Option<PathBuf> {
     let namespaced = plugin.root.join(NAMESPACE).join("hooks.json");
@@ -371,6 +403,11 @@ fn hooks_file_path(plugin: &Plugin) -> Option<PathBuf> {
     let draft = plugin.root.join("hooks").join("hooks.json");
     draft.is_file().then_some(draft)
 }
+
+// ---------------------------------------------------------------------------
+// env/policy：manifest 环境 allowlist、子进程环境 baseline、on_failure 收敛
+// （ADR 0003 D2 / D3）
+// ---------------------------------------------------------------------------
 
 /// manifest `extensions["dev.instagent"].env`：字符串数组，其余形状忽略。
 /// hooks 与 command 工具加载期共用（ADR 0003 D2 allowlist）。
@@ -409,68 +446,6 @@ pub fn apply_plugin_env(cmd: &mut Command, plugin_root: &Path, declared: &[Strin
     }
 }
 
-/// 决策判定（搬运 goose `classify_output`，hooks/mod.rs:916~966）：
-/// 退出 2 → Block(stderr)；stdout JSON `decision:"block"` → Block（不看退出码）；
-/// 退出 0 且空或 `decision:"allow"` → Allow；其余"没有决策"按 on_failure
-/// （Allow → None，Block → Block(框架生成的失败理由)）。
-///
-/// 第二个返回值是"没有决策"时的有界失败诊断（ADR 0003 D3 可见性）；
-/// 产出合法 allow / block 决策时为 `None`。
-pub fn parse_decision(
-    stdout: &str,
-    stderr: &str,
-    exit_code: Option<i32>,
-    on_failure: OnFailure,
-) -> (HookDecision, Option<String>) {
-    let non_empty = |s: &str| {
-        if s.is_empty() {
-            EMPTY_REASON_DENY.to_string()
-        } else {
-            s.to_string()
-        }
-    };
-
-    if exit_code == Some(2) {
-        return (HookDecision::Block(non_empty(stderr.trim())), None);
-    }
-
-    #[derive(Deserialize)]
-    struct Resp {
-        decision: Option<String>,
-        reason: Option<String>,
-    }
-
-    let trimmed = stdout.trim();
-    let resp = trimmed
-        .starts_with('{')
-        .then(|| serde_json::from_str::<Resp>(trimmed).ok())
-        .flatten();
-
-    if let Some(resp) = &resp {
-        if resp.decision.as_deref() == Some("block") {
-            let reason = resp.reason.clone().unwrap_or_default();
-            return (HookDecision::Block(non_empty(reason.trim())), None);
-        }
-    }
-    if exit_code == Some(0)
-        && (trimmed.is_empty()
-            || resp.as_ref().and_then(|r| r.decision.as_deref()) == Some("allow"))
-    {
-        return (HookDecision::Allow, None);
-    }
-
-    let diagnosis = match exit_code {
-        Some(0) => "exited 0 without an allow or block decision on stdout".to_string(),
-        Some(code) => format!("exited with status {code} and no usable decision"),
-        None => "was terminated by a signal".to_string(),
-    };
-    let decision = match on_failure {
-        OnFailure::Allow => HookDecision::None,
-        OnFailure::Block => HookDecision::Block(format!("the hook {diagnosis}")),
-    };
-    (decision, Some(diagnosis))
-}
-
 /// hook 失败收敛（ADR 0003 D3）：产出带插件 / 事件 / 命令 / 原因的 warning，
 /// 再按 on_failure 决策——Allow（缺省）放行，显式 `"block"` 阻断。
 fn fail_with_warning(
@@ -490,6 +465,10 @@ fn fail_with_warning(
         OnFailure::Block => HookDecision::Block(format!("the hook {reason}")),
     }
 }
+
+// ---------------------------------------------------------------------------
+// command execution：sh -c + 有界输出 + 进程组
+// ---------------------------------------------------------------------------
 
 /// hook 子进程：`sh -c` + baseline 白名单环境（[`apply_plugin_env`]）；
 /// working_dir 存在则作为 cwd。`${PLUGIN_ROOT}` 不替换进命令字符串，
@@ -586,6 +565,76 @@ async fn run_hook(
         fail_with_warning(plugin, event, &hook.command, on_failure, &diagnosis);
     }
     decision
+}
+
+// ---------------------------------------------------------------------------
+// decision parser：退出码 / stdout JSON → HookDecision（goose classify_output
+// 搬运，行为逐字不变）
+// ---------------------------------------------------------------------------
+
+/// block 理由为空时的兜底理由。
+const EMPTY_REASON_DENY: &str = "denied by plugin hook";
+
+/// 决策判定（搬运 goose `classify_output`，hooks/mod.rs:916~966）：
+/// 退出 2 → Block(stderr)；stdout JSON `decision:"block"` → Block（不看退出码）；
+/// 退出 0 且空或 `decision:"allow"` → Allow；其余"没有决策"按 on_failure
+/// （Allow → None，Block → Block(框架生成的失败理由)）。
+///
+/// 第二个返回值是"没有决策"时的有界失败诊断（ADR 0003 D3 可见性）；
+/// 产出合法 allow / block 决策时为 `None`。
+pub fn parse_decision(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    on_failure: OnFailure,
+) -> (HookDecision, Option<String>) {
+    let non_empty = |s: &str| {
+        if s.is_empty() {
+            EMPTY_REASON_DENY.to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    if exit_code == Some(2) {
+        return (HookDecision::Block(non_empty(stderr.trim())), None);
+    }
+
+    #[derive(Deserialize)]
+    struct Resp {
+        decision: Option<String>,
+        reason: Option<String>,
+    }
+
+    let trimmed = stdout.trim();
+    let resp = trimmed
+        .starts_with('{')
+        .then(|| serde_json::from_str::<Resp>(trimmed).ok())
+        .flatten();
+
+    if let Some(resp) = &resp {
+        if resp.decision.as_deref() == Some("block") {
+            let reason = resp.reason.clone().unwrap_or_default();
+            return (HookDecision::Block(non_empty(reason.trim())), None);
+        }
+    }
+    if exit_code == Some(0)
+        && (trimmed.is_empty()
+            || resp.as_ref().and_then(|r| r.decision.as_deref()) == Some("allow"))
+    {
+        return (HookDecision::Allow, None);
+    }
+
+    let diagnosis = match exit_code {
+        Some(0) => "exited 0 without an allow or block decision on stdout".to_string(),
+        Some(code) => format!("exited with status {code} and no usable decision"),
+        None => "was terminated by a signal".to_string(),
+    };
+    let decision = match on_failure {
+        OnFailure::Allow => HookDecision::None,
+        OnFailure::Block => HookDecision::Block(format!("the hook {diagnosis}")),
+    };
+    (decision, Some(diagnosis))
 }
 
 #[cfg(test)]

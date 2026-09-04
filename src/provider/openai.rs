@@ -55,6 +55,7 @@ use crate::provider::shared::require_base_url;
 use crate::provider::shared::sanitize_function_name;
 use crate::provider::shared::sanitized_tool_names;
 use crate::provider::shared::to_provider_error;
+use crate::provider::shared::PendingCall;
 use crate::provider::shared::StreamEngine;
 use crate::provider::shared::StreamState;
 use crate::provider::EngineKind;
@@ -64,6 +65,10 @@ use crate::provider::Request;
 use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::tools::ToolSpec;
+
+// ---------------------------------------------------------------------------
+// transport 骨架：构造 / 请求头 / 流入口（HTTP、SSE 驱动与重试复用共享层）
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -138,7 +143,7 @@ impl Provider for OpenAiProvider {
 }
 
 // ---------------------------------------------------------------------------
-// 请求侧：消息 / 工具格式化
+// request mapping：请求体 / 消息 / 工具 / 图片预算
 // ---------------------------------------------------------------------------
 
 /// model 表里的 `max_tokens` 是输出上限：请求超过时收敛到该值（todo 08 / S9，
@@ -181,6 +186,8 @@ fn build_request_body(req: &Request<'_>) -> crate::Result<Value> {
     }
     Ok(body)
 }
+
+// request mapping 子单元：图片预算——去重 + 生命周期淘汰（todo 13 / S15）。
 
 /// 单个图片槽位（消息下标, block 下标）在本请求内的处置（todo 13）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,7 +406,8 @@ fn format_tools(tools: &[ToolSpec]) -> crate::Result<Vec<Value>> {
 }
 
 // ---------------------------------------------------------------------------
-// 响应侧：SSE 事件流 → StreamEvent
+// stream state：SSE 事件流 → StreamEvent 组装（驱动器复用共享层
+// [`crate::provider::shared::sse_to_stream_events`]）
 // ---------------------------------------------------------------------------
 
 /// openai 引擎流状态：共享 [`StreamState`] + usage 累积
@@ -414,18 +422,8 @@ impl OpenAiStreamState {
     /// 单个流式 chunk：文本即时出 TextDelta，tool_calls 按 index 累积，
     /// usage / finish_reason 记录到最后（`Done` 在收尾钩子统一发）。
     fn apply_chunk(&mut self, chunk: &Value) -> Result<(), ProviderError> {
-        if let Some(err) = chunk.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            // 错误摘要有界 + redact（todo 08 / S18 / ADR 0003 D1）。
-            let summary = crate::provider::http::redact_secret_tokens(
-                &crate::provider::http::summarize(msg, crate::provider::http::ERROR_SUMMARY_CHARS),
-            );
-            return Err(ProviderError::Transport(format!(
-                "provider error in stream: {summary}"
-            )));
+        if let Some(err) = stream_error_from_chunk(chunk) {
+            return Err(err);
         }
         if let Some(usage) = usage_from_chunk(chunk) {
             self.usage = usage;
@@ -454,30 +452,7 @@ impl OpenAiStreamState {
             }
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for (position, call) in calls.iter().enumerate() {
-                let index = call
-                    .get("index")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(position as i64);
-                let pending = self.st.tools.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() && pending.id.is_empty() {
-                        pending.id = id.to_string();
-                    }
-                }
-                let Some(function) = call.get("function") else {
-                    continue;
-                };
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    if !name.is_empty() && pending.name.is_empty() {
-                        pending.name = name.to_string();
-                    }
-                }
-                // arguments 可能缺省 / null（goose 的 delta 测试覆盖过）。
-                if let Some(args) = function.get("arguments").and_then(Value::as_str) {
-                    pending.arguments.push_str(args);
-                }
-            }
+            accumulate_tool_calls(&mut self.st.tools, calls);
         }
         Ok(())
     }
@@ -537,6 +512,61 @@ fn sse_to_stream_events(
     events: BoxStream<'static, crate::Result<SseEvent>>,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
     crate::provider::shared::sse_to_stream_events(OpenAiStreamState::default(), events)
+}
+
+// ---------------------------------------------------------------------------
+// SSE delta parser：并行 tool_calls 按 index 累积
+// ---------------------------------------------------------------------------
+
+/// SSE delta parser：`delta.tool_calls[]` 按 `index` 累积进待发工具表
+/// （第二版 §6 风险 1）。`index` 缺省时退化为数组内位置；id / name 取首个
+/// 非空值，arguments 增量拼接（可能缺省 / null）。
+fn accumulate_tool_calls(tools: &mut BTreeMap<i64, PendingCall>, calls: &[Value]) {
+    for (position, call) in calls.iter().enumerate() {
+        let index = call
+            .get("index")
+            .and_then(Value::as_i64)
+            .unwrap_or(position as i64);
+        let pending = tools.entry(index).or_default();
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if !id.is_empty() && pending.id.is_empty() {
+                pending.id = id.to_string();
+            }
+        }
+        let Some(function) = call.get("function") else {
+            continue;
+        };
+        if let Some(name) = function.get("name").and_then(Value::as_str) {
+            if !name.is_empty() && pending.name.is_empty() {
+                pending.name = name.to_string();
+            }
+        }
+        // arguments 可能缺省 / null（goose 的 delta 测试覆盖过）。
+        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+            pending.arguments.push_str(args);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// error/usage handling：流内错误帧、usage 映射、终止原因
+// ---------------------------------------------------------------------------
+
+/// 流内错误帧（`chunk.error`）→ Transport；错误摘要有界 + redact
+/// （todo 08 / S18 / ADR 0003 D1）。
+fn stream_error_from_chunk(chunk: &Value) -> Option<ProviderError> {
+    let err = chunk.get("error")?;
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    let summary = crate::provider::http::redact_secret_tokens(&crate::provider::http::summarize(
+        msg,
+        crate::provider::http::ERROR_SUMMARY_CHARS,
+    ));
+    Some(ProviderError::Transport(format!(
+        "provider error in stream: {summary}"
+    )))
 }
 
 /// `finish_reason` → [`StopReason`]。
