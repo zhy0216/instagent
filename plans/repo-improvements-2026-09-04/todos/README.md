@@ -35,7 +35,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/18-provider-converter.md` ✅ | P2 | medium | provider converter 的 source 注入、fixture 和 round-trip 校验 |
 | `19-agent-module-split.md` | P2 | hard | 在行为测试护栏下拆分 agent loop 与工具执行职责 |
 | `20-hooks-provider-split.md` | P2 | hard | 在契约锁定后拆分 hooks 与 OpenAI transport/parser |
-| `21-install-module-split.md` | P2 | medium | 在安装回归稳定后拆分安装流程、git 和替换状态机 |
+| `done/21-install-module-split.md` ✅ | P2 | medium | 在安装回归稳定后拆分安装流程、git 和替换状态机 |
 
 ## 文件
 
@@ -59,7 +59,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 18. `done/18-provider-converter.md` ✅ — 完成。converter 改 `--source DIR`/`--fixture` 显式注入（不再硬编码 ~/yyds/goose）；产物按 08 的 ProviderDef/ModelDef 契约做 schema + round-trip 校验，契约外字段剔除、约定字段保留，坏 source/schema 非零退出带文件与字段诊断；新增最小 fixture 与 11 个可重复 python 测试，真实 goose 源重生成 groq/deepseek 与提交物逐字节一致。依赖：08。
 19. `19-agent-module-split.md` — 依赖：11、13、16。
 20. `20-hooks-provider-split.md` — 依赖：06、08、11、13、16。
-21. `21-install-module-split.md` — 依赖：07、12、16。
+21. `done/21-install-module-split.md` ✅ — 依赖：07、12、16。完成。`install.rs` 按职责拆为五个私有子模块（acquire git 获取与错误脱敏回显 / metadata `.install.json` 读写 / staging 目录与 copy_tree symlink 契约 / replace `.replaced-*` 回滚状态机 / update 手动与 24h 节流），公开 API、CLI 输出与 `PluginSource` 语义不变、不动模块树；闭环 15 的残留：`list()` enabled 列改用共享 `plugin_enabled()`（显式 `[]` 白名单不再误报"全部已启用"），新增回归测试。
 
 ## 并行批次
 

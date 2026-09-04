@@ -12,32 +12,43 @@
 //! 到期的插件，失败也先记检查时间，避免每次启动重试（goose 同款）。
 //! list / show / enable / disable 为数据层，CLI 接线在 `18`。
 //! `PLUGIN_DATA`：[`plugin_data_dir`] = `<data_dir>/plugins/<name>/`，按需创建。
+//!
+//! 实现按职责分为五个私有子模块（公开 API 全部留在本模块）：
+//! `acquire` source acquisition（git clone / rev-parse / 错误回显与 URL
+//! 脱敏）、`metadata` manifest/metadata persistence（`.install.json`
+//! 读写）、`staging` staging 目录与本地复制（symlink 契约）、
+//! `replace` 原子替换与 `.replaced-*` 可恢复状态机、
+//! `update` update / auto-update 节流。
 
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use anyhow::bail;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::plugin::discovery::agents_dir;
 use crate::plugin::manifest::read_manifest;
 use crate::plugin::manifest::validate_plugin_name;
 use crate::plugin::manifest::PluginManifest;
+use crate::plugin::plugin_enabled;
 use crate::plugin::Plugin;
 use crate::plugin::PluginSource;
 use crate::settings::Settings;
-use crate::subprocess::git_command;
-use crate::subprocess::run_bounded;
-use crate::subprocess::CollectedRun;
-use crate::subprocess::Outcome;
-use crate::subprocess::ProcessGroupChild;
+
+use acquire::fetch_git_commit;
+use acquire::redact_url;
+use acquire::remove_git_dir;
+use metadata::read_install_info;
+use replace::place;
+use staging::copy_tree;
+use staging::Staging;
+
+pub use update::auto_update_all;
+pub use update::should_auto_update;
+pub use update::update;
 
 /// `.install.json` 文件名（goose `.goose-plugin-install.json` 的对应物）。
 pub const INSTALL_METADATA: &str = ".install.json";
@@ -50,18 +61,6 @@ pub const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `git rev-parse` 这类本地快命令的超时。
 pub const GIT_QUICK_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// git 子进程单路输出的收集硬上限（超出即杀组并只保留头部摘要）。
-const GIT_OUTPUT_CAP_BYTES: usize = 64 * 1024;
-
-/// 错误信息里回显 git 输出的字节上限（只显示截断摘要，绝不整段倾倒）。
-const GIT_ERROR_DISPLAY_BYTES: usize = 512;
-
-/// `replace_dir` 换入前挪走旧目录的备份前缀。
-const REPLACED_PREFIX: &str = ".replaced-";
-
-/// 崩溃进程遗留在 `.tmp-install` 下的 staging 孤儿超过这个时长即清理。
-const STAGING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// 安装来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,53 +185,6 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
     Ok(plugin)
 }
 
-/// 按 `.install.json` 重新拉取（手动 update 不受节流限制）。
-pub fn update(name: &str) -> crate::Result<()> {
-    update_at(name, crate::message::now_ts())
-}
-
-/// 24h 节流的纯时间判定（goose `should_auto_update`）。
-pub fn should_auto_update(last_update_check: Option<i64>, now: i64) -> bool {
-    last_update_check.is_none_or(|checked| now - checked >= AUTO_UPDATE_INTERVAL_SECS)
-}
-
-/// 扫描用户插件目录，对 `auto_update` 的 git 来源做节流更新。
-/// 失败也返回在结果里（调用方只 warn，goose 同款）。
-pub fn auto_update_all(now: i64) -> crate::Result<Vec<AutoUpdateResult>> {
-    let root = user_plugins_dir()?;
-    let entries = match std::fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    dirs.sort();
-    let mut results = Vec::new();
-    for dir in dirs {
-        let Ok(info) = read_install_info(&dir) else {
-            continue;
-        };
-        if !info.auto_update || info.commit.is_none() {
-            continue;
-        }
-        if !should_auto_update(info.last_update_check, now) {
-            continue;
-        }
-        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let name = name.to_string();
-        // 先记检查时间再更新：失败也不在每次启动重试。
-        let result = mark_last_update_check(&dir, now).and_then(|()| update_at(&name, now));
-        results.push(AutoUpdateResult { name, result });
-    }
-    Ok(results)
-}
-
 /// 已安装（用户目录）插件清单；manifest 校验失败的目录跳过
 /// （发现层的 skipped 记录在 `05`，这里只报"装了什么"）。
 pub fn list(cwd: &Path) -> crate::Result<Vec<InstalledPlugin>> {
@@ -253,11 +205,7 @@ pub fn list(cwd: &Path) -> crate::Result<Vec<InstalledPlugin>> {
             continue;
         };
         let name = &manifest.name;
-        let enabled = if settings.enabled_plugins.is_empty() {
-            !settings.disabled_plugins.contains(name)
-        } else {
-            settings.enabled_plugins.contains(name)
-        };
+        let enabled = plugin_enabled(name, &settings);
         installed.push(InstalledPlugin {
             plugin: Plugin {
                 manifest,
@@ -313,346 +261,539 @@ fn ensure_installed(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
-/// update 的带时刻实现：手动 update 用真实 now，节流测试注入假 now。
-fn update_at(name: &str, now: i64) -> crate::Result<()> {
-    if name.trim().is_empty() {
-        bail!("plugin name must not be empty");
-    }
-    validate_plugin_name(name)?;
-    let dest = user_plugins_dir()?.join(name);
-    if !dest.is_dir() {
-        bail!("plugin `{name}` is not installed");
-    }
-    let old = read_install_info(&dest)?;
-    if old.commit.is_none() {
-        bail!(
-            "plugin `{name}` was installed from local path `{}` and cannot be updated",
-            old.source
-        );
-    }
-    let staging = Staging::new()?;
-    let commit = fetch_git_commit(&old.source, &staging.path)?;
-    remove_git_dir(&staging.path)?;
-    let manifest = read_manifest(&staging.path)
-        .with_context(|| format!("validate updated plugin `{name}`"))?;
-    if manifest.name != name {
-        staging.cleanup_ok();
-        bail!(
-            "updated plugin name `{}` does not match installed plugin `{name}`",
-            manifest.name
-        );
-    }
-    let info = InstallInfo {
-        commit: Some(commit),
-        last_update_check: Some(now),
-        ..old
-    };
-    place(staging, manifest, &info)?;
-    Ok(())
-}
+/// source acquisition：git-url 的 clone / rev-parse（统一 Tokio wrapper、
+/// 进程组 + 超时 + bounded output + 取消）与失败回显脱敏。
+mod acquire {
+    use std::future::Future;
+    use std::path::Path;
+    use std::time::Duration;
 
-/// 把 staging（已含 `.install.json`）换入 `<plugins>/<manifest.name>/`。
-fn place(
-    mut staging: Staging,
-    manifest: PluginManifest,
-    info: &InstallInfo,
-) -> crate::Result<Plugin> {
-    write_install_info(&staging.path, info)?;
-    let root = user_plugins_dir()?;
-    std::fs::create_dir_all(&root)?;
-    cleanup_orphan_backups(&root);
-    let dest = root.join(&manifest.name);
-    replace_dir(&staging.path, &dest)?;
-    staging.commit();
-    Ok(Plugin {
-        manifest,
-        root: dest,
-        source: PluginSource::User,
-    })
-}
+    use anyhow::bail;
+    use anyhow::Context;
+    use tokio_util::sync::CancellationToken;
 
-fn read_install_info(dir: &Path) -> crate::Result<InstallInfo> {
-    let path = dir.join(INSTALL_METADATA);
-    let text = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "plugin at {} has no {INSTALL_METADATA} and cannot be updated",
-            dir.display()
-        )
-    })?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
-}
+    use crate::subprocess::git_command;
+    use crate::subprocess::run_bounded;
+    use crate::subprocess::CollectedRun;
+    use crate::subprocess::Outcome;
+    use crate::subprocess::ProcessGroupChild;
 
-fn write_install_info(dir: &Path, info: &InstallInfo) -> crate::Result<()> {
-    let path = dir.join(INSTALL_METADATA);
-    crate::settings::write_private_atomic(&path, &serde_json::to_string_pretty(info)?)
-}
+    use super::GIT_CLONE_TIMEOUT;
+    use super::GIT_QUICK_TIMEOUT;
 
-fn mark_last_update_check(dir: &Path, now: i64) -> crate::Result<()> {
-    let mut info = read_install_info(dir)?;
-    info.last_update_check = Some(now);
-    write_install_info(dir, &info)
-}
+    /// git 子进程单路输出的收集硬上限（超出即杀组并只保留头部摘要）。
+    pub(super) const GIT_OUTPUT_CAP_BYTES: usize = 64 * 1024;
 
-/// staging 目录：`<agents_dir>/.tmp-install/<uuid>`——放在用户插件根之外，
-/// 不会被 `05` 的发现流程扫到；同盘保证 rename 换入原子。
-struct Staging {
-    path: PathBuf,
-    committed: bool,
-}
+    /// 错误信息里回显 git 输出的字节上限（只显示截断摘要，绝不整段倾倒）。
+    const GIT_ERROR_DISPLAY_BYTES: usize = 512;
 
-impl Staging {
-    fn new() -> crate::Result<Self> {
-        let parent = agents_dir()?.join(".tmp-install");
-        std::fs::create_dir_all(&parent)?;
-        cleanup_stale_staging(&parent, SystemTime::now());
-        Ok(Self {
-            path: parent.join(Uuid::new_v4().to_string()),
-            committed: false,
+    /// clone → rev-parse HEAD：一次 git 拉取的可取消整体（同步入口用的胶水）。
+    pub(super) fn fetch_git_commit(url: &str, dest: &Path) -> crate::Result<String> {
+        let url = url.to_string();
+        let dest = dest.to_path_buf();
+        block_on_dedicated(async move {
+            clone_git_repo(&url, &dest, GIT_CLONE_TIMEOUT, None).await?;
+            head_commit(&dest, GIT_QUICK_TIMEOUT, None).await
         })
     }
 
-    fn commit(&mut self) {
-        self.committed = true;
+    /// 公共 install/update 是同步入口（CLI handlers 与 assembly 未 async 化），
+    /// 而 git 流程要跑在 Tokio wrapper 上。专用 OS 线程 + 私有 current-thread
+    /// runtime：既能在"已在 runtime 里"的调用线程上安全执行（同线程嵌套
+    /// block_on 会 panic），也把挂起/超时/杀组的取消语义完整保留。
+    fn block_on_dedicated<T: Send + 'static>(
+        future: impl Future<Output = crate::Result<T>> + Send + 'static,
+    ) -> crate::Result<T> {
+        std::thread::Builder::new()
+            .name("instagent-git".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create git subprocess runtime")?;
+                runtime.block_on(future)
+            })
+            .context("spawn git subprocess thread")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("git subprocess thread panicked"))?
     }
 
-    fn cleanup_ok(&self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+    /// 统一 git 子进程入口：`git_command` 的加固参数 + 进程组 / `kill_on_drop`
+    /// （[`ProcessGroupChild`]）、超时、取消与双路 bounded output（[`run_bounded`]）。
+    /// 超时 / 取消 / 输出越限时整组（含孙进程）SIGKILL，不残留。
+    async fn run_git(
+        command: &mut tokio::process::Command,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> crate::Result<CollectedRun> {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = ProcessGroupChild::spawn(command).context("failed to spawn `git`")?;
+        run_bounded(child, GIT_OUTPUT_CAP_BYTES, timeout, cancel)
+            .await
+            .context("collect git subprocess output")
     }
-}
 
-impl Drop for Staging {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.cleanup_ok();
+    fn git_command_async() -> tokio::process::Command {
+        tokio::process::Command::from(git_command())
+    }
+
+    pub(super) async fn clone_git_repo(
+        url: &str,
+        dest: &Path,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> crate::Result<()> {
+        let mut command = git_command_async();
+        command
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            // 无网络凭据时直接失败而不是挂起等输入。
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg(url)
+            .arg(dest);
+        let run = run_git(&mut command, timeout, cancel).await?;
+        if run.outcome == Outcome::Exited(Some(0)) {
+            return Ok(());
+        }
+        let message = match run.outcome {
+            Outcome::TimedOut => format!("timed out cloning plugin repository after {timeout:?}"),
+            Outcome::Cancelled => "cancelled while cloning plugin repository".to_string(),
+            _ => format!(
+                "failed to clone plugin repository: {}",
+                git_error_summary(&run, Some(url))
+            ),
+        };
+        bail!(message)
+    }
+
+    async fn head_commit(
+        dir: &Path,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> crate::Result<String> {
+        let mut command = git_command_async();
+        command.arg("-C").arg(dir).arg("rev-parse").arg("HEAD");
+        let run = run_git(&mut command, timeout, cancel).await?;
+        let commit = run.stdout.text.trim().to_string();
+        if run.outcome != Outcome::Exited(Some(0)) || commit.is_empty() {
+            bail!(
+                "plugin git source has no commits (rev-parse HEAD failed): {}",
+                git_error_summary(&run, None)
+            );
+        }
+        Ok(commit)
+    }
+
+    /// git 失败的可读摘要：stderr 优先（git 的诊断走 stderr），去凭据、封顶截断。
+    fn git_error_summary(run: &CollectedRun, redact: Option<&str>) -> String {
+        let stream = if run.stderr.text.trim().is_empty() {
+            &run.stdout
+        } else {
+            &run.stderr
+        };
+        let mut text = stream.text.trim().to_string();
+        if let Some(url) = redact {
+            text = text.replace(url, "<git-url>");
+        }
+        if text.len() > GIT_ERROR_DISPLAY_BYTES {
+            let mut cut = GIT_ERROR_DISPLAY_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push('…');
+        }
+        if let Some(note) = stream.truncation_note() {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        if text.is_empty() {
+            text = "(no git output)".to_string();
+        }
+        text
+    }
+
+    /// 去掉 URL 里的 `user:password@` 凭据段，用于错误展示（不落日志、不回显）。
+    pub(super) fn redact_url(url: &str) -> String {
+        let Some(scheme_end) = url.find("://") else {
+            return url.to_string();
+        };
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(url.len(), |offset| authority_start + offset);
+        match url[authority_start..authority_end].rfind('@') {
+            Some(at) => format!(
+                "{}{}",
+                &url[..authority_start],
+                &url[authority_start + at..]
+            ),
+            None => url.to_string(),
         }
     }
-}
 
-/// 清理策略：`.tmp-install` 下 mtime 老于 [`STAGING_MAX_AGE`] 的条目一定是
-/// 崩溃进程遗留（活着的 staging 在当次进程内由 Drop 删除），下次建 staging 前扫掉。
-/// `now` 参数化以便测试注入假时钟。
-fn cleanup_stale_staging(parent: &Path, now: SystemTime) {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        let stale = modified
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > STAGING_MAX_AGE);
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
+    pub(super) fn remove_git_dir(dir: &Path) -> crate::Result<()> {
+        let git = dir.join(".git");
+        if git.exists() {
+            std::fs::remove_dir_all(&git)?;
         }
+        Ok(())
     }
 }
 
-/// 清理策略：换入新版本前，扫掉插件根下遗留的 `.replaced-*` 孤儿备份
-/// （上次替换 rename 成功后删备份失败、或回滚失败崩溃的产物）。
-/// 回滚失败的错误信息会指明备份路径供手动恢复；下一次同插件 install 即回收点。
-fn cleanup_orphan_backups(root: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(REPLACED_PREFIX)
+/// manifest/metadata persistence：`.install.json` 的读写（原子私有写入）。
+mod metadata {
+    use std::path::Path;
+
+    use anyhow::Context;
+
+    use super::InstallInfo;
+    use super::INSTALL_METADATA;
+
+    pub(super) fn read_install_info(dir: &Path) -> crate::Result<InstallInfo> {
+        let path = dir.join(INSTALL_METADATA);
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "plugin at {} has no {INSTALL_METADATA} and cannot be updated",
+                dir.display()
+            )
+        })?;
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    }
+
+    pub(super) fn write_install_info(dir: &Path, info: &InstallInfo) -> crate::Result<()> {
+        let path = dir.join(INSTALL_METADATA);
+        crate::settings::write_private_atomic(&path, &serde_json::to_string_pretty(info)?)
+    }
+
+    pub(super) fn mark_last_update_check(dir: &Path, now: i64) -> crate::Result<()> {
+        let mut info = read_install_info(dir)?;
+        info.last_update_check = Some(now);
+        write_install_info(dir, &info)
+    }
+}
+
+/// staging/copy：staging 目录（同盘 rename 前提）与本地复制树的 symlink 契约。
+mod staging {
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use std::time::SystemTime;
+
+    use anyhow::bail;
+    use anyhow::Context;
+    use uuid::Uuid;
+
+    use super::agents_dir;
+    use super::INSTALL_METADATA;
+
+    /// 崩溃进程遗留在 `.tmp-install` 下的 staging 孤儿超过这个时长即清理。
+    pub(super) const STAGING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+    /// staging 目录：`<agents_dir>/.tmp-install/<uuid>`——放在用户插件根之外，
+    /// 不会被 `05` 的发现流程扫到；同盘保证 rename 换入原子。
+    pub(super) struct Staging {
+        pub(super) path: PathBuf,
+        committed: bool,
+    }
+
+    impl Staging {
+        pub(super) fn new() -> crate::Result<Self> {
+            let parent = agents_dir()?.join(".tmp-install");
+            std::fs::create_dir_all(&parent)?;
+            cleanup_stale_staging(&parent, SystemTime::now());
+            Ok(Self {
+                path: parent.join(Uuid::new_v4().to_string()),
+                committed: false,
+            })
+        }
+
+        pub(super) fn commit(&mut self) {
+            self.committed = true;
+        }
+
+        pub(super) fn cleanup_ok(&self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.cleanup_ok();
+            }
+        }
+    }
+
+    /// 清理策略：`.tmp-install` 下 mtime 老于 [`STAGING_MAX_AGE`] 的条目一定是
+    /// 崩溃进程遗留（活着的 staging 在当次进程内由 Drop 删除），下次建 staging 前扫掉。
+    /// `now` 参数化以便测试注入假时钟。
+    pub(super) fn cleanup_stale_staging(parent: &Path, now: SystemTime) {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            let stale = modified
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > STAGING_MAX_AGE);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    /// 递归复制目录树；跳过任意层级的 `.git` 与顶层 `.install.json`
+    /// （源可能是先前安装过的目录）。
+    ///
+    /// symlink 契约：源树中**任何**层级的 symlink（指向文件或目录皆同）一律
+    /// 显式拒绝并报出路径，既不复制链接本身也不跟随其目标——防止 staging
+    /// 借道指向源树外的文件（如 `~/.ssh`）；非目录非文件的特殊文件（fifo、
+    /// socket、设备）同样拒绝。
+    pub(super) fn copy_tree(source: &Path, dest: &Path) -> crate::Result<()> {
+        copy_tree_at(source, dest, true)
+    }
+
+    fn copy_tree_at(source: &Path, dest: &Path, top_level: bool) -> crate::Result<()> {
+        std::fs::create_dir_all(dest)?;
+        for entry in
+            std::fs::read_dir(source).with_context(|| format!("read {}", source.display()))?
         {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == ".git" || (top_level && name == INSTALL_METADATA) {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                bail!(
+                    "plugin source contains symlink `{}`; symlinks are rejected, not copied",
+                    entry.path().display()
+                );
+            }
+            let target = dest.join(name);
+            if file_type.is_dir() {
+                copy_tree_at(&entry.path(), &target, false)?;
+            } else if file_type.is_file() {
+                std::fs::copy(entry.path(), &target)?;
+            } else {
+                bail!(
+                    "plugin source contains non-regular file `{}`",
+                    entry.path().display()
+                );
+            }
         }
+        Ok(())
     }
 }
 
-/// 换入 dest：旧目录先挪去同目录备份，换入失败即回滚（goose 同款）。
-/// 回滚也失败时绝不静默吞掉：错误指明可手动恢复的备份路径（孤儿备份的
-/// 自动回收见 [`cleanup_orphan_backups`]）。
-fn replace_dir(source: &Path, dest: &Path) -> crate::Result<()> {
-    let backup = if dest.exists() {
-        let backup = dest.with_file_name(format!(
-            "{REPLACED_PREFIX}{}-{}",
-            dest.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("plugin"),
-            Uuid::new_v4()
-        ));
-        std::fs::rename(dest, &backup).with_context(|| format!("move aside {}", dest.display()))?;
-        Some(backup)
-    } else {
-        None
-    };
-    match std::fs::rename(source, dest) {
-        Ok(()) => {
-            if let Some(backup) = backup {
-                let _ = std::fs::remove_dir_all(backup);
-            }
-            Ok(())
-        }
-        Err(err) => {
-            if let Some(backup) = &backup {
-                if let Err(restore_err) = std::fs::rename(backup, dest) {
-                    return Err(anyhow::Error::from(err).context(format!(
-                        "install into {} failed and the old plugin could not be moved back; \
-                         recover it manually from {} ({restore_err})",
-                        dest.display(),
-                        backup.display()
-                    )));
-                }
-            }
-            Err(err).with_context(|| format!("install into {}", dest.display()))
-        }
-    }
-}
+/// atomic replacement：`.replaced-*` 备份 + 换入失败回滚的可恢复状态机。
+mod replace {
+    use std::path::Path;
 
-/// 公共 install/update 是同步入口（CLI handlers 与 assembly 未 async 化），
-/// 而 git 流程要跑在 Tokio wrapper 上。专用 OS 线程 + 私有 current-thread
-/// runtime：既能在"已在 runtime 里"的调用线程上安全执行（同线程嵌套
-/// block_on 会 panic），也把挂起/超时/杀组的取消语义完整保留。
-fn block_on_dedicated<T: Send + 'static>(
-    future: impl Future<Output = crate::Result<T>> + Send + 'static,
-) -> crate::Result<T> {
-    std::thread::Builder::new()
-        .name("instagent-git".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("create git subprocess runtime")?;
-            runtime.block_on(future)
+    use anyhow::Context;
+    use uuid::Uuid;
+
+    use super::metadata::write_install_info;
+    use super::staging::Staging;
+    use super::user_plugins_dir;
+    use super::InstallInfo;
+    use super::Plugin;
+    use super::PluginManifest;
+    use super::PluginSource;
+
+    /// `replace_dir` 换入前挪走旧目录的备份前缀。
+    pub(super) const REPLACED_PREFIX: &str = ".replaced-";
+
+    /// 把 staging（已含 `.install.json`）换入 `<plugins>/<manifest.name>/`。
+    pub(super) fn place(
+        mut staging: Staging,
+        manifest: PluginManifest,
+        info: &InstallInfo,
+    ) -> crate::Result<Plugin> {
+        write_install_info(&staging.path, info)?;
+        let root = user_plugins_dir()?;
+        std::fs::create_dir_all(&root)?;
+        cleanup_orphan_backups(&root);
+        let dest = root.join(&manifest.name);
+        replace_dir(&staging.path, &dest)?;
+        staging.commit();
+        Ok(Plugin {
+            manifest,
+            root: dest,
+            source: PluginSource::User,
         })
-        .context("spawn git subprocess thread")?
-        .join()
-        .map_err(|_| anyhow::anyhow!("git subprocess thread panicked"))?
-}
-
-/// clone → rev-parse HEAD：一次 git 拉取的可取消整体（同步入口用的胶水）。
-fn fetch_git_commit(url: &str, dest: &Path) -> crate::Result<String> {
-    let url = url.to_string();
-    let dest = dest.to_path_buf();
-    block_on_dedicated(async move {
-        clone_git_repo(&url, &dest, GIT_CLONE_TIMEOUT, None).await?;
-        head_commit(&dest, GIT_QUICK_TIMEOUT, None).await
-    })
-}
-
-/// 统一 git 子进程入口：`git_command` 的加固参数 + 进程组 / `kill_on_drop`
-/// （[`ProcessGroupChild`]）、超时、取消与双路 bounded output（[`run_bounded`]）。
-/// 超时 / 取消 / 输出越限时整组（含孙进程）SIGKILL，不残留。
-async fn run_git(
-    command: &mut tokio::process::Command,
-    timeout: Duration,
-    cancel: Option<&CancellationToken>,
-) -> crate::Result<CollectedRun> {
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = ProcessGroupChild::spawn(command).context("failed to spawn `git`")?;
-    run_bounded(child, GIT_OUTPUT_CAP_BYTES, timeout, cancel)
-        .await
-        .context("collect git subprocess output")
-}
-
-fn git_command_async() -> tokio::process::Command {
-    tokio::process::Command::from(git_command())
-}
-
-async fn clone_git_repo(
-    url: &str,
-    dest: &Path,
-    timeout: Duration,
-    cancel: Option<&CancellationToken>,
-) -> crate::Result<()> {
-    let mut command = git_command_async();
-    command
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        // 无网络凭据时直接失败而不是挂起等输入。
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg(url)
-        .arg(dest);
-    let run = run_git(&mut command, timeout, cancel).await?;
-    if run.outcome == Outcome::Exited(Some(0)) {
-        return Ok(());
     }
-    let message = match run.outcome {
-        Outcome::TimedOut => format!("timed out cloning plugin repository after {timeout:?}"),
-        Outcome::Cancelled => "cancelled while cloning plugin repository".to_string(),
-        _ => format!(
-            "failed to clone plugin repository: {}",
-            git_error_summary(&run, Some(url))
-        ),
-    };
-    bail!(message)
-}
 
-async fn head_commit(
-    dir: &Path,
-    timeout: Duration,
-    cancel: Option<&CancellationToken>,
-) -> crate::Result<String> {
-    let mut command = git_command_async();
-    command.arg("-C").arg(dir).arg("rev-parse").arg("HEAD");
-    let run = run_git(&mut command, timeout, cancel).await?;
-    let commit = run.stdout.text.trim().to_string();
-    if run.outcome != Outcome::Exited(Some(0)) || commit.is_empty() {
-        bail!(
-            "plugin git source has no commits (rev-parse HEAD failed): {}",
-            git_error_summary(&run, None)
-        );
-    }
-    Ok(commit)
-}
-
-/// git 失败的可读摘要：stderr 优先（git 的诊断走 stderr），去凭据、封顶截断。
-fn git_error_summary(run: &CollectedRun, redact: Option<&str>) -> String {
-    let stream = if run.stderr.text.trim().is_empty() {
-        &run.stdout
-    } else {
-        &run.stderr
-    };
-    let mut text = stream.text.trim().to_string();
-    if let Some(url) = redact {
-        text = text.replace(url, "<git-url>");
-    }
-    if text.len() > GIT_ERROR_DISPLAY_BYTES {
-        let mut cut = GIT_ERROR_DISPLAY_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
+    /// 清理策略：换入新版本前，扫掉插件根下遗留的 `.replaced-*` 孤儿备份
+    /// （上次替换 rename 成功后删备份失败、或回滚失败崩溃的产物）。
+    /// 回滚失败的错误信息会指明备份路径供手动恢复；下一次同插件 install 即回收点。
+    fn cleanup_orphan_backups(root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REPLACED_PREFIX)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
-        text.truncate(cut);
-        text.push('…');
     }
-    if let Some(note) = stream.truncation_note() {
-        text.push('\n');
-        text.push_str(&note);
+
+    /// 换入 dest：旧目录先挪去同目录备份，换入失败即回滚（goose 同款）。
+    /// 回滚也失败时绝不静默吞掉：错误指明可手动恢复的备份路径（孤儿备份的
+    /// 自动回收见 [`cleanup_orphan_backups`]）。
+    pub(super) fn replace_dir(source: &Path, dest: &Path) -> crate::Result<()> {
+        let backup = if dest.exists() {
+            let backup = dest.with_file_name(format!(
+                "{REPLACED_PREFIX}{}-{}",
+                dest.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("plugin"),
+                Uuid::new_v4()
+            ));
+            std::fs::rename(dest, &backup)
+                .with_context(|| format!("move aside {}", dest.display()))?;
+            Some(backup)
+        } else {
+            None
+        };
+        match std::fs::rename(source, dest) {
+            Ok(()) => {
+                if let Some(backup) = backup {
+                    let _ = std::fs::remove_dir_all(backup);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(backup) = &backup {
+                    if let Err(restore_err) = std::fs::rename(backup, dest) {
+                        return Err(anyhow::Error::from(err).context(format!(
+                            "install into {} failed and the old plugin could not be moved back; \
+                             recover it manually from {} ({restore_err})",
+                            dest.display(),
+                            backup.display()
+                        )));
+                    }
+                }
+                Err(err).with_context(|| format!("install into {}", dest.display()))
+            }
+        }
     }
-    if text.is_empty() {
-        text = "(no git output)".to_string();
-    }
-    text
 }
 
-/// 去掉 URL 里的 `user:password@` 凭据段，用于错误展示（不落日志、不回显）。
-fn redact_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let authority_start = scheme_end + 3;
-    let authority_end = url[authority_start..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |offset| authority_start + offset);
-    match url[authority_start..authority_end].rfind('@') {
-        Some(at) => format!(
-            "{}{}",
-            &url[..authority_start],
-            &url[authority_start + at..]
-        ),
-        None => url.to_string(),
+/// update / auto-update：手动 update 与 24h 节流的批量更新。
+mod update {
+    use anyhow::bail;
+    use anyhow::Context;
+
+    use super::acquire::fetch_git_commit;
+    use super::acquire::remove_git_dir;
+    use super::metadata::mark_last_update_check;
+    use super::metadata::read_install_info;
+    use super::replace::place;
+    use super::staging::Staging;
+    use super::user_plugins_dir;
+    use super::validate_plugin_name;
+    use super::AutoUpdateResult;
+    use super::InstallInfo;
+    use super::AUTO_UPDATE_INTERVAL_SECS;
+
+    use crate::plugin::manifest::read_manifest;
+
+    /// 按 `.install.json` 重新拉取（手动 update 不受节流限制）。
+    pub fn update(name: &str) -> crate::Result<()> {
+        update_at(name, crate::message::now_ts())
+    }
+
+    /// 24h 节流的纯时间判定（goose `should_auto_update`）。
+    pub fn should_auto_update(last_update_check: Option<i64>, now: i64) -> bool {
+        last_update_check.is_none_or(|checked| now - checked >= AUTO_UPDATE_INTERVAL_SECS)
+    }
+
+    /// 扫描用户插件目录，对 `auto_update` 的 git 来源做节流更新。
+    /// 失败也返回在结果里（调用方只 warn，goose 同款）。
+    pub fn auto_update_all(now: i64) -> crate::Result<Vec<AutoUpdateResult>> {
+        let root = user_plugins_dir()?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut dirs: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        let mut results = Vec::new();
+        for dir in dirs {
+            let Ok(info) = read_install_info(&dir) else {
+                continue;
+            };
+            if !info.auto_update || info.commit.is_none() {
+                continue;
+            }
+            if !should_auto_update(info.last_update_check, now) {
+                continue;
+            }
+            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let name = name.to_string();
+            // 先记检查时间再更新：失败也不在每次启动重试。
+            let result = mark_last_update_check(&dir, now).and_then(|()| update_at(&name, now));
+            results.push(AutoUpdateResult { name, result });
+        }
+        Ok(results)
+    }
+
+    /// update 的带时刻实现：手动 update 用真实 now，节流测试注入假 now。
+    pub(super) fn update_at(name: &str, now: i64) -> crate::Result<()> {
+        if name.trim().is_empty() {
+            bail!("plugin name must not be empty");
+        }
+        validate_plugin_name(name)?;
+        let dest = user_plugins_dir()?.join(name);
+        if !dest.is_dir() {
+            bail!("plugin `{name}` is not installed");
+        }
+        let old = read_install_info(&dest)?;
+        if old.commit.is_none() {
+            bail!(
+                "plugin `{name}` was installed from local path `{}` and cannot be updated",
+                old.source
+            );
+        }
+        let staging = Staging::new()?;
+        let commit = fetch_git_commit(&old.source, &staging.path)?;
+        remove_git_dir(&staging.path)?;
+        let manifest = read_manifest(&staging.path)
+            .with_context(|| format!("validate updated plugin `{name}`"))?;
+        if manifest.name != name {
+            staging.cleanup_ok();
+            bail!(
+                "updated plugin name `{}` does not match installed plugin `{name}`",
+                manifest.name
+            );
+        }
+        let info = InstallInfo {
+            commit: Some(commit),
+            last_update_check: Some(now),
+            ..old
+        };
+        place(staging, manifest, &info)?;
+        Ok(())
     }
 }
 
@@ -663,61 +804,22 @@ fn source_display(source: &InstallSource) -> String {
     }
 }
 
-fn remove_git_dir(dir: &Path) -> crate::Result<()> {
-    let git = dir.join(".git");
-    if git.exists() {
-        std::fs::remove_dir_all(&git)?;
-    }
-    Ok(())
-}
-
-/// 递归复制目录树；跳过任意层级的 `.git` 与顶层 `.install.json`
-/// （源可能是先前安装过的目录）。
-///
-/// symlink 契约：源树中**任何**层级的 symlink（指向文件或目录皆同）一律
-/// 显式拒绝并报出路径，既不复制链接本身也不跟随其目标——防止 staging
-/// 借道指向源树外的文件（如 `~/.ssh`）；非目录非文件的特殊文件（fifo、
-/// socket、设备）同样拒绝。
-fn copy_tree(source: &Path, dest: &Path) -> crate::Result<()> {
-    copy_tree_at(source, dest, true)
-}
-
-fn copy_tree_at(source: &Path, dest: &Path, top_level: bool) -> crate::Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == ".git" || (top_level && name == INSTALL_METADATA) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            bail!(
-                "plugin source contains symlink `{}`; symlinks are rejected, not copied",
-                entry.path().display()
-            );
-        }
-        let target = dest.join(name);
-        if file_type.is_dir() {
-            copy_tree_at(&entry.path(), &target, false)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target)?;
-        } else {
-            bail!(
-                "plugin source contains non-regular file `{}`",
-                entry.path().display()
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin::manifest::PLUGIN_SCHEMA_URL;
     use std::sync::MutexGuard;
+    use std::time::SystemTime;
     use tempfile::TempDir;
+
+    use super::acquire::clone_git_repo;
+    use super::acquire::redact_url;
+    use super::acquire::GIT_OUTPUT_CAP_BYTES;
+    use super::metadata::read_install_info;
+    use super::replace::replace_dir;
+    use super::replace::REPLACED_PREFIX;
+    use super::staging::cleanup_stale_staging;
+    use super::staging::STAGING_MAX_AGE;
 
     /// env 隔离约定同 `discovery.rs`（lock_env 串行化进程级变量）。
     /// 本模块数据目录逻辑走 `*_at` 参数化入口测试，特意**不**设
@@ -759,7 +861,11 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) {
-        let output = git_command().current_dir(cwd).args(args).output().unwrap();
+        let output = crate::subprocess::git_command()
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "`git {args:?}` failed: {}",
@@ -865,7 +971,7 @@ mod tests {
         assert!(plugin.root.join("dev.instagent/providers/x.json").is_file());
 
         let expected = {
-            let out = git_command()
+            let out = crate::subprocess::git_command()
                 .current_dir(repo.path())
                 .arg("rev-parse")
                 .arg("HEAD")
@@ -1050,6 +1156,26 @@ mod tests {
             vec!["b".to_string(), "a".to_string()]
         );
         assert!(!list(cwd).unwrap().iter().any(|i| i.enabled));
+    }
+
+    #[test]
+    fn list_reports_disabled_for_explicit_empty_whitelist() {
+        // 15 的残留闭环：显式 `enabledPlugins: []` = 禁用全部（ADR 0003 D5），
+        // list 的 enabled 列不得读成"全部已启用"。
+        let env = isolated();
+        let cwd = env.agents.path();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+
+        std::fs::write(
+            env.config.path().join("settings.json"),
+            r#"{"enabledPlugins":[]}"#,
+        )
+        .unwrap();
+        let items = list(cwd).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].enabled);
+        assert!(!show(cwd, "alpha").unwrap().enabled);
     }
 
     #[test]
@@ -1358,7 +1484,7 @@ mod tests {
         let _fake = fake_git(&hanging_git(dir.path()));
         let dest = TempDir::new().unwrap();
 
-        let token = CancellationToken::new();
+        let token = tokio_util::sync::CancellationToken::new();
         let cancel = token.clone();
         let started = dir.path().join("git.pid");
         std::thread::spawn(move || {
