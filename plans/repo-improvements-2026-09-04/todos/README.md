@@ -24,7 +24,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `07-plugin-install-resilience.md` | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
 | `08-config-provider-validation.md` | P1 | hard | config/provider 字段校验、key 来源实现、schema drift 和 context limit 诊断 |
 | `09-message-contract.md` | P1 | medium | message role/tool id/image 合约与统一边界校验 |
-| `10-mcp-inventory.md` | P1 | medium | MCP 连接部分失败、inventory timeout/cancel、缓存和可见诊断 |
+| `done/10-mcp-inventory.md` ✅ | P1 | medium | MCP 连接部分失败、inventory timeout/cancel、缓存和可见诊断 |
 | `11-agent-event-contract.md` | P2 | medium | event 背压、残缺 stream 和 session hook 错误可见性 |
 | `12-cli-stream-and-e2e.md` | P1 | hard | stdout/stderr 契约、退出码、取消和 CLI/PTY 回归 |
 | `13-parallel-tools.md` | P1 | hard | 只读工具并行、冲突排序、图片/并发预算和取消 |
@@ -48,7 +48,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 7. `07-plugin-install-resilience.md` — 依赖：03、05。
 8. `08-config-provider-validation.md` — 依赖：01。
 9. `09-message-contract.md` — 依赖：01。
-10. `10-mcp-inventory.md` — 依赖：01、05。
+10. `done/10-mcp-inventory.md` ✅ — 完成。connect/list 硬超时、`inventory()` 错误通道不静默空列表、单 server 失败保留健康 source 并产出带 plugin/server 的 note、Registry 清单+route 缓存与 invalidate、mcp.json 1MiB 上限与 headers/command 来源诊断、stdio env 走 D2 baseline（含 PLUGIN_ROOT 环境变量）。依赖：01、05。
 11. `11-agent-event-contract.md` — 依赖：06、09。
 12. `12-cli-stream-and-e2e.md` — 依赖：06、07、10、11。
 13. `13-parallel-tools.md` — 依赖：04、05、06、09、10、11。

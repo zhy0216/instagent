@@ -317,6 +317,135 @@ async fn shutdown_kills_child_and_calls_report_not_connected() {
     panic!("shutdown 后子进程 {pid} 仍存活，kill_on_drop 未生效");
 }
 
+// ---- todo 10：多 server 健壮性 / 超时 / 缓存失效 ----
+
+#[tokio::test]
+async fn one_failed_server_keeps_healthy_sources_with_notes() {
+    let (_tmp, plugin) = plugin_with_mcp_json(
+        r#"{"mcpServers": {
+             "gone": {"type": "stdio", "command": "./no-such-server"},
+             "fixture": {"type": "stdio", "command": "./mcp-fixture-server"}
+           }}"#,
+    );
+    let data = tempfile::TempDir::new().unwrap();
+    let outcome = connect_plugin(&plugin, data.path())
+        .await
+        .expect("单 server 失败不得拖垮同插件其它健康 server");
+    assert_eq!(outcome.sources.len(), 1);
+    assert_eq!(outcome.sources[0].server.name, "fixture");
+    assert_eq!(outcome.notes.len(), 1);
+    let note = &outcome.notes[0];
+    assert!(note.contains("gone"), "note 必须指出失败的 server: {note}");
+    assert!(note.contains("demo"), "note 必须指出 plugin: {note}");
+    assert!(note.contains("no-such-server"), "note 必须带根因: {note}");
+    for source in &outcome.sources {
+        source.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn connect_timeout_bounds_a_server_that_never_finishes_initialize() {
+    // `cat` 会原样回显 initialize 请求但永不发出响应：握手必须被超时切断。
+    let plugin = Plugin {
+        manifest: manifest(),
+        root: std::path::PathBuf::from("/"),
+        source: PluginSource::User,
+    };
+    let server = McpServerConfig {
+        name: "hang".to_string(),
+        r#type: McpServerType::Stdio,
+        command: Some("cat".to_string()),
+        args: vec![],
+        env: Default::default(),
+        cwd: None,
+        url: None,
+        headers: Default::default(),
+    };
+    let start = std::time::Instant::now();
+    let err = McpSource::connect_with(&plugin, &server, Duration::from_millis(500))
+        .await
+        .expect_err("悬死的握手必须超时报错，不得永挂");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "超时必须有上界: {elapsed:?}"
+    );
+    let full = format!("{err:#}");
+    assert!(full.contains("timed out"), "{full}");
+    assert!(full.contains("mcp:demo/hang"), "错误必须指出来源: {full}");
+}
+
+#[tokio::test]
+async fn http_headers_produce_a_visible_note_not_silent_drop() {
+    let (_tmp, plugin) = plugin_with_mcp_json(
+        r#"{"mcpServers": {
+             "remote": {"type": "streamable-http", "url": "http://127.0.0.1:1/mcp",
+                        "headers": {"X-Auth": "whatever"}},
+             "fixture": {"type": "stdio", "command": "./mcp-fixture-server"}
+           }}"#,
+    );
+    let data = tempfile::TempDir::new().unwrap();
+    let outcome = connect_plugin(&plugin, data.path()).await.unwrap();
+    assert_eq!(
+        outcome.sources.len(),
+        1,
+        "refused remote 不影响 healthy fixture"
+    );
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .any(|n| n.contains("header") && n.contains("remote") && n.contains("demo")),
+        "headers 被 v1 忽略必须可见且带来源: {:?}",
+        outcome.notes
+    );
+    for source in &outcome.sources {
+        source.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn registry_surfaces_dead_server_inventory_error_after_invalidate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let source = Arc::new(connect_fixture(tmp.path()).await);
+    let mut registry = Registry::new();
+    registry.register(source.clone());
+
+    assert!(registry
+        .list()
+        .await
+        .iter()
+        .any(|s| s.name == "fixture__echo"));
+    assert!(registry.list_errors().is_empty());
+
+    let pid = source.child_pid().expect("stdio child pid");
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill fixture server");
+
+    // 重连 / 配置变化入口：invalidate 后重新枚举，死 server 的失败以 note 呈现，
+    // 不静默当成"空工具列表"。
+    registry.invalidate();
+    let specs = registry.list().await;
+    assert!(
+        !specs.iter().any(|s| s.name.starts_with("fixture__")),
+        "死 server 的工具不得继续出现在清单里: {specs:?}"
+    );
+    let errors = registry.list_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("mcp:demo/fixture")),
+        "失败 note 必须指出来源 server: {errors:?}"
+    );
+    // 健康路径不受影响：重连一个新进程后 inventory 恢复。
+    drop(source);
+    let revived_dir = tempfile::TempDir::new().unwrap();
+    let revived = connect_fixture(revived_dir.path()).await;
+    let revived_specs = revived.inventory().await.expect("fresh source works");
+    assert!(!revived_specs.is_empty());
+    revived.shutdown().await;
+}
+
 // ---- 与 13 Registry 的接线 ----
 
 #[tokio::test]

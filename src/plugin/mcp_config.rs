@@ -12,6 +12,8 @@
 //! - `url` 与 `headers` 不展开、不承载凭据（远程鉴权 v1 不做）。
 //! - 插件根没有 `mcp.json` 时回退读 `.mcp.json`（goose / Claude Code 草案
 //!   格式，无 `type` 字段按 `stdio` 处理）；两者都没有则返回空列表。
+//! - 读取有大小上限（[`MAX_MCP_CONFIG_BYTES`]），错误诊断带来源文件路径；
+//!   回显进错误里的用户输入（command 等）做截断，防坏配置放大日志。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,6 +24,21 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::plugin::Plugin;
+
+/// `mcp.json` / `.mcp.json` 单次读取的硬上限（1 MiB）：超限直接拒绝解析，
+/// 不让坏文件把整坨内容读进内存或灌进错误日志。
+pub const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// 回显进错误消息里的用户输入的最大字符数，超出截断加省略号。
+const MAX_ECHO_CHARS: usize = 120;
+
+fn brief(value: &str) -> String {
+    let mut out: String = value.chars().take(MAX_ECHO_CHARS).collect();
+    if out.chars().count() < value.chars().count() {
+        out.push('…');
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -74,8 +91,29 @@ struct RawServer {
     cwd: Option<String>,
     #[serde(default)]
     url: Option<String>,
+    /// 先按任意 JSON 收下，逐条校验字符串形状，错误能指到具体 header 名。
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, serde_json::Value>,
+}
+
+/// `headers` 必须是 string → string；坏条目的错误带来源路径、server 与 header 名。
+fn validate_headers(
+    path: &Path,
+    name: &str,
+    headers: &BTreeMap<String, serde_json::Value>,
+) -> crate::Result<BTreeMap<String, String>> {
+    headers
+        .iter()
+        .map(|(key, value)| match value.as_str() {
+            Some(v) => Ok((key.clone(), v.to_string())),
+            None => bail!(
+                "{}: mcp server `{name}` header `{}` must be a string value, got {}",
+                path.display(),
+                brief(key),
+                brief(&value.to_string())
+            ),
+        })
+        .collect()
 }
 
 /// 读插件根下的 `mcp.json`（无则回退 `.mcp.json`，再无则空列表）并展开变量。
@@ -87,14 +125,27 @@ pub fn load_servers(plugin: &Plugin, plugin_data: &Path) -> crate::Result<Vec<Mc
         None => return Ok(Vec::new()),
         Some(pair) => pair,
     };
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text = read_bounded(&path)?;
     let file: RawFile = serde_json::from_str(&text)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     file.mcp_servers
         .into_iter()
         .map(|(name, raw)| expand_server(name, raw, draft, &path, &plugin.root, plugin_data))
         .collect()
+}
+
+/// 带硬上限的配置文件读取：先查 metadata 再读，超限错误指出路径与上限。
+fn read_bounded(path: &Path) -> crate::Result<String> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?
+        .len();
+    if size > MAX_MCP_CONFIG_BYTES {
+        bail!(
+            "{}: mcp config is {size} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
+            path.display()
+        );
+    }
+    fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
 /// 返回 (配置文件路径, 是否草案 `.mcp.json`)；两者都不存在时 `None`。
@@ -132,8 +183,9 @@ fn expand_server(
     for key in raw.env.keys() {
         if key == "PLUGIN_ROOT" || key == "PLUGIN_DATA" {
             bail!(
-                "{}: mcp server `{name}` must not define reserved variable `{key}` in `env`",
-                path.display()
+                "{}: mcp server `{name}` must not define reserved variable `{}` in `env`",
+                path.display(),
+                brief(key)
             );
         }
     }
@@ -161,6 +213,7 @@ fn expand_server(
         McpServerType::Sse => {}
     }
 
+    let headers = validate_headers(path, &name, &raw.headers)?;
     let expand = |value: &str| expand_vars(value, plugin_root, plugin_data);
     Ok(McpServerConfig {
         name,
@@ -175,7 +228,7 @@ fn expand_server(
         cwd: raw.cwd.as_deref().map(|c| PathBuf::from(expand(c))),
         // `url` / `headers` 不参与展开。
         url: raw.url,
-        headers: raw.headers,
+        headers,
     })
 }
 
@@ -190,30 +243,34 @@ fn validate_command(path: &Path, name: &str, command: &str) -> crate::Result<()>
     if command.contains("${") {
         bail!(
             "{}: mcp server `{name}` `command` must not contain variables (no expansion is \
-             performed): `{command}`",
-            path.display()
+             performed): `{}`",
+            path.display(),
+            brief(command)
         );
     }
     if command.chars().any(char::is_whitespace) {
         bail!(
             "{}: mcp server `{name}` `command` must be a single executable name or a `./`-prefixed \
-             plugin-relative path: `{command}`",
-            path.display()
+             plugin-relative path: `{}`",
+            path.display(),
+            brief(command)
         );
     }
     if command.starts_with("./") {
         if command.split('/').any(|seg| seg == "..") {
             bail!(
-                "{}: mcp server `{name}` `command` must not escape the plugin root: `{command}`",
-                path.display()
+                "{}: mcp server `{name}` `command` must not escape the plugin root: `{}`",
+                path.display(),
+                brief(command)
             );
         }
         return Ok(());
     }
     if command.contains('/') {
         bail!(
-            "{}: mcp server `{name}` relative `command` paths must start with `./`: `{command}`",
-            path.display()
+            "{}: mcp server `{name}` relative `command` paths must start with `./`: `{}`",
+            path.display(),
+            brief(command)
         );
     }
     Ok(())
@@ -492,5 +549,53 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         let err = load(dir.path(), data.path()).unwrap_err();
         assert!(err.to_string().contains("Failed to parse"), "{err}");
+        assert!(err.to_string().contains("mcp.json"), "{err}");
+    }
+
+    #[test]
+    fn oversized_config_is_rejected_before_parse() {
+        let padding = "a".repeat(MAX_MCP_CONFIG_BYTES as usize);
+        let json = format!(
+            r#"{{"mcpServers": {{"s": {{"type": "stdio", "command": "srv", "args": ["{padding}]}}}}}}"#
+        );
+        let dir = dir_with_mcp_json(&json);
+        let data = tempfile::TempDir::new().unwrap();
+        let err = load(dir.path(), data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("byte limit"), "{msg}");
+        assert!(msg.contains("mcp.json"), "{msg}");
+        assert!(
+            msg.len() < 2048,
+            "错误消息不能被坏文件内容放大：{} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn invalid_headers_shape_errors_with_source_path() {
+        let dir = dir_with_mcp_json(
+            r#"{"mcpServers": {"h": {"type": "streamable-http", "url": "https://x.invalid/mcp",
+                "headers": {"X-Ok": "v", "X-Bad": 123}}}}"#,
+        );
+        let data = tempfile::TempDir::new().unwrap();
+        let err = load(dir.path(), data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mcp.json"), "{msg}");
+        assert!(msg.contains("header `X-Bad`"), "{msg}");
+        assert!(msg.contains("`h`"), "{msg}");
+    }
+
+    #[test]
+    fn error_echoes_of_user_input_are_bounded() {
+        let long_command = format!("{} ", "x".repeat(500));
+        let dir = dir_with_mcp_json(&format!(
+            r#"{{"mcpServers": {{"s": {{"type": "stdio", "command": "{long_command}"}}}}}}"#
+        ));
+        let data = tempfile::TempDir::new().unwrap();
+        let err = load(dir.path(), data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("single executable"), "{msg}");
+        assert!(msg.contains('…'), "command 回显必须截断: {msg}");
+        assert!(msg.len() < 400, "错误消息过长：{} bytes", msg.len());
     }
 }

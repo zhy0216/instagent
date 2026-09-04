@@ -126,6 +126,8 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
     for plugin in plugins.iter() {
         let data = plugin_data_dir(&plugin.manifest.name)?;
         match connect_plugin(plugin, &data).await {
+            // 部分失败：健康 server 照常注册，失败/sse/headers note 已带
+            // plugin + server 名（`10`），这里补上插件根路径便于定位。
             Ok(outcome) => {
                 notes.extend(outcome.notes);
                 for source in outcome.sources {
@@ -139,8 +141,9 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
                 }
             }
             Err(err) => notes.push(format!(
-                "MCP servers of plugin `{}` failed to start: {err:#}",
-                plugin.manifest.name
+                "MCP servers of plugin `{}` (root `{}`) failed to start: {err:#}",
+                plugin.manifest.name,
+                plugin.root.display()
             )),
         }
     }

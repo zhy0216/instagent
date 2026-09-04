@@ -101,6 +101,13 @@ pub trait ToolSource: Send + Sync {
 
     async fn list(&self) -> Vec<ToolSpec>;
 
+    /// 带可见失败的清单枚举（`10`）：`Err(note)` 表示本次没有拿到可信清单
+    /// （超时 / 断连 / transport 不支持），调用方不得当成"该来源没有工具"。
+    /// note 自带来源标识。默认实现回落到 [`Self::list`]：本地来源不会失败。
+    async fn inventory(&self) -> Result<Vec<ToolSpec>, String> {
+        Ok(self.list().await)
+    }
+
     async fn call(&self, name: &str, input: Value, ctx: &ToolCtx) -> ToolOutput;
 
     async fn shutdown(&self) {}
@@ -120,10 +127,15 @@ struct Routes {
 }
 
 /// 汇总多个来源，按模型可见名路由（名字映射表在实现里，双向且会话内稳定）。
+/// 工具清单与 route 缓存（`10`）：首次 [`Self::list`] 枚举各来源后缓存，
+/// 后续每轮直接命中，不再重复网络枚举；[`Self::invalidate`]（连接 / 配置变化、
+/// 缓存外调用名未命中时的自动重建）令缓存作废。
 #[derive(Default)]
 pub struct Registry {
     pub sources: Vec<Arc<dyn ToolSource>>,
     routes: Mutex<Routes>,
+    cached_specs: Mutex<Option<Vec<ToolSpec>>>,
+    list_errors: Mutex<Vec<String>>,
 }
 
 impl Registry {
@@ -132,18 +144,60 @@ impl Registry {
     }
 
     pub fn register(&mut self, source: Arc<dyn ToolSource>) {
+        self.invalidate();
         self.sources.push(source);
     }
 
+    /// 令工具清单缓存作废（下一次 [`Self::list`] 重新枚举）。连接或配置变化
+    /// 时由装配层调用；会话内新建的 Registry 天然不会命中旧清单。
+    pub fn invalidate(&self) {
+        *self.cached_specs.lock().expect("registry cache lock") = None;
+        *self.routes.lock().expect("registry routes lock") = Routes::default();
+    }
+
+    /// 最近一次枚举中各来源上报的失败 note（超时 / 断连等，note 自带来源
+    /// id）。清单被缓存时 note 一并冻结，随下一次重新枚举刷新。
+    pub fn list_errors(&self) -> Vec<String> {
+        self.list_errors
+            .lock()
+            .expect("registry notes lock")
+            .clone()
+    }
+
     /// 汇总各来源 spec，解决同名冲突（后来者加插件名前缀），再套
-    /// [`model_visible_name`] 生成模型可见名，并刷新双向映射表。
+    /// [`model_visible_name`] 生成模型可见名，刷新双向映射表并缓存结果。
+    /// 来源经 [`ToolSource::inventory`] 上报的失败不进清单、不缓存成"空工具"，
+    /// 收进 [`Self::list_errors`] 并写 warning。
     pub async fn list(&self) -> Vec<ToolSpec> {
+        if let Some(cached) = self
+            .cached_specs
+            .lock()
+            .expect("registry cache lock")
+            .clone()
+        {
+            return cached;
+        }
+        let specs = self.enumerate().await;
+        *self.cached_specs.lock().expect("registry cache lock") = Some(specs.clone());
+        specs
+    }
+
+    async fn enumerate(&self) -> Vec<ToolSpec> {
         let mut specs = Vec::new();
         let mut routes = Routes::default();
+        let mut errors = Vec::new();
 
         for (idx, source) in self.sources.iter().enumerate() {
             let prefix = conflict_prefix(source.id());
-            for spec in source.list().await {
+            let listed = match source.inventory().await {
+                Ok(specs) => specs,
+                Err(note) => {
+                    tracing::warn!("{note}");
+                    errors.push(note);
+                    continue;
+                }
+            };
+            for spec in listed {
                 let mut candidate = spec.name.clone();
                 let mut retry = 0usize;
                 let visible = loop {
@@ -176,6 +230,7 @@ impl Registry {
         }
 
         *self.routes.lock().expect("registry routes lock") = routes;
+        *self.list_errors.lock().expect("registry notes lock") = errors;
         specs
     }
 
@@ -196,6 +251,8 @@ impl Registry {
         if let Some(route) = self.lookup_cached(visible) {
             return Some(route);
         }
+        // 缓存外名字未命中：连接/清单可能已变，作废后重建一次再试。
+        self.invalidate();
         self.list().await;
         self.lookup_cached(visible)
     }
@@ -386,6 +443,162 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.iter().any(|spec| spec.name == "weird_tool_name"));
         assert!(first.iter().any(|spec| spec.name == "shell"));
+    }
+
+    /// 可计数、内容可变的来源：验证缓存与失效。
+    struct CountingSource {
+        id: String,
+        enumerations: std::sync::atomic::AtomicUsize,
+        names: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ToolSource for CountingSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn call(&self, name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput::ok(format!("{}::{name}", self.id))
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            self.enumerations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.names
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|name| ToolSpec {
+                    name: name.clone(),
+                    description: "counting".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    read_only: false,
+                })
+                .collect()
+        }
+    }
+
+    /// inventory 永远失败的来源（模拟超时 / 断连的远端）。
+    struct FailingSource {
+        id: String,
+    }
+
+    #[async_trait]
+    impl ToolSource for FailingSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput::err("dead".to_string())
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn inventory(&self) -> Result<Vec<ToolSpec>, String> {
+            Err(format!("MCP `{}`: list_tools timed out", self.id))
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_caches_inventory_until_invalidated() {
+        let source = Arc::new(CountingSource {
+            id: "mcp:p/srv".to_string(),
+            enumerations: std::sync::atomic::AtomicUsize::new(0),
+            names: Mutex::new(vec!["tool_a".to_string()]),
+        });
+        let mut registry = Registry::new();
+        registry.register(source.clone());
+
+        let first = registry.list().await;
+        assert_eq!(
+            first.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["tool_a"]
+        );
+        let second = registry.list().await;
+        assert_eq!(first, second);
+        assert_eq!(
+            source
+                .enumerations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第二轮必须命中缓存，不重复枚举"
+        );
+
+        // 配置/连接变化后不命中旧 inventory：改内容 → invalidate → 重新枚举。
+        *source.names.lock().unwrap() = vec!["tool_b".to_string()];
+        assert!(
+            registry.list().await.iter().any(|s| s.name == "tool_a"),
+            "未失效前仍走缓存"
+        );
+        registry.invalidate();
+        let after = registry.list().await;
+        assert_eq!(
+            after.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["tool_b"]
+        );
+        assert_eq!(
+            source
+                .enumerations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_keeps_healthy_source_and_reports_inventory_errors() {
+        let mut registry = Registry::new();
+        registry.register(DummySource::new("mcp:p/good", &["ok_tool"]));
+        registry.register(Arc::new(FailingSource {
+            id: "mcp:p/dead".to_string(),
+        }));
+
+        let specs = registry.list().await;
+        assert!(
+            specs.iter().any(|s| s.name == "ok_tool"),
+            "单来源失败不得丢弃其它健康 source 的工具: {specs:?}"
+        );
+        let errors = registry.list_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("mcp:p/dead"), "{}", errors[0]);
+
+        // 缓存命中时失败 note 仍可读出，不被静默清空。
+        assert_eq!(registry.list_errors(), errors);
+    }
+
+    #[tokio::test]
+    async fn registry_call_miss_rebuilds_after_inventory_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let source = Arc::new(CountingSource {
+            id: "mcp:p/live".to_string(),
+            enumerations: std::sync::atomic::AtomicUsize::new(0),
+            names: Mutex::new(vec!["first".to_string()]),
+        });
+        let mut registry = Registry::new();
+        registry.register(source.clone());
+        assert!(registry.list().await.iter().any(|s| s.name == "first"));
+
+        *source.names.lock().unwrap() = vec!["later".to_string()];
+        // 缓存里没有 `later`：call 未命中触发 invalidate + 重建，必须路由成功。
+        let output = registry
+            .call(
+                &ToolCall {
+                    id: "t".to_string(),
+                    name: "later".to_string(),
+                    input: json!({}),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(
+            !output.is_error,
+            "缓存外新工具应触发重建而非 unknown: {}",
+            output.text
+        );
     }
 
     #[tokio::test]
