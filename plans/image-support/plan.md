@@ -4,8 +4,8 @@
 
 让模型能"看见"本地图片：新增内置工具 `read_image`，读取本地图片文件（png /
 jpeg / gif / webp），产出 `Content::Image`（base64 数据 + media type）；图片块随
-会话持久化（JSONL），并在两个 provider 引擎里序列化进请求，多模态模型真正看到
-像素。即 `docs/goose-from-scratch-plan.md` §7 v2 表里的"图片：read_image 工具 +
+会话持久化（JSONL），并在 openai 引擎里序列化进请求，多模态模型真正看到
+像素（anthropic 引擎已按 ADR 0001 移除，本项只做 openai 侧）。即 `docs/goose-from-scratch-plan.md` §7 v2 表里的"图片：read_image 工具 +
 Content::Image"（原估 300 行）。
 
 调研结论（全部来自代码阅读，无凭空设计）：
@@ -17,21 +17,18 @@ Content::Image"（原估 300 行）。
   `execute_calls`（`src/agent/mod.rs:220`）经 `Content::tool_result` 把结果折叠成
   单个块，`finish_turn`（`src/agent/mod.rs:501`）整组落盘——接线点在
   `execute_calls`，`finish_turn` 无需改。
-- 对 `Content` 做穷举匹配的生产代码共三处，都是新变体的必改点：
+- 对 `Content` 做穷举匹配的生产代码共两处，都是新变体的必改点：
   `src/provider/openai.rs:142` `format_messages`、
-  `src/provider/anthropic.rs:176` `format_messages`、
   `src/agent/compact.rs:192` `format_history`。
 - goose 参考（commit `4ad43df`）：
   - `agents/platform_extensions/developer/image.rs`：`MAX_IMAGE_BYTES = 20MB`；
     支持 png/jpeg/gif/webp（`image::guess_format` 按**内容**判格式，不看扩展名）；
     工具结果 = 一条摘要文本 + 一个 image block；
-  - `goose-provider-types/src/images.rs` `convert_image`：两种 wire 形状——
-    OpenAI `{"type":"image_url","image_url":{"url":"data:{mime};base64,{data}"}}`，
-    Anthropic `{"type":"image","source":{"type":"base64","media_type","data"}}`；
+  - `goose-provider-types/src/images.rs` `convert_image`：OpenAI wire 形状
+    `{"type":"image_url","image_url":{"url":"data:{mime};base64,{data}"}}`
+    （Anthropic 形状随 ADR 0001 不再搬运）；
   - `formats/openai.rs`：OpenAI 的 `tool` 角色消息**不能带图片**，goose 在 tool
-    消息里放占位文本、图片挪进紧随其后的 user 消息；
-  - `formats/anthropic.rs`：image block 放进 `tool_result` 的 content 数组；
-    只放行 4 种 media type，其余降级为文本标记。
+    消息里放占位文本、图片挪进紧随其后的 user 消息。
 - 依赖锁定（`todos/01`）：**没有** `base64` / `image` / `mime_guess` crate。
   base64 编码需手写（约 15 行）；格式判定用魔数嗅探（`image::guess_format` 的
   无依赖等价物）。
@@ -40,9 +37,8 @@ Content::Image"（原估 300 行）。
 
 - 新内置工具 `read_image`：读本地文件，20MB 上限（对齐 goose），
   png/jpeg/gif/webp 之外的文件报清晰错误，`read_only = true`。
-- `Content::Image` 新变体：字段对齐 Anthropic image block 的 source
-  （base64 data + media_type），一次编码、两引擎各自映射。
-- 两个引擎都支持序列化图片（判断与理由见"设计决策"表）。
+- `Content::Image` 新变体：base64 data + media_type，一次编码。
+- openai 引擎支持序列化图片（anthropic 引擎已按 ADR 0001 移除，不在本项范围）。
 - 会话不变量（`src/message.rs` 四条）不被破坏；压缩不把 base64 灌进摘要器；
   旧会话文件 100% 可读。
 
@@ -99,11 +95,9 @@ pub enum Content {
 `ToolResult` 要 `tool_use_id/content/is_error`，旧 JSONL 的任何行都不会误配到
 `Image`；`data/media_type` 也不与任何现有字段冲突。
 
-**为什么不把图片塞进 `ToolResult`**（goose anthropic 格式是放进
-`tool_result.content` 数组）：instagent 的 `ToolResult.content` 是 `String`，
-扩成块数组会动会话模型与全部序列化点；而独立 `Image` 块放在同一条 user 消息里，
-Anthropic API 同样接受（user 消息可混排 `tool_result` + `image` 块），OpenAI 侧
-反正必须放 user 消息（见下），一处模型两引擎复用，改动最小。
+**为什么不把图片塞进 `ToolResult`**：instagent 的 `ToolResult.content` 是
+`String`，扩成块数组会动会话模型与全部序列化点；而 OpenAI 的 `tool` 消息本就
+不能带图片（见下），独立 `Image` 块放在同一条 user 消息里改动最小。
 
 ### read_image 工具（新文件 `src/tools/builtin/image.rs` + `builtin/mod.rs` 注册）
 
@@ -152,20 +146,6 @@ if let Some(img) = image {
 - `finish_turn` 原样工作（`results` 非空即整组落盘）。
 - ToolDone 预览 / PostToolUse hook 只经 `output.text`，无需改。
 
-### Anthropic 引擎（`src/provider/anthropic.rs` `format_messages`）
-
-user 消息的块循环加一臂（对齐 goose `convert_image` 的 Anthropic 形状）：
-
-```json
-{ "type": "image",
-  "source": { "type": "base64", "media_type": "image/png", "data": "..." } }
-```
-
-与同消息的 `tool_result` 块并列在 content 数组里（API 接受）。assistant 分支加
-`Content::Image(_) => {}` 忽略臂（模型流不会产出图片，仅保穷举）。
-不做 goose 的 media type 白名单降级——我们只生产 4 种合法类型（MCP 图片是非目标），
-不为不可能出现的输入写防御分支。
-
 ### OpenAI 引擎（`src/provider/openai.rs` `format_messages`）
 
 关键约束（调研所得）：**OpenAI `tool` 角色消息只能带字符串**。图片只能进 user
@@ -178,12 +158,13 @@ user 消息的块循环加一臂（对齐 goose `convert_image` 的 Anthropic �
   （goose `convert_image` OpenAI 形状）；只有图片没有文本时也发该 user 消息。
 - 顺序仍是 `results（tool 消息）→ user 消息`，怪癖 3（tool 消息紧跟 assistant）
   不被破坏。
-- assistant 分支同样加 `Content::Image(_) => {}` 忽略臂。
+- assistant 分支加 `Content::Image(_) => {}` 忽略臂（模型流不会产出图片，仅保穷举）。
+- 不做 media type 白名单降级——我们只生产 4 种合法类型（MCP 图片是非目标），
+  不为不可能出现的输入写防御分支。
 
-**两个引擎都支持**（而不是只做其一）：anthropic 引擎是原生形状零成本；openai
-引擎服务 openai/ollama/openrouter/deepseek 一大票网关，`image_url` data URL 是
-Chat Completions 标准形状，改动集中在一个函数的一个分支。只做一个引擎会把
-"会话里含图片"变成引擎相关行为（切 provider 就丢图或报错），不值得。
+openai 引擎服务 openai/ollama/openrouter/deepseek 一大票网关，`image_url` data
+URL 是 Chat Completions 标准形状，改动集中在一个函数的一个分支。
+anthropic 引擎已移除（ADR 0001），将来若恢复原生引擎再补映射。
 
 ### 压缩（`src/agent/compact.rs` `format_history`）
 
@@ -210,18 +191,17 @@ Chat Completions 标准形状，改动集中在一个函数的一个分支。只
 
 ## 拆解
 
-任务队列（依赖列"无"即可并行；总量约 340 行，对齐原表"约 300 行"）：
+任务队列（依赖列"无"即可并行；总量约 315 行，对齐原表"约 300 行"）：
 
 | # | 任务 | 依赖 | 涉及文件 | 估算 |
 |---|---|---|---|---|
 | 1 | 数据模型：`ImageData`、`ToolOutput.image`、`Content::Image` + serde round-trip 测试 | 无 | `src/tools/mod.rs`、`src/message.rs` | ~40 行 |
 | 2 | `read_image` 工具：base64 编码器、魔数嗅探、读取/校验/错误、spec 与分发注册、既有 5 工具测试改 6 | 1 | 新文件 `src/tools/builtin/image.rs`，`src/tools/builtin/mod.rs` | ~200 行 |
 | 3 | loop 接线：`execute_calls` 拆出 Image 块 + loop 级测试（read_image 成功后会话含 Image、不变量校验通过） | 1 | `src/agent/mod.rs` | ~35 行 |
-| 4 | Anthropic 引擎序列化 + 测试（image 块形状、与 tool_result 同消息共存） | 1 | `src/provider/anthropic.rs` | ~25 行 |
-| 5 | OpenAI 引擎序列化 + 测试（含图时 content 数组形状、无图时行为不变、怪癖 3 顺序保持） | 1 | `src/provider/openai.rs` | ~35 行 |
-| 6 | `format_history` 图片占位 + 测试（base64 不进摘要文本） | 1 | `src/agent/compact.rs` | ~12 行 |
+| 4 | OpenAI 引擎序列化 + 测试（含图时 content 数组形状、无图时行为不变、怪癖 3 顺序保持） | 1 | `src/provider/openai.rs` | ~35 行 |
+| 5 | `format_history` 图片占位 + 测试（base64 不进摘要文本） | 1 | `src/agent/compact.rs` | ~12 行 |
 
-执行顺序：1 先行，2–6 五路可并行。任务 2 的测试夹具用 1x1 PNG（68 字节，
+执行顺序：1 先行，2–5 四路可并行。任务 2 的测试夹具用 1x1 PNG（68 字节，
 与 goose `image.rs` 测试同一张，其 base64 即
 `iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=`），
 字节数组与 base64 串双双硬编码为常量做已知答案测试，**不需要解码器**。
@@ -232,14 +212,12 @@ Chat Completions 标准形状，改动集中在一个函数的一个分支。只
 
 ## 校验
 
-仓库级命令（每个任务完成后全部执行；anthropic 引擎在 feature 后，需两步）：
+仓库级命令（每个任务完成后全部执行）：
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo clippy --all-targets --features anthropic-engine -- -D warnings
-cargo test --features anthropic-engine
 ```
 
 各组新增测试的验收方式：
@@ -253,30 +231,22 @@ cargo test --features anthropic-engine
   的 `read_image` 端到端（真实临时文件）。
 - **任务 3**：`execute_calls` 后 user 消息 = `[ToolResult, Image]` 且
   `message::validate` 通过；无图片的工具调用行为逐字不变。
-- **任务 4**：`format_messages` 输出含
-  `{"type":"image","source":{"type":"base64",...}}`，与 `tool_result` 同在一
-  条 user 消息；`validate` 过的完整对话端到端（沿用现有
-  `wiremock_request_body_wellformed_end_to_end` 风格）。
-- **任务 5**：含图 user 消息 → `content` 是数组（text + `image_url` data URL）；
+- **任务 4**：含图 user 消息 → `content` 是数组（text + `image_url` data URL）；
   无图 → 与现有 `quirk3_*` 断言逐字一致（回归）；`tool` 消息仍紧跟 assistant。
-- **任务 6**：`format_history` 对含图历史输出占位、**不含** base64 子串
+- **任务 5**：`format_history` 对含图历史输出占位、**不含** base64 子串
   （断言 `!history.contains(&img.data)`）。
 
-最终验收：五条命令全绿 + 既有 273+ 测试零回归。
+最终验收：三条命令全绿 + 既有测试零回归。
 
 ## 风险与假设
 
-- **假设**：Anthropic API 接受 image 块与 tool_result 块在同一条 user 消息并列。
-  依据：goose 把图片放进 `tool_result.content` 数组，API 文档同样允许 user 消息
-  混排 image 块；若实测被拒，退路是序列化时把图片并入对应 `tool_result` 的
-  content 数组（只动 `anthropic.rs` 一处，模型不变）。
 - **风险**：旧二进制读含图片的新会话，第一张图片之后的历史被 salvage 丢弃
   （单向升级代价，已述）。
 - **风险**：会话文件体积膨胀（20MB 图 ≈ 27MB 行）；`/compact` 后图片消失只留
   占位描述。均为已知取舍。
-- **风险**：Anthropic 单图实际限制约 5MB，20MB 上限沿用 goose，超大图会得到
-  provider 400——错误经现有 `map_http_error` 正常呈现，不特判。
-- **假设**：不支持视觉的模型收到 `image_url` / image 块会报错而非静默忽略；
+- **风险**：各家网关单图限制不一（OpenAI data URL 约 10MB 量级），20MB 上限沿用
+  goose，超大图会得到 provider 400——错误经现有 `map_http_error` 正常呈现，不特判。
+- **假设**：不支持视觉的模型收到 `image_url` 会报错而非静默忽略；
   不做能力探测（非目标），报错即反馈。
 - **假设**：MCP / command 插件工具不产出图片（`ToolOutput.image` 恒 None）；
   其图片支持需要 rmcp `ContentBlock::Image` 的搬运，另开任务。
