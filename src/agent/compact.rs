@@ -340,6 +340,38 @@ mod tests {
     }
 
     #[test]
+    fn images_become_placeholders_never_base64_in_history() {
+        let mut data = String::new();
+        for byte in 0..255u8 {
+            data.push_str(&format!("{byte:02x}"));
+        }
+        let img = crate::tools::ImageData {
+            data,
+            media_type: "image/png".into(),
+        };
+        let len = img.data.len();
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "read_image ok".into(),
+                    is_error: false,
+                },
+                Content::Image(img.clone()),
+            ],
+            ts: 0,
+            usage: None,
+        }];
+        let out = format_history(&messages);
+        assert!(
+            out.contains(&format!("[image: image/png, {len} base64 bytes omitted]")),
+            "{out}"
+        );
+        assert!(!out.contains(&img.data));
+    }
+
+    #[test]
     fn split_head_tail_keeps_only_unanswered_trailing_user() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = Session {

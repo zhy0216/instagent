@@ -11,7 +11,7 @@
 | 02-read-image-tool.md | P1 | hard | 新工具 `read_image`：手写 base64、魔数嗅探、错误文案、注册与端到端测试 |
 | 03-loop-wiring.md | P1 | medium | `execute_calls` 把 `output.image` 拆成同消息 `Image` 块 + loop 级测试 |
 | 04-openai-serialization.md | P1 | medium | `format_messages` user 分支含图时改 parts 数组（data URL）+ 回归测试 |
-| 05-compact-placeholder.md | P2 | easy | `format_history` 图片占位文案最终化 + "base64 不进摘要" 测试 |
+| done/05-compact-placeholder.md ✅ | P2 | easy | `format_history` 图片占位文案最终化 + "base64 不进摘要" 测试 |
 
 ## 文件
 
@@ -19,7 +19,7 @@
 2. `02-read-image-tool.md` — 依赖 01。可与 03/04/05 并行。
 3. `03-loop-wiring.md` — 依赖 01。可与 02/04/05 并行。
 4. `04-openai-serialization.md` — 依赖 01。可与 02/03/05 并行。
-5. `05-compact-placeholder.md` — 依赖 01。可与 02/03/04 并行。
+5. `done/05-compact-placeholder.md` ✅ — 完成。占位臂文案与方案一致，`split_head_tail` 无需改动，新增 "base64 不进摘要" 测试。
 
 并行说明：01 落地后，02–05 各自只改互不相交的文件
 （`builtin/image.rs`+`builtin/mod.rs` / `agent/mod.rs` / `provider/openai.rs` /
