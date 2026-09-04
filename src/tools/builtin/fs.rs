@@ -4,11 +4,24 @@
 //! （commit `4ad43df`）的 `string_replace` / `count_lines_before` /
 //! `get_line_context` / `find_similar_context` / `build_file_preview`
 //! 与 `resolve_path` 精简搬运（本文件标注处注明）。
+//!
+//! 安全边界（ADR 0003 D6）：强制隔离层是外部 sandbox，本文件只承诺这些
+//! 应用层纵深防御——**最终目标** symlink 拒绝写入、读/写字节上限、取消检查。
+//! 中间路径 symlink 与绝对路径按当前语义解析（相对路径按会话目录），
+//! `write linkdir/file` 可经 cwd 内的链接写到外部；这是 sandbox 的责任面，
+//! 不要把这些工具描述成"路径安全"。全路径 containment 走 RM5 另立决策。
+//!
+//! 阻塞模型（计划 R1）：所有同步文件系统操作经 [`spawn_tool`] 放到
+//! tokio blocking 线程池，不占 current-thread runtime 的事件循环；
+//! 长循环按行/按块检查取消令牌。
 
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
@@ -16,8 +29,72 @@ use crate::tools::ToolOutput;
 /// read 默认最多 2000 行。
 pub const READ_DEFAULT_LIMIT: u32 = 2000;
 
-/// read 拒绝超过此字节数的文件。
+/// read / edit 拒绝超过此字节数的文件。
 pub const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
+
+/// write 拒绝超过此字节数的内容（计划 R9：write 不再接受无界模型内容）。
+pub const MAX_WRITE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// read 循环中取消检查的行间隔（上界 = 4096 行或剩余字节上限的读取时间）。
+const READ_CANCEL_CHECK_LINES: usize = 4096;
+
+/// 统一的取消输出：工具层把"被取消"报告为带路径的可诊断错误。
+pub fn cancelled_output(path: &Path) -> ToolOutput {
+    ToolOutput::err(format!("cancelled: {}", path.display()))
+}
+
+/// 把阻塞的工具逻辑放到 tokio blocking 线程池（计划 R1：同步文件系统、
+/// 目录遍历等移出 current-thread async 路径）。blocking 任务异常终止时
+/// 返回可诊断错误而不是 panic。
+pub async fn spawn_tool<F>(work: F) -> ToolOutput
+where
+    F: FnOnce() -> ToolOutput + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(out) => out,
+        Err(err) => ToolOutput::err(format!("tool task aborted: {err}")),
+    }
+}
+
+/// 超限文案统一格式（带路径、实际大小、上限）。
+fn too_large_message(path: &Path, len: u64, limit: u64) -> String {
+    format!(
+        "Failed to read {}: file too large ({} bytes, limit {} bytes); use shell tools (head/grep) to inspect it",
+        path.display(),
+        len,
+        limit
+    )
+}
+
+/// 有界整读（计划 R9）：metadata 预检 + `take(MAX+1)` 读后兜底。
+/// 兜底针对 metadata/read 增长竞态——文件在预检通过后继续增长时，
+/// 最多读 `MAX_READ_BYTES + 1` 字节就报错，而不是无界读入内存。
+fn read_capped_text(full: &Path) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("Failed to read {}: {e}", full.display());
+    let meta = std::fs::metadata(full).map_err(fail)?;
+    if meta.len() > MAX_READ_BYTES {
+        return Err(too_large_message(full, meta.len(), MAX_READ_BYTES));
+    }
+    let file = std::fs::File::open(full).map_err(fail)?;
+    let mut buf = Vec::new();
+    file.take(MAX_READ_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(fail)?;
+    if buf.len() as u64 > MAX_READ_BYTES {
+        return Err(format!(
+            "Failed to read {}: file grew past {} bytes during read (limit {} bytes)",
+            full.display(),
+            MAX_READ_BYTES,
+            MAX_READ_BYTES
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| {
+        format!(
+            "Failed to read {}: not valid UTF-8 (binary file?)",
+            full.display()
+        )
+    })
+}
 
 /// 无匹配时给的文件预览行数（goose edit.rs:8）。
 const NO_MATCH_PREVIEW_LINES: usize = 20;
@@ -41,10 +118,6 @@ pub async fn read_file(
     limit: Option<u32>,
     ctx: &ToolCtx,
 ) -> ToolOutput {
-    let full = resolve_path(path, &ctx.cwd);
-    let fail =
-        |e: std::io::Error| ToolOutput::err(format!("Failed to read {}: {e}", full.display()));
-
     if line == Some(0) {
         return ToolOutput::err(
             "`line` is 1-based, got line=0; use line=1 for the first line".to_string(),
@@ -55,20 +128,31 @@ pub async fn read_file(
             "`limit` must be positive, got limit=0; omit it for the default window".to_string(),
         );
     }
+    let full = resolve_path(path, &ctx.cwd);
+    let cancel = ctx.cancel.clone();
+    spawn_tool(move || read_file_sync(&full, line, limit, &cancel)).await
+}
 
-    let meta = match std::fs::metadata(&full) {
+fn read_file_sync(
+    full: &Path,
+    line: Option<u32>,
+    limit: Option<u32>,
+    cancel: &CancellationToken,
+) -> ToolOutput {
+    if cancel.is_cancelled() {
+        return cancelled_output(full);
+    }
+    let fail =
+        |e: std::io::Error| ToolOutput::err(format!("Failed to read {}: {e}", full.display()));
+
+    let meta = match std::fs::metadata(full) {
         Ok(meta) => meta,
         Err(e) => return fail(e),
     };
     if meta.len() > MAX_READ_BYTES {
-        return ToolOutput::err(format!(
-            "Failed to read {}: file too large ({} bytes, limit {} bytes); use shell tools (head/grep) to inspect it",
-            full.display(),
-            meta.len(),
-            MAX_READ_BYTES
-        ));
+        return ToolOutput::err(too_large_message(full, meta.len(), MAX_READ_BYTES));
     }
-    let file = match std::fs::File::open(&full) {
+    let file = match std::fs::File::open(full) {
         Ok(file) => file,
         Err(e) => return fail(e),
     };
@@ -77,14 +161,26 @@ pub async fn read_file(
     let count = limit.unwrap_or(READ_DEFAULT_LIMIT) as usize;
     let mut text = String::new();
     let mut total = 0usize;
+    let mut bytes_seen = 0u64;
+    let mut grew_past_limit = false;
     for (i, line) in BufReader::new(file).lines().enumerate() {
-        total = i + 1;
+        if i % READ_CANCEL_CHECK_LINES == 0 && cancel.is_cancelled() {
+            return cancelled_output(full);
+        }
         let file_line = match line {
             Ok(line) => line,
             Err(e) => return fail(e),
         };
+        total = i + 1;
+        bytes_seen = bytes_seen.saturating_add(file_line.len() as u64 + 1);
         if i >= start && i - start < count {
             text.push_str(&format!("{:>4}: {}\n", i + 1, file_line));
+        }
+        // metadata/read 增长竞态：metadata 预检通过后文件又增长时及时止损，
+        // 不把无界增长的行一直数下去。
+        if bytes_seen > MAX_READ_BYTES {
+            grew_past_limit = true;
+            break;
         }
     }
 
@@ -97,7 +193,11 @@ pub async fn read_file(
             start + 1
         ));
     }
-    if total > start + count {
+    if grew_past_limit {
+        text.push_str(&format!(
+            "... (stopped: file grew past {MAX_READ_BYTES} bytes during read; total line count is incomplete)\n"
+        ));
+    } else if total > start + count {
         text.push_str(&format!("... ({} more lines)\n", total - start - count));
     }
     ToolOutput::ok(text)
@@ -134,10 +234,27 @@ fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
     }
 }
 
-/// 建父目录，原子覆盖写。
+/// 建父目录，原子覆盖写。内容有 [`MAX_WRITE_BYTES`] 上限（计划 R9）。
 pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);
-    if let Some(out) = reject_symlink(&full) {
+    let content = content.to_string();
+    let cancel = ctx.cancel.clone();
+    spawn_tool(move || write_file_sync(&full, &content, &cancel)).await
+}
+
+fn write_file_sync(full: &Path, content: &str, cancel: &CancellationToken) -> ToolOutput {
+    if cancel.is_cancelled() {
+        return cancelled_output(full);
+    }
+    if content.len() as u64 > MAX_WRITE_BYTES {
+        return ToolOutput::err(format!(
+            "Failed to write {}: content too large ({} bytes, limit {} bytes)",
+            full.display(),
+            content.len(),
+            MAX_WRITE_BYTES
+        ));
+    }
+    if let Some(out) = reject_symlink(full) {
         return out;
     }
     if let Some(parent) = full.parent() {
@@ -148,7 +265,7 @@ pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput
             ));
         }
     }
-    match atomic_write(&full, content) {
+    match atomic_write(full, content) {
         Ok(()) => ToolOutput::ok(format!(
             "Wrote {} bytes to {}",
             content.len(),
@@ -159,19 +276,38 @@ pub async fn write_file(path: &Path, content: &str, ctx: &ToolCtx) -> ToolOutput
 }
 
 /// `before` 必须唯一精确匹配，否则报错并给出匹配次数和相近上下文；
-/// `after` 为空即删除。写回走原子替换。
+/// `after` 为空即删除。写回走原子替换。整读经 [`read_capped_text`]
+/// 受 [`MAX_READ_BYTES`] 约束（此前无上限，计划 R9）。
 pub async fn edit_file(path: &Path, before: &str, after: &str, ctx: &ToolCtx) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);
-    if let Some(out) = reject_symlink(&full) {
+    let before = before.to_string();
+    let after = after.to_string();
+    let cancel = ctx.cancel.clone();
+    spawn_tool(move || edit_file_sync(&full, &before, &after, &cancel)).await
+}
+
+fn edit_file_sync(
+    full: &Path,
+    before: &str,
+    after: &str,
+    cancel: &CancellationToken,
+) -> ToolOutput {
+    if cancel.is_cancelled() {
+        return cancelled_output(full);
+    }
+    if let Some(out) = reject_symlink(full) {
         return out;
     }
-    let content = match std::fs::read_to_string(&full) {
+    let content = match read_capped_text(full) {
         Ok(content) => content,
-        Err(e) => return ToolOutput::err(format!("Failed to read {}: {e}", full.display())),
+        Err(message) => return ToolOutput::err(message),
     };
+    if cancel.is_cancelled() {
+        return cancelled_output(full);
+    }
 
     match string_replace(&content, before, after) {
-        Ok(new_content) => match atomic_write(&full, &new_content) {
+        Ok(new_content) => match atomic_write(full, &new_content) {
             Ok(()) => {
                 let old_lines = content.lines().count();
                 let new_lines = new_content.lines().count();
@@ -541,6 +677,106 @@ mod tests {
         assert_eq!(
             resolve_path(Path::new("/x/y"), Path::new("/a")),
             PathBuf::from("/x/y")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_oversized_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "a".repeat(MAX_WRITE_BYTES as usize + 1);
+
+        let out = write_file(Path::new("big.txt"), &content, &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("content too large"), "{}", out.text);
+        assert!(!dir.path().join("big.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("huge.txt");
+        let f = std::fs::File::create(&file).unwrap();
+        // 稀疏文件：metadata 报告超大长度，整读前就被字节上限拦截。
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+
+        let out = edit_file(&file, "x", "y", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("too large"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_non_utf8_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bin.dat");
+        std::fs::write(&file, [0xffu8, 0xfe, 0x00]).unwrap();
+
+        let out = edit_file(&file, "x", "y", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("not valid UTF-8"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_precancelled_returns_cancelled_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let ctx = ToolCtx {
+            cwd: dir.path().to_path_buf(),
+            cancel: token,
+        };
+
+        let out = read_file(Path::new("a.txt"), None, None, &ctx).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("cancelled"), "{}", out.text);
+    }
+
+    /// 取消上界验证：32MB / 1M 行的文件，中途取消后必须在可测上界内返回。
+    #[tokio::test]
+    async fn read_cancellation_returns_within_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.txt");
+        let line = "a".repeat(31) + "\n"; // 32 字节/行
+        let content = line.repeat((MAX_READ_BYTES as usize) / 32);
+        std::fs::write(&file, content).unwrap();
+
+        let token = CancellationToken::new();
+        let ctx = ToolCtx {
+            cwd: dir.path().to_path_buf(),
+            cancel: token.clone(),
+        };
+        let handle =
+            tokio::spawn(async move { read_file(Path::new("big.txt"), None, None, &ctx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let start = std::time::Instant::now();
+        let out = handle.await.unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("read cancellation took {elapsed:?}");
+
+        assert!(out.is_error);
+        assert!(out.text.contains("cancelled"), "{}", out.text);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "取消应在可测上界内生效: {elapsed:?}"
+        );
+    }
+
+    /// ADR 0003 D6 显式非保证：中间路径 symlink 不做 containment，
+    /// `write linkdir/file` 会跟随 cwd 内的链接写到外部（隔离由 sandbox 负责）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_follows_intermediate_symlink_per_adr_d6() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = dir.path().join("linkdir");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let out = write_file(Path::new("linkdir/f.txt"), "escaped", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("f.txt")).unwrap(),
+            "escaped"
         );
     }
 }

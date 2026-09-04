@@ -4,9 +4,19 @@
 //! 的 `MAX_IMAGE_BYTES` / `ensure_image_size` / `read_bounded`；摘要文案是其
 //! `LoadedImage::summary` 去掉宽高；格式判定用魔数嗅探（`image::guess_format`
 //! 的无依赖等价物，不看扩展名）；base64 手写（依赖锁定，不加 base64 crate）。
+//!
+//! 校验边界（计划 S14 / todo 04）：短期只做魔数 MIME 判定、长度与
+//! [`MAX_IMAGE_BYTES`] payload 预算（含 `take(MAX+1)` 读后兜底防御
+//! metadata/read 增长竞态）；结构化解码与像素/压缩炸弹预算属于 RM2，
+//! 不在本任务引入未批准的 decoder 依赖。摘要文本带原始字节数与 base64
+//! 负载字节数，为后续 agent/provider 层落实单请求/单会话图片总预算
+//! （计划 S15 / todo 13）提供工具层可观测的大小信息。阻塞读取经
+//! [`super::fs::spawn_tool`] 移出 current-thread async 路径（计划 R1）。
 
 use std::io::Read;
 use std::path::Path;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::tools::ImageData;
 use crate::tools::ToolCtx;
@@ -68,10 +78,18 @@ fn too_large(len: u64) -> ToolOutput {
 /// 对齐 goose `read_bounded`），魔数嗅探判格式，产出 `ToolOutput.image`。
 pub async fn read_image(path: &Path, ctx: &ToolCtx) -> ToolOutput {
     let full = fs::resolve_path(path, &ctx.cwd);
+    let cancel = ctx.cancel.clone();
+    fs::spawn_tool(move || read_image_sync(&full, &cancel)).await
+}
+
+fn read_image_sync(full: &Path, cancel: &CancellationToken) -> ToolOutput {
+    if cancel.is_cancelled() {
+        return fs::cancelled_output(full);
+    }
     let fail =
         |e: std::io::Error| ToolOutput::err(format!("Failed to read {}: {e}", full.display()));
 
-    let len = match std::fs::metadata(&full) {
+    let len = match std::fs::metadata(full) {
         Ok(meta) => meta.len(),
         Err(e) => return fail(e),
     };
@@ -79,7 +97,7 @@ pub async fn read_image(path: &Path, ctx: &ToolCtx) -> ToolOutput {
         return too_large(len);
     }
 
-    let file = match std::fs::File::open(&full) {
+    let file = match std::fs::File::open(full) {
         Ok(file) => file,
         Err(e) => return fail(e),
     };
@@ -97,13 +115,15 @@ pub async fn read_image(path: &Path, ctx: &ToolCtx) -> ToolOutput {
         );
     };
 
+    let data = b64(&bytes);
     let mut out = ToolOutput::ok(format!(
-        "Loaded image from {} ({} bytes, {media_type}).",
+        "Loaded image from {} ({} bytes, {media_type}, {} bytes base64).",
         full.display(),
-        bytes.len()
+        bytes.len(),
+        data.len()
     ));
     out.image = Some(ImageData {
-        data: b64(&bytes),
+        data,
         media_type: media_type.to_string(),
     });
     out
@@ -200,9 +220,11 @@ mod tests {
         assert_eq!(
             out.text,
             format!(
-                "Loaded image from {} (68 bytes, image/png).",
-                file.display()
-            )
+                "Loaded image from {} (68 bytes, image/png, {} bytes base64).",
+                file.display(),
+                PNG_1X1_B64.len()
+            ),
+            "摘要带原始字节数与 base64 负载字节数（供后续总预算任务观测）"
         );
         let image = out.image.expect("image payload");
         assert_eq!(image.media_type, "image/png");
@@ -266,5 +288,38 @@ mod tests {
                 MAX_IMAGE_BYTES + 1
             )
         );
+    }
+
+    #[tokio::test]
+    async fn read_image_rejects_truncated_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        // 只有 2 个字节的前缀：不够任何魔数，按内容拒绝。
+        std::fs::write(dir.path().join("trunc.png"), [0x89u8, 0x50]).unwrap();
+
+        let out = call_read_image(&registry(), &ctx(dir.path()), "trunc.png").await;
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("unsupported image format"),
+            "{}",
+            out.text
+        );
+        assert!(out.image.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_image_precancelled_returns_cancelled_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), PNG_1X1).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let ctx = ToolCtx {
+            cwd: dir.path().to_path_buf(),
+            cancel: token,
+        };
+
+        let out = call_read_image(&registry(), &ctx, "a.png").await;
+        assert!(out.is_error);
+        assert!(out.text.contains("cancelled"), "{}", out.text);
+        assert!(out.image.is_none());
     }
 }

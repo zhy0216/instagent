@@ -18,7 +18,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/01-policy-decisions.md` ✅ | P1 | medium | 固化密钥、环境、hook、CLI 流和 settings 语义，以及 sandbox 责任边界 |
 | `done/02-session-boundary.md` ✅ | P1 | medium | session id、坏尾部 salvage、权限、耐久性和 `last` 选择 |
 | `done/03-settings-atomic-merge.md` ✅ | P1 | medium | settings / 安装元数据原子私有写入、tri-state 合并和本地配置忽略 |
-| `04-file-tool-budgets.md` | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
+| `done/04-file-tool-budgets.md` ✅ | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
 | `done/05-subprocess-collector.md` ✅ | P1 | medium | 进程输出上限、增量 UTF-8 和无 pipe 配置错误 |
 | `06-process-tool-isolation.md` | P1 | hard | shell/command/hooks 的 bounded output、argv/env 隔离和 hook 策略 |
 | `07-plugin-install-resilience.md` | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
@@ -42,7 +42,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 1. `done/01-policy-decisions.md` ✅ — 完成。ADR 0003 落地六项决策（D1–D6），解锁所有策略相关实现。
 2. `done/02-session-boundary.md` ✅ — 完成。validate_session_id 白名单、salvage 原子写回+有界时间戳备份、0700/0600 权限、rename 失败清理、list/`last` 诊断跳过。
 3. `03-settings-atomic-merge.md` — 依赖：01。
-4. `04-file-tool-budgets.md` — 依赖：01。
+4. `done/04-file-tool-budgets.md` ✅ — 完成。fs/tree/skills/image 阻塞逻辑移入 `spawn_blocking` 并按行/按块检查取消；tree 增加 entries/字节/输出/深度/时间五预算与结构化截断 note（`depth=0` 受内部深度兜底）；read/edit/write 与 skill 文件设字节上限（metadata 预检 + `take(MAX+1)` 兜底增长竞态）；skill description 强制非空、supporting file 明确 no-follow；image 摘要带 base64 负载大小供后续总预算观测（新增 22 测试，取消耗时实测 ≤0.5ms）。
 5. `done/05-subprocess-collector.md` ✅ — 完成。`run_bounded` 硬上限 collector（越限杀组、保留摘要、增量 UTF-8），`wait_and_drain` 无 pipe 改带上下文错误。
 6. `06-process-tool-isolation.md` — 依赖：01、05。
 7. `07-plugin-install-resilience.md` — 依赖：03、05。

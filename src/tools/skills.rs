@@ -5,9 +5,18 @@
 //! 发现范围：每个启用插件的 `skills/`（只看一层子目录，含 `SKILL.md` 的子目录
 //! 是一个 skill，不递归）+ `~/.agents/skills/` + `<project>/.agents/skills/`。
 //! 插件里的 skill 命名 `<plugin>:<skill>`（goose `namespaced_component_name`）。
-//! frontmatter 按 Agent Skills 规范校验，无效 skill 跳过不报错（warn 日志）。
+//! frontmatter 按 Agent Skills 规范校验（description 必须非空），无效 skill
+//! 跳过不报错（warn 日志）。
+//!
+//! 资源与路径边界（计划 S10 / todo 04）：SKILL.md 与 supporting file 均受
+//! [`MAX_SKILL_FILE_BYTES`] 单文件上限（metadata 预检 + `take(MAX+1)` 读后
+//! 兜底增长竞态）；supporting file 明确 **no-follow**——目标本身是符号链接
+//! 时拒绝读取（这是纵深防御，不是 containment 承诺，见 ADR 0003 D6：
+//! 路径组件仍按字面解析，隔离由外部 sandbox 负责）。调用时读取经
+//! [`builtin_fs::spawn_tool`] 移出 current-thread async 路径并检查取消。
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,10 +27,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::plugin::discovery::agents_dir;
 use crate::plugin::manifest::namespaced_component_name;
 use crate::plugin::PluginSet;
+use crate::tools::builtin::fs as builtin_fs;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
 use crate::tools::ToolSource;
@@ -30,12 +41,16 @@ use crate::tools::ToolSpec;
 /// `description` 上限（Agent Skills 规范）。
 pub const MAX_DESCRIPTION_CHARS: usize = 1024;
 
+/// SKILL.md 与 supporting file 的单文件字节上限；超限在边界报可诊断错误，
+/// 发现阶段则跳过该 skill（warn 日志）。
+pub const MAX_SKILL_FILE_BYTES: u64 = 1024 * 1024;
+
 /// SKILL.md frontmatter（Agent Skills 规范）。`allowed-tools` 等未知字段忽略。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillFrontmatter {
     /// 必需，1~64，小写字母数字和 `-`，必须等于目录名。
     pub name: String,
-    /// 必需，≤1024。
+    /// 必需，非空，≤1024。
     pub description: String,
     #[serde(default)]
     pub license: Option<String>,
@@ -112,8 +127,9 @@ fn scan_skills_root(
             None => continue,
         };
         let path = dir.join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue; // 没有 SKILL.md 的普通子目录直接跳过，不算无效
+        // 有界读取：缺文件与超上限都跳过（没有 SKILL.md 的普通子目录不算无效）。
+        let Ok(text) = read_skill_file(&path) else {
+            continue;
         };
         let name = namespace.map_or_else(
             || dir_name.clone(),
@@ -147,6 +163,9 @@ fn validate_skill(text: &str, dir_name: &str) -> crate::Result<SkillFrontmatter>
     }
     if frontmatter.name != dir_name {
         bail!("name `{}` 与目录名 `{dir_name}` 不一致", frontmatter.name);
+    }
+    if frontmatter.description.trim().is_empty() {
+        bail!("description 不能为空");
     }
     if frontmatter.description.chars().count() > MAX_DESCRIPTION_CHARS {
         bail!(
@@ -212,7 +231,7 @@ impl ToolSource for SkillsSource {
         }]
     }
 
-    async fn call(&self, name: &str, input: Value, _ctx: &ToolCtx) -> ToolOutput {
+    async fn call(&self, name: &str, input: Value, ctx: &ToolCtx) -> ToolOutput {
         if name != "load_skill" {
             return ToolOutput::err(format!("unknown tool: {name}"));
         }
@@ -229,18 +248,55 @@ impl ToolSource for SkillsSource {
         let Some(skill) = self.find(skill_name) else {
             return ToolOutput::err(format!("Unknown skill: {skill_name}"));
         };
+        let root = skill.root.clone();
+        let cancel = ctx.cancel.clone();
         match file {
-            Some(file) => load_supporting_file(skill, file),
-            None => load_skill_body(skill),
+            Some(file) => {
+                let file = file.to_string();
+                builtin_fs::spawn_tool(move || load_supporting_file_sync(&root, &file, &cancel))
+                    .await
+            }
+            None => builtin_fs::spawn_tool(move || load_skill_body_sync(&root, &cancel)).await,
         }
     }
 }
 
-fn load_skill_body(skill: &SkillMeta) -> ToolOutput {
-    let path = skill.root.join("SKILL.md");
-    let text = match std::fs::read_to_string(&path) {
+/// 有界读取单个 skill 文件（[`MAX_SKILL_FILE_BYTES`]）：metadata 预检 +
+/// `take(MAX+1)` 读后兜底 metadata/read 增长竞态，超限返回可诊断错误文案。
+fn read_skill_file(path: &Path) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("Failed to read {}: {e}", path.display());
+    let meta = std::fs::metadata(path).map_err(fail)?;
+    if meta.len() > MAX_SKILL_FILE_BYTES {
+        return Err(format!(
+            "Failed to read {}: file too large ({} bytes, limit {MAX_SKILL_FILE_BYTES} bytes)",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .map_err(fail)?
+        .take(MAX_SKILL_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(fail)?;
+    if buf.len() as u64 > MAX_SKILL_FILE_BYTES {
+        return Err(format!(
+            "Failed to read {}: file grew past {MAX_SKILL_FILE_BYTES} bytes during read",
+            path.display()
+        ));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| format!("Failed to read {}: not valid UTF-8", path.display()))
+}
+
+fn load_skill_body_sync(root: &Path, cancel: &CancellationToken) -> ToolOutput {
+    let path = root.join("SKILL.md");
+    if cancel.is_cancelled() {
+        return builtin_fs::cancelled_output(&path);
+    }
+    let text = match read_skill_file(&path) {
         Ok(text) => text,
-        Err(err) => return ToolOutput::err(format!("Failed to read {}: {err}", path.display())),
+        Err(message) => return ToolOutput::err(message),
     };
     match parse_frontmatter::<SkillFrontmatter>(&text, false) {
         Ok((_frontmatter, body)) => ToolOutput::ok(body),
@@ -248,16 +304,31 @@ fn load_skill_body(skill: &SkillMeta) -> ToolOutput {
     }
 }
 
-fn load_supporting_file(skill: &SkillMeta, file: &str) -> ToolOutput {
+fn load_supporting_file_sync(root: &Path, file: &str, cancel: &CancellationToken) -> ToolOutput {
     if !is_safe_relative_path(file) {
         return ToolOutput::err(format!(
             "Invalid supporting file path: {file} (must be a relative path inside the skill)"
         ));
     }
-    let target = skill.root.join(file);
-    match std::fs::read_to_string(&target) {
+    let target = root.join(file);
+    if cancel.is_cancelled() {
+        return builtin_fs::cancelled_output(&target);
+    }
+    // no-follow：目标本身是符号链接时拒绝（防 supporting file 经链接逃出
+    // skill root 的纵深防御；完整 containment 不是应用层承诺，见 ADR 0003 D6）。
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return ToolOutput::err(format!(
+                "Refusing to follow symlink: {} (supporting files must be regular files inside the skill)",
+                target.display()
+            ));
+        }
+        Err(err) => return ToolOutput::err(format!("Failed to read {}: {err}", target.display())),
+        Ok(_) => {}
+    }
+    match read_skill_file(&target) {
         Ok(content) => ToolOutput::ok(content),
-        Err(err) => ToolOutput::err(format!("Failed to read {}: {err}", target.display())),
+        Err(message) => ToolOutput::err(message),
     }
 }
 
@@ -443,7 +514,27 @@ mod tests {
         );
         // 6) 没有 SKILL.md 的普通子目录直接忽略。
         std::fs::create_dir_all(skills.join("not-a-skill")).unwrap();
-        // 7) 合法对照 + 恰 1024 字符 description 的边界样本。
+        // 7) description 为空 / 全空白（规范要求的 non-empty）。
+        std::fs::create_dir_all(skills.join("empty-desc")).unwrap();
+        std::fs::write(
+            skills.join("empty-desc").join("SKILL.md"),
+            "---\nname: empty-desc\ndescription: \"\"\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills.join("blank-desc")).unwrap();
+        std::fs::write(
+            skills.join("blank-desc").join("SKILL.md"),
+            "---\nname: blank-desc\ndescription: \"   \"\n---\nbody\n",
+        )
+        .unwrap();
+        // 8) SKILL.md 超过单文件上限：发现阶段有界读取后跳过。
+        std::fs::create_dir_all(skills.join("too-big")).unwrap();
+        std::fs::write(
+            skills.join("too-big").join("SKILL.md"),
+            vec![b'x'; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        // 9) 合法对照 + 恰 1024 字符 description 的边界样本。
         write_skill(&skills.join("good"), "good", "fine", "body");
         write_skill(&skills.join("edge"), "edge", &"d".repeat(1024), "body");
 
@@ -579,5 +670,112 @@ mod tests {
         assert!(!is_safe_relative_path("/etc/passwd"));
         assert!(!is_safe_relative_path("../escape"));
         assert!(!is_safe_relative_path("a/../../b"));
+    }
+
+    #[test]
+    fn validate_skill_requires_nonempty_description() {
+        let empty = "---\nname: good\ndescription: \"\"\n---\nbody\n";
+        let err = validate_skill(empty, "good").unwrap_err();
+        assert!(format!("{err:#}").contains("description"), "{err:#}");
+
+        let blank = "---\nname: good\ndescription: \"   \"\n---\nbody\n";
+        assert!(validate_skill(blank, "good").is_err());
+
+        let ok = "---\nname: good\ndescription: does things\n---\nbody\n";
+        assert!(validate_skill(ok, "good").is_ok());
+    }
+
+    /// SKILL.md 超过单文件上限：加载报可诊断错误，不整读入内存。
+    #[test]
+    fn load_skill_body_rejects_oversized_skill_md() {
+        let dir = TempDir::new().unwrap();
+        let skill = dir.path().join("big");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            vec![b'x'; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let out = load_skill_body_sync(&skill, &cancel);
+        assert!(out.is_error);
+        assert!(out.text.contains("too large"), "{}", out.text);
+    }
+
+    /// supporting file 超过单文件上限：报可诊断错误。
+    #[tokio::test]
+    async fn load_skill_supporting_file_respects_size_limit() {
+        let env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let skill = cwd.path().join(".agents").join("skills").join("big");
+        write_skill(&skill, "big", "Has a big reference", "body");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(
+            skill.join("references").join("big.md"),
+            vec![b'x'; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let source = SkillsSource::discover(&PluginSet::default(), cwd.path()).unwrap();
+        let out = load(
+            &source,
+            cwd.path(),
+            json!({"name": "big", "file": "references/big.md"}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(out.text.contains("too large"), "{}", out.text);
+        let _ = env;
+    }
+
+    /// supporting file no-follow：目标本身是符号链接时拒绝，不跟随逃出。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_skill_supporting_file_rejects_symlink() {
+        let env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let skill = cwd.path().join(".agents").join("skills").join("linky");
+        write_skill(&skill, "linky", "Has a symlinked reference", "body");
+        let secret = cwd.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").unwrap();
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::os::unix::fs::symlink(&secret, skill.join("references").join("link.md")).unwrap();
+
+        let source = SkillsSource::discover(&PluginSet::default(), cwd.path()).unwrap();
+        let out = load(
+            &source,
+            cwd.path(),
+            json!({"name": "linky", "file": "references/link.md"}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("Refusing to follow symlink"),
+            "{}",
+            out.text
+        );
+        let _ = env;
+    }
+
+    /// 预取消：load_skill 立即返回带 `cancelled` 的错误。
+    #[tokio::test]
+    async fn load_skill_precancelled_returns_cancelled_error() {
+        let (_env, cwd, _plugin) = skills_env();
+        let plugins =
+            crate::plugin::discovery::discover(cwd.path(), &Settings::default(), &[], &[]).unwrap();
+        let source = SkillsSource::discover(&plugins, cwd.path()).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let ctx = ToolCtx {
+            cwd: cwd.path().to_path_buf(),
+            cancel: token,
+        };
+
+        let out = source
+            .call("load_skill", json!({"name": "pdf"}), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(out.text.contains("cancelled"), "{}", out.text);
     }
 }
