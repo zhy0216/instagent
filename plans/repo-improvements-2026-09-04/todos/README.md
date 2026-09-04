@@ -23,7 +23,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/06-process-tool-isolation.md` ✅ | P1 | hard | shell/command/hooks 的 bounded output、argv/env 隔离和 hook 策略 |
 | `done/07-plugin-install-resilience.md` ✅ | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
 | `done/08-config-provider-validation.md` ✅ | P1 | hard | config/provider 字段校验、key 来源实现、schema drift 和 context limit 诊断 |
-| `09-message-contract.md` | P1 | medium | message role/tool id/image 合约与统一边界校验 |
+| `done/09-message-contract.md` ✅ | P1 | medium | message role/tool id/image 合约与统一边界校验 |
 | `done/10-mcp-inventory.md` ✅ | P1 | medium | MCP 连接部分失败、inventory timeout/cancel、缓存和可见诊断 |
 | `11-agent-event-contract.md` | P2 | medium | event 背压、残缺 stream 和 session hook 错误可见性 |
 | `12-cli-stream-and-e2e.md` | P1 | hard | stdout/stderr 契约、退出码、取消和 CLI/PTY 回归 |
@@ -47,7 +47,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 6. `done/06-process-tool-isolation.md` ✅ — 完成。shell/command/hooks 接入 `run_bounded` 显式预算（越限杀组、保留可操作摘要，`wait_and_drain` 兼容入口随之删除）；`${PLUGIN_ROOT}` 改经环境变量传递不拼 `sh -c`，command 工具接入共享 env baseline + manifest allowlist；hook 失败全量可见（spawn/超时/超限/无决策 warning 带插件/事件/命令/原因），on_failure 缺省 fail-open、显式 block 为 fail-closed；shell spill 加会话标记/随机后缀 + TTL 清理 + 失败诊断；tool JSON 定义 64KiB 读取上限带来源诊断。含空格/引号/换行路径与 env 隔离测试。
 7. `done/07-plugin-install-resilience.md` ✅ — 完成。git clone/rev-parse 走 `run_bounded` wrapper（进程组+kill_on_drop、超时、取消、bounded output，超时 fake git 进程组无残留），错误只回显截断摘要且去 URL 凭据；replace_dir 回滚失败指明备份路径、`.replaced-*` 孤儿备份换入前清扫、`.tmp-install` staging 孤儿 TTL 清扫；copy_tree symlink 契约（一律拒绝）+ 测试。
 8. `done/08-config-provider-validation.md` ✅ — 依赖：01。完成。config 字段级校验 + ADR 0003 D1 密钥唯一来源；provider schema 补齐 display_name/description/max_tokens，context_limit 诊断不再静默，provider JSON/HTTP 错误 body 读取有界。
-9. `09-message-contract.md` — 依赖：01。
+9. `done/09-message-contract.md` ✅ — 完成。validate 扩为 role/content 矩阵（ToolUse 仅 assistant、ToolResult/Image 仅 user、id/name 非空且全局唯一、紧邻结果 id 多重集精确相等、image MIME/canonical base64/20MiB）；provider wire（openai，proxy 经由它）、Session append/rewrite/salvage 统一调用同一校验核心；错误带消息/block 索引与约束。依赖：01。
 10. `done/10-mcp-inventory.md` ✅ — 完成。connect/list 硬超时、`inventory()` 错误通道不静默空列表、单 server 失败保留健康 source 并产出带 plugin/server 的 note、Registry 清单+route 缓存与 invalidate、mcp.json 1MiB 上限与 headers/command 来源诊断、stdio env 走 D2 baseline（含 PLUGIN_ROOT 环境变量）。依赖：01、05。
 11. `11-agent-event-contract.md` — 依赖：06、09。
 12. `12-cli-stream-and-e2e.md` — 依赖：06、07、10、11。

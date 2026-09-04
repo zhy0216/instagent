@@ -191,17 +191,35 @@ impl Session {
         }
     }
 
+    /// 统一消息边界（S8）：先经 `message::validate_for_append`（与 provider
+    /// wire / rewrite 同一校验核心，仅容忍"尾部 assistant 的 tool calls 尚未
+    /// 答复"这一 `finish_turn` 中间态）再落盘；校验失败不落盘、不入库，错误
+    /// 只带索引与会话 id，不回显消息原文。
+    ///
     /// 追加一行 + 立即 flush（最低 durability：进程崩溃不丢；主机掉电不
     /// 保证——create / rewrite / salvage 修复路径才 `sync_all`）。
     pub fn append(&mut self, message: Message) -> crate::Result<()> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("open session file for append {}", self.path.display()))?;
-        writeln!(file, "{}", serde_json::to_string(&message)?)?;
-        file.flush()?;
+        let index = self.messages.len();
         self.messages.push(message);
-        Ok(())
+        let written = (|| -> crate::Result<()> {
+            message::validate_for_append(&self.messages)?;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&self.path)
+                .with_context(|| format!("open session file for append {}", self.path.display()))?;
+            writeln!(file, "{}", serde_json::to_string(&self.messages[index])?)?;
+            file.flush()?;
+            Ok(())
+        })();
+        if written.is_err() {
+            self.messages.pop();
+        }
+        written.with_context(|| {
+            format!(
+                "invalid append at message {index} in session {}",
+                self.header.id
+            )
+        })
     }
 
     /// 只读每个文件的第一行（header），按 created 降序。单个坏 header/坏
@@ -986,7 +1004,16 @@ mod tests {
         let (dir, _guard) = temp_data_dir();
         let mut session = sample_session(&dir);
         session.append(msg(Role::User, "a")).unwrap();
-        session.append(msg(Role::User, "b")).unwrap();
+        // 老版本（append 不校验时）写入的违反不变量 1 的尾部：手写落盘。
+        let raw = fs::read_to_string(&session.path).unwrap();
+        fs::write(
+            &session.path,
+            format!(
+                "{raw}{}\n",
+                serde_json::to_string(&msg(Role::User, "b")).unwrap()
+            ),
+        )
+        .unwrap();
         // 违反不变量 1 的尾部回退掉，保留合法前缀。
         let resumed = Session::resume(&session.header.id).unwrap();
         assert_eq!(resumed.messages.len(), 1);
@@ -994,6 +1021,67 @@ mod tests {
         Session::remove(&session.header.id).unwrap();
         assert!(!session.path.exists());
         assert!(Session::remove(&session.header.id).is_err());
+    }
+
+    #[test]
+    fn append_enforces_message_contract_at_boundary() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        session.append(msg(Role::User, "run")).unwrap();
+        // finish_turn 中间态合法：尾部 assistant 的 tool_use 允许先落盘。
+        session
+            .append(Message::assistant(
+                vec![Content::ToolUse {
+                    id: "a".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({}),
+                }],
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&session.path).unwrap().lines().count(),
+            3
+        );
+
+        // 不配对就继续追加 → 拒绝：不落盘、不入库。
+        let err = format!(
+            "{:#}",
+            session
+                .append(msg(Role::User, "changed my mind"))
+                .unwrap_err()
+        );
+        assert!(err.contains("invariant 2"), "{err}");
+        assert!(err.contains("invalid append at message 2"), "{err}");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            fs::read_to_string(&session.path).unwrap().lines().count(),
+            3
+        );
+
+        // 精确配对的结果正常落盘。
+        session
+            .append(Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    tool_use_id: "a".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+                ts: 0,
+                usage: None,
+            })
+            .unwrap();
+        let again = Session::resume(&session.header.id).unwrap();
+        assert_eq!(again.messages, session.messages);
+
+        // 连续同角色（不变量 1）也在 append 边界拒绝。
+        let err = format!(
+            "{:#}",
+            session.append(msg(Role::User, "twice")).unwrap_err()
+        );
+        assert!(err.contains("invariant 1"), "{err}");
+        assert_eq!(session.messages.len(), 3);
     }
 
     #[test]

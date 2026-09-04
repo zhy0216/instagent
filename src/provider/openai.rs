@@ -114,6 +114,9 @@ impl Provider for OpenAiProvider {
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         let mut req = req;
         clamp_max_tokens(&self.def, &mut req);
+        // 统一消息边界（S8）：wire 前严格校验整个会话；proxy 引擎经由本方法
+        // 继承同一校验。错误带消息/block 索引与约束，不回显消息原文。
+        crate::message::validate(req.messages).map_err(to_provider_error)?;
         let base_url = require_base_url(&self.def)?;
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let body = build_request_body(&req).map_err(to_provider_error)?;
