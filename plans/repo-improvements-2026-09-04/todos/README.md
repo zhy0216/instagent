@@ -15,7 +15,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 
 | 文件 | 优先级 | 难度 | 说明 |
 |---|---|---|---|
-| `01-policy-decisions.md` | P1 | medium | 固化密钥、环境、hook、CLI 流和 settings 语义，以及 sandbox 责任边界 |
+| `done/01-policy-decisions.md` ✅ | P1 | medium | 固化密钥、环境、hook、CLI 流和 settings 语义，以及 sandbox 责任边界 |
 | `02-session-boundary.md` | P1 | medium | session id、坏尾部 salvage、权限、耐久性和 `last` 选择 |
 | `03-settings-atomic-merge.md` | P1 | medium | settings / 安装元数据原子私有写入、tri-state 合并和本地配置忽略 |
 | `04-file-tool-budgets.md` | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
@@ -39,7 +39,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 
 ## 文件
 
-1. `01-policy-decisions.md` — 依赖：无。完成后解锁所有策略相关实现。
+1. `done/01-policy-decisions.md` ✅ — 完成。ADR 0003 落地六项决策（D1–D6），解锁所有策略相关实现。
 2. `02-session-boundary.md` — 依赖：01。
 3. `03-settings-atomic-merge.md` — 依赖：01。
 4. `04-file-tool-budgets.md` — 依赖：01。
