@@ -1,21 +1,28 @@
 //! shell 工具（第二版 §2.4）。
 //!
 //! `$SHELL -c` 或 `bash -c`，cwd 为会话目录，用 `03` 的进程组 + kill_on_drop；
-//! 超时或取消时 drop [`ProcessGroupChild`] kill 整组（含孙进程）。
+//! 输出走 [`run_bounded`] 有界收集（每路 [`COLLECT_CAP_BYTES`] 硬上限）：
+//! 超限 / 超时 / 取消时 drop [`ProcessGroupChild`] kill 整组（含孙进程），
+//! 并返回可操作摘要（截断标记、原因、杀组说明）。builtin shell 是 ADR 0003 D2
+//! 的唯一例外：保留父进程完整环境（它是模型操作 sandbox 用户 shell 的通道）。
 //!
 //! 输出截断与 drain 超时逻辑参考 goose `developer/shell.rs`（commit `4ad43df`）
 //! 的 `render_output` / `truncate_output` / `save_full_output` /
 //! `unix_shell` / `OUTPUT_DRAIN_TIMEOUT_MILLIS` 组，按本仓库形态精简搬运
 //! （预览取**前** 50 行 / 10KB，goose 取尾部；全文落临时文件返回路径）。
+//!
+//! 超限落盘的 spill 文件按 `会话标记/流标签-随机uuid` 命名（R11 / todo 06）：
+//! 目录与文件私有权限，每次新保存前做 TTL 清理，清理失败有可见诊断。
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::subprocess::wait_and_drain;
+use crate::subprocess::run_bounded;
 use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 use crate::tools::ToolCtx;
@@ -23,12 +30,18 @@ use crate::tools::ToolOutput;
 
 /// 默认超时（第二版 §2.4）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
-/// 每流上限：2000 行 / 50KB。
+/// 展示上限：2000 行 / 50KB，超出给预览 + 全文落临时文件。
 pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 /// 超出时给前 50 行 / 10KB 预览，全文存临时文件并返回路径。
 pub const PREVIEW_LINES: usize = 50;
 pub const PREVIEW_BYTES: usize = 10 * 1024;
+/// [`run_bounded`] 每路收集硬上限（1 MiB）：比展示上限高一个量级，给
+/// spill 文件留余地；超限杀整个进程组、保留截断头部与摘要（R3 / todo 06）。
+pub const COLLECT_CAP_BYTES: usize = 1024 * 1024;
+/// spill 文件保留期：每次新保存前清理过期文件（惰性、有界），
+/// 敏感输出不长期留在磁盘（R11）。
+pub const SPILL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 非 POSIX 登录 shell（fish/csh/tcsh/nu）会吞掉 heredoc、`$VAR`、`2>&1` 等
 /// POSIX 语法，所以不自动采用 `$SHELL`：优先 bash，其次才退回 `$SHELL`。
@@ -84,13 +97,20 @@ pub async fn run(
     };
 
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let run = wait_and_drain(child, timeout, Some(&ctx.cancel)).await;
+    let run = match run_bounded(child, COLLECT_CAP_BYTES, timeout, Some(&ctx.cancel)).await {
+        Ok(run) => run,
+        Err(e) => return ToolOutput::err(format!("subprocess configuration error: {e}")),
+    };
 
-    let stdout = truncate_stream(&run.stdout, "stdout");
-    let stderr = truncate_stream(&run.stderr, "stderr");
+    let stdout = truncate_stream(&run.stdout.text, "stdout");
+    let stderr = truncate_stream(&run.stderr.text, "stderr");
     let timed_out = run.outcome == Outcome::TimedOut;
     let cancelled = run.outcome == Outcome::Cancelled;
-    let exit_code = run.exit_code();
+    let overflowed = run.stdout.truncated || run.stderr.truncated;
+    let exit_code = match run.outcome {
+        Outcome::Exited(code) => code,
+        _ => None,
+    };
 
     let mut text = render_output(&stdout, &stderr, exit_code);
     if timed_out {
@@ -102,6 +122,12 @@ pub async fn run(
     if cancelled {
         text.push_str("note: command cancelled; the whole process group was killed.\n");
     }
+    if overflowed {
+        text.push_str(&format!(
+            "note: output exceeded the {COLLECT_CAP_BYTES} byte collection cap; \
+             the whole process group was killed and only the kept head is shown.\n"
+        ));
+    }
     if run.drained_short {
         text.push_str(
             "note: output collection was cut short after the shell exited \
@@ -109,7 +135,7 @@ pub async fn run(
         );
     }
 
-    let failed = timed_out || cancelled || !matches!(exit_code, Some(0));
+    let failed = timed_out || cancelled || overflowed || !matches!(exit_code, Some(0));
     if failed {
         ToolOutput::err(text)
     } else {
@@ -169,10 +195,24 @@ fn truncate_preview_bytes(preview: String) -> String {
     preview[..end].to_string()
 }
 
-/// 全文落临时文件并返回路径。参考 goose developer/shell.rs `save_full_output`
-/// （goose 按 label 复用固定路径，这里加 uuid 防并发覆盖）。
+fn spill_root() -> PathBuf {
+    std::env::temp_dir().join("instagent-shell-output")
+}
+
+/// 本进程的会话标记：CLI 一个进程跑一个会话，随机 id 足以把不同会话的
+/// spill 文件分开（R11 的 session 后缀；文件级再加随机 uuid 防并发覆盖）。
+fn session_marker() -> &'static str {
+    static MARKER: OnceLock<String> = OnceLock::new();
+    MARKER.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// 全文落临时文件并返回路径：`<root>/<会话标记>/<label>-<uuid>`。
+/// 每次写入前做惰性 TTL 清理。参考 goose developer/shell.rs
+/// `save_full_output`（goose 按 label 复用固定路径，这里加会话/随机后缀）。
 fn save_full_output(output: &str, label: &str) -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("instagent-shell-output");
+    let root = spill_root();
+    cleanup_expired_spills(&root, SPILL_TTL, session_marker());
+    let dir = root.join(session_marker());
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{label}-{}", uuid::Uuid::new_v4()));
     std::fs::write(&path, output)?;
@@ -180,10 +220,53 @@ fn save_full_output(output: &str, label: &str) -> std::io::Result<PathBuf> {
     {
         use std::os::unix::fs::PermissionsExt;
         // 全量输出可能含敏感信息：目录 0700、文件 0600，同机其他用户不可读。
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(path)
+}
+
+/// TTL 清理（R11）：删过期 spill 文件与空的会话目录（`keep_session` 是
+/// 当前会话目录，不删）。每次保存时惰性触发，兜底"消费 / 会话结束"场景
+/// （工具层挂不到这两个时机，靠 TTL 保证不留长期敏感文件）；清理失败只
+/// warn、不打断保存。
+fn cleanup_expired_spills(root: &Path, ttl: Duration, keep_session: &str) {
+    let now = std::time::SystemTime::now();
+    let Ok(sessions) = std::fs::read_dir(root) else {
+        return; // 首次保存：根目录尚不存在。
+    };
+    for session in sessions.flatten() {
+        let dir = session.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(files) = std::fs::read_dir(&dir) {
+            for file in files.flatten() {
+                let expired = file
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| now.duration_since(mtime).ok())
+                    .is_some_and(|age| age > ttl);
+                if expired {
+                    if let Err(err) = std::fs::remove_file(file.path()) {
+                        tracing::warn!(
+                            "清理过期 shell 输出文件失败 {}: {err}",
+                            file.path().display()
+                        );
+                    }
+                }
+            }
+        }
+        let is_current = dir.file_name().and_then(|n| n.to_str()) == Some(keep_session);
+        if !is_current && std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            if let Err(err) = std::fs::remove_dir(&dir) {
+                tracing::warn!("清理空 shell 输出目录失败 {}: {err}", dir.display());
+            }
+        }
+    }
 }
 
 /// 拼装最终文本（截断后的 stdout/stderr 段 + exit code）。
@@ -302,17 +385,87 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn full_output_file_is_private() {
+    fn full_output_file_is_private_and_session_scoped() {
         use std::os::unix::fs::PermissionsExt;
         let path = save_full_output("secret output", "perm-test").unwrap();
-        let dir_mode = std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode();
+        let dir = path.parent().unwrap();
+        let root = dir.parent().unwrap();
+        assert_eq!(root, spill_root(), "落在统一 spill 根下");
+        assert_eq!(
+            dir.file_name().unwrap().to_str().unwrap(),
+            session_marker(),
+            "会话后缀目录（R11）"
+        );
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("perm-test-"),
+            "label + 随机 uuid 后缀"
+        );
+        let root_mode = std::fs::metadata(root).unwrap().permissions().mode();
+        let dir_mode = std::fs::metadata(dir).unwrap().permissions().mode();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
         let _ = std::fs::remove_file(&path);
+        assert_eq!(root_mode & 0o777, 0o700, "root perms: {root_mode:#o}");
         assert_eq!(dir_mode & 0o777, 0o700, "dir perms: {dir_mode:#o}");
         assert_eq!(file_mode & 0o777, 0o600, "file perms: {file_mode:#o}");
+    }
+
+    #[test]
+    fn spill_cleanup_removes_expired_files_and_empty_session_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("spill");
+        let old_session = root.join("sess-old");
+        let keep = root.join("keep");
+        std::fs::create_dir_all(&old_session).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        let expired = old_session.join("stdout-xyz");
+        std::fs::write(&expired, "old").unwrap();
+        // mtime 落到过去，避免零龄边界。
+        std::thread::sleep(Duration::from_millis(20));
+
+        cleanup_expired_spills(&root, Duration::ZERO, "keep");
+        assert!(!expired.exists(), "TTL 过期文件应被清理");
+        assert!(!old_session.exists(), "清空的会话目录应被移除");
+        assert!(keep.exists(), "当前会话目录不删");
+
+        // 未过期文件保留。
+        let fresh = keep.join("stdout-fresh");
+        std::fs::write(&fresh, "new").unwrap();
+        cleanup_expired_spills(&root, SPILL_TTL, "keep");
+        assert!(fresh.exists(), "TTL 内文件保留");
+    }
+
+    /// 输出越过收集硬上限：进程组被杀、is_error，带可操作摘要
+    /// （可控 fake：/dev/zero 洪泛，只有杀组后才能收敛）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_output_over_collect_cap_kills_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), CancellationToken::new());
+        // 1.2MB > COLLECT_CAP_BYTES（1MiB）。
+        let out = run(
+            "head -c 1200000 /dev/zero | tr '\\0' x",
+            Some(60),
+            None,
+            &ctx,
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("byte collection cap"),
+            "超限要说明原因：{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("the whole process group was killed"),
+            "{}",
+            out.text
+        );
+        // 保留的头部仍然走展示截断：预览 + 全文落盘说明。
+        assert!(out.text.contains("byte limit"), "{}", out.text);
     }
 
     #[cfg(unix)]

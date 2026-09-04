@@ -10,6 +10,16 @@
 //! 生效，goose 只认 PreToolUse。载荷字段取 §2.7 的子集（无
 //! `matcher_context` / `tool_call_id` / `last_assistant_message`，Stop 的
 //! 最后一条助手文本放 `message`）。
+//!
+//! ADR 0003 钉死的策略：
+//! - D2：插件子进程环境 baseline + manifest allowlist（[`apply_plugin_env`]，
+//!   command 工具复用，builtin shell 除外保留父环境）；`${PLUGIN_ROOT}` 一律经
+//!   `PLUGIN_ROOT` 环境变量传递、由 shell 自行展开，**不**在加载期字符串替换
+//!   进 `sh -c` 代码（路径含空格 / 引号 / metacharacter 时不破坏解析、不改变
+//!   命令含义）。
+//! - D3：`on_failure` 缺省 `Allow`（fail-open），显式 `"block"` 升级 fail-closed；
+//!   失败不再静默——spawn 失败 / 超时 / 输出超限 / 无决策全部产出带插件、事件、
+//!   命令、原因的 warning。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,13 +37,16 @@ use tokio::process::Command;
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
-use crate::subprocess::wait_and_drain;
+use crate::subprocess::run_bounded;
 use crate::subprocess::write_stdin;
 use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 
 /// 默认超时 30s（§2.7）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// 每路输出收集硬上限：hook 决策载荷很小，64 KiB 足够；超限杀整个进程组，
+/// 截断状态经 [`crate::subprocess::BoundedOutput::truncated`] 上报（todo 06 / R3）。
+pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 /// Stop 连续阻止上限（goose 默认 8），防死循环。
 pub const STOP_BLOCK_LIMIT: u32 = 8;
 /// 载荷字段按事件省略，`event` 与 `session_id` 必有。
@@ -187,7 +200,8 @@ pub struct HooksFile {
     pub hooks: BTreeMap<String, Vec<HookMatcherGroup>>,
 }
 
-/// 单个 hook 及其来源插件；command 已展开 `${PLUGIN_ROOT}`，matcher 已预编译。
+/// 单个 hook 及其来源插件；command 原样保留 `${PLUGIN_ROOT}`（运行时经
+/// `PLUGIN_ROOT` 环境变量由 shell 展开，ADR 0003 D2），matcher 已预编译。
 #[derive(Debug, Clone)]
 pub struct RegisteredHook {
     pub plugin: String,
@@ -216,7 +230,8 @@ pub struct Hooks {
 
 impl Hooks {
     /// 加载：`dev.instagent/hooks.json`，没有则回退草案位置
-    /// `hooks/hooks.json`；`${PLUGIN_ROOT}` 展开 + matcher 预编译。
+    /// `hooks/hooks.json`；matcher 预编译。命令里的 `${PLUGIN_ROOT}` 不在加载期
+    /// 展开，运行时经 `PLUGIN_ROOT` 环境变量由 shell 展开（ADR 0003 D2）。
     /// 未知事件、非 command 类型、非法正则的 rule 跳过（warn）。
     pub fn load(plugins: &PluginSet) -> crate::Result<Hooks> {
         let mut out = Hooks::default();
@@ -269,10 +284,6 @@ impl Hooks {
                             }
                             keep
                         })
-                        .map(|hook| HookDef {
-                            command: expand_plugin_root(&hook.command, &plugin.root),
-                            ..hook
-                        })
                         .collect();
                     if hooks.is_empty() {
                         continue;
@@ -300,7 +311,10 @@ impl Hooks {
         let payload = match serde_json::to_string(ctx) {
             Ok(payload) => payload,
             Err(err) => {
-                tracing::warn!("hook 载荷序列化失败（{err}），按放行处理");
+                tracing::warn!(
+                    "hook 载荷序列化失败（事件 {}：{err}），按放行处理",
+                    ctx.event
+                );
                 return HookDecision::Allow;
             }
         };
@@ -322,6 +336,8 @@ impl Hooks {
             for hook in &entry.group.hooks {
                 let decision = run_hook(
                     hook,
+                    &entry.plugin,
+                    entry.event,
                     &entry.plugin_root,
                     declared,
                     &payload,
@@ -357,7 +373,8 @@ fn hooks_file_path(plugin: &Plugin) -> Option<PathBuf> {
 }
 
 /// manifest `extensions["dev.instagent"].env`：字符串数组，其余形状忽略。
-fn declared_env(plugin: &Plugin) -> Vec<String> {
+/// hooks 与 command 工具加载期共用（ADR 0003 D2 allowlist）。
+pub fn declared_env(plugin: &Plugin) -> Vec<String> {
     plugin
         .manifest
         .extensions
@@ -373,21 +390,38 @@ fn declared_env(plugin: &Plugin) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `${PLUGIN_ROOT}` → 插件根绝对路径（单次、非递归，与 `06` 展开约定一致）。
-fn expand_plugin_root(command: &str, plugin_root: &Path) -> String {
-    command.replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
+/// ADR 0003 D2 插件子进程环境 baseline：`env_clear` 后只注入 `PATH` `HOME`
+/// `LANG`（存在才带）、`PLUGIN_ROOT` 与 manifest 声明的变量名。hooks 与
+/// command 工具共用（MCP stdio 由 todo 10 接入）；默认不泄露 provider
+/// credentials / session secrets。builtin shell 是唯一例外，保留父环境。
+pub fn apply_plugin_env(cmd: &mut Command, plugin_root: &Path, declared: &[String]) {
+    cmd.env_clear();
+    for key in ["PATH", "HOME", "LANG"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.env("PLUGIN_ROOT", plugin_root);
+    for name in declared {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
 }
 
 /// 决策判定（搬运 goose `classify_output`，hooks/mod.rs:916~966）：
 /// 退出 2 → Block(stderr)；stdout JSON `decision:"block"` → Block（不看退出码）；
 /// 退出 0 且空或 `decision:"allow"` → Allow；其余"没有决策"按 on_failure
 /// （Allow → None，Block → Block(框架生成的失败理由)）。
+///
+/// 第二个返回值是"没有决策"时的有界失败诊断（ADR 0003 D3 可见性）；
+/// 产出合法 allow / block 决策时为 `None`。
 pub fn parse_decision(
     stdout: &str,
     stderr: &str,
     exit_code: Option<i32>,
     on_failure: OnFailure,
-) -> HookDecision {
+) -> (HookDecision, Option<String>) {
     let non_empty = |s: &str| {
         if s.is_empty() {
             EMPTY_REASON_DENY.to_string()
@@ -397,7 +431,7 @@ pub fn parse_decision(
     };
 
     if exit_code == Some(2) {
-        return HookDecision::Block(non_empty(stderr.trim()));
+        return (HookDecision::Block(non_empty(stderr.trim())), None);
     }
 
     #[derive(Deserialize)]
@@ -415,36 +449,51 @@ pub fn parse_decision(
     if let Some(resp) = &resp {
         if resp.decision.as_deref() == Some("block") {
             let reason = resp.reason.clone().unwrap_or_default();
-            return HookDecision::Block(non_empty(reason.trim()));
+            return (HookDecision::Block(non_empty(reason.trim())), None);
         }
     }
     if exit_code == Some(0)
         && (trimmed.is_empty()
             || resp.as_ref().and_then(|r| r.decision.as_deref()) == Some("allow"))
     {
-        return HookDecision::Allow;
+        return (HookDecision::Allow, None);
     }
 
+    let diagnosis = match exit_code {
+        Some(0) => "exited 0 without an allow or block decision on stdout".to_string(),
+        Some(code) => format!("exited with status {code} and no usable decision"),
+        None => "was terminated by a signal".to_string(),
+    };
+    let decision = match on_failure {
+        OnFailure::Allow => HookDecision::None,
+        OnFailure::Block => HookDecision::Block(format!("the hook {diagnosis}")),
+    };
+    (decision, Some(diagnosis))
+}
+
+/// hook 失败收敛（ADR 0003 D3）：产出带插件 / 事件 / 命令 / 原因的 warning，
+/// 再按 on_failure 决策——Allow（缺省）放行，显式 `"block"` 阻断。
+fn fail_with_warning(
+    plugin: &str,
+    event: HookEvent,
+    command: &str,
+    on_failure: OnFailure,
+    reason: &str,
+) -> HookDecision {
+    let policy = match on_failure {
+        OnFailure::Allow => "fail-open（on_failure 缺省 allow）",
+        OnFailure::Block => "fail-closed（on_failure: block）",
+    };
+    tracing::warn!("[{plugin}] {event} hook `{command}` 失败：{reason}；策略 {policy}");
     match on_failure {
         OnFailure::Allow => HookDecision::None,
-        OnFailure::Block => HookDecision::Block(match exit_code {
-            Some(0) => "the hook exited 0 without an allow or block decision on stdout".to_string(),
-            Some(code) => format!("the hook exited with status {code} and no usable decision"),
-            None => "the hook was terminated by a signal".to_string(),
-        }),
+        OnFailure::Block => HookDecision::Block(format!("the hook {reason}")),
     }
 }
 
-/// 进程起不来 / 超时：同样按 on_failure 收敛（"没有决策"）。
-fn no_decision(on_failure: OnFailure, reason: &str) -> HookDecision {
-    match on_failure {
-        OnFailure::Allow => HookDecision::None,
-        OnFailure::Block => HookDecision::Block(reason.to_string()),
-    }
-}
-
-/// 白名单环境：`env_clear` 后只带 `PATH` `HOME` `LANG`（存在才带）、
-/// `PLUGIN_ROOT` 和 manifest 声明的变量；working_dir 存在则作为 cwd。
+/// hook 子进程：`sh -c` + baseline 白名单环境（[`apply_plugin_env`]）；
+/// working_dir 存在则作为 cwd。`${PLUGIN_ROOT}` 不替换进命令字符串，
+/// 由 shell 经环境变量展开（ADR 0003 D2）。
 fn hook_command(
     command: &str,
     plugin_root: &Path,
@@ -453,28 +502,21 @@ fn hook_command(
 ) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "LANG"] {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.env("PLUGIN_ROOT", plugin_root);
-    for name in declared {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
-        }
-    }
+    apply_plugin_env(&mut cmd, plugin_root, declared);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
     cmd
 }
 
-/// 跑一条 command hook：载荷写 stdin，超时 drop [`ProcessGroupChild`]
-/// 杀整个进程组（`03`），stdout/stderr 独立排空。
+/// 跑一条 command hook：载荷写 stdin，输出走 [`run_bounded`] 有界收集
+/// （每路 [`OUTPUT_CAP_BYTES`]），超时 / 超限 / 取消时 drop
+/// [`ProcessGroupChild`] 杀整个进程组（`03`）。失败全部经
+/// [`fail_with_warning`] 可见，并按 on_failure 收敛（ADR 0003 D3）。
 async fn run_hook(
     hook: &HookDef,
+    plugin: &str,
+    event: HookEvent,
     plugin_root: &Path,
     declared_env: &[String],
     payload: &str,
@@ -489,25 +531,61 @@ async fn run_hook(
     let mut child = match ProcessGroupChild::spawn(&mut cmd) {
         Ok(child) => child,
         Err(err) => {
-            tracing::warn!("hook `{}` 启动失败：{err}", hook.command);
-            return no_decision(on_failure, "the hook command failed to run");
+            return fail_with_warning(
+                plugin,
+                event,
+                &hook.command,
+                on_failure,
+                &format!("failed to spawn: {err}"),
+            );
         }
     };
 
     // 载荷后台写 stdin（防大输入死锁；脚本不读时 BrokenPipe 忽略）。
     write_stdin(&mut child, payload.as_bytes());
-    let run = wait_and_drain(child, timeout, None).await;
-    let exit_code = run.exit_code();
-    let stdout = run.stdout;
-    let stderr = run.stderr;
+    let run = match run_bounded(child, OUTPUT_CAP_BYTES, timeout, None).await {
+        Ok(run) => run,
+        Err(err) => {
+            return fail_with_warning(
+                plugin,
+                event,
+                &hook.command,
+                on_failure,
+                &format!("subprocess configuration error: {err}"),
+            );
+        }
+    };
     if run.outcome == Outcome::TimedOut {
-        tracing::warn!(
-            "hook `{}` 超时 {timeout:?}，按 on_failure 处理",
-            hook.command
+        return fail_with_warning(
+            plugin,
+            event,
+            &hook.command,
+            on_failure,
+            &format!(
+                "timed out after {}s; killed the process group",
+                timeout.as_secs()
+            ),
         );
-        return no_decision(on_failure, "the hook timed out without a decision");
     }
-    parse_decision(&stdout, &stderr, exit_code, on_failure)
+    if run.stdout.truncated || run.stderr.truncated {
+        return fail_with_warning(
+            plugin,
+            event,
+            &hook.command,
+            on_failure,
+            &format!("output exceeded {OUTPUT_CAP_BYTES} bytes; killed the process group"),
+        );
+    }
+    let exit_code = match run.outcome {
+        Outcome::Exited(code) => code,
+        _ => None,
+    };
+    let (decision, diagnosis) =
+        parse_decision(&run.stdout.text, &run.stderr.text, exit_code, on_failure);
+    if let Some(diagnosis) = diagnosis {
+        fail_with_warning(plugin, event, &hook.command, on_failure, &diagnosis);
+    }
+    decision
 }
 
 #[cfg(test)]
@@ -959,7 +1037,7 @@ mod tests {
     // ---- parse_decision 单元路径（搬运 goose classify_output 的表） ----
 
     fn pd(code: Option<i32>, stdout: &str, stderr: &str) -> HookDecision {
-        parse_decision(stdout, stderr, code, OnFailure::Allow)
+        parse_decision(stdout, stderr, code, OnFailure::Allow).0
     }
 
     #[test]
@@ -993,22 +1071,120 @@ mod tests {
         assert_eq!(pd(Some(0), "garbage", ""), HookDecision::None);
         assert_eq!(pd(None, "", ""), HookDecision::None);
         // on_failure=block 把"没有决策"翻成 Block，且理由是框架生成的。
-        let blocked = parse_decision("garbage", "", Some(0), Block);
+        let (blocked, diagnosis) = parse_decision("garbage", "", Some(0), Block);
         match blocked {
             HookDecision::Block(reason) => assert!(reason.contains("exited 0"), "{reason}"),
             other => panic!("{other:?}"),
         }
-        match parse_decision("", "", Some(7), Block) {
+        assert_eq!(
+            diagnosis.as_deref(),
+            Some("exited 0 without an allow or block decision on stdout"),
+            "失败诊断供 warning 使用（ADR 0003 D3）"
+        );
+        match parse_decision("", "", Some(7), Block).0 {
             HookDecision::Block(reason) => assert!(reason.contains("status 7"), "{reason}"),
             other => panic!("{other:?}"),
         }
+        assert!(parse_decision("", "", None, Block).1.is_some());
     }
 
+    /// 合法 allow / block 决策不产出失败诊断；只有"没有决策"才有。
     #[test]
-    fn plugin_root_expansion_is_single_pass() {
+    fn parse_decision_diagnosis_only_on_failure_paths() {
         assert_eq!(
-            expand_plugin_root("${PLUGIN_ROOT}/a/${PLUGIN_ROOT}", Path::new("/p")),
-            "/p/a//p"
+            parse_decision("", "denied", Some(2), OnFailure::Allow).1,
+            None
         );
+        assert_eq!(
+            parse_decision(
+                r#"{"decision":"block","reason":"no"}"#,
+                "",
+                Some(0),
+                OnFailure::Allow
+            )
+            .1,
+            None
+        );
+        assert_eq!(parse_decision("", "", Some(0), OnFailure::Allow).1, None);
+        assert_eq!(
+            parse_decision(r#"{"decision":"allow"}"#, "", Some(0), OnFailure::Allow).1,
+            None
+        );
+        assert!(parse_decision("garbage", "", Some(1), OnFailure::Allow)
+            .1
+            .is_some());
+    }
+
+    /// 插件根路径含空格、引号、换行与命令替换：`${PLUGIN_ROOT}` 经环境变量
+    /// 传递、由 shell 在引号内展开（ADR 0003 D2 / S11）——路径按字面到达
+    /// 脚本，不被重新解析，`$(...)` 不会执行、命令含义不被改变。
+    #[tokio::test]
+    async fn hostile_plugin_root_path_passes_literally() {
+        let h = harness();
+        let injected = h.root().join("injected");
+        // 旧字符串替换方案会把这段目录名拼进 sh -c 代码 → 解析被引号破坏、
+        // $(touch …) 被执行。现在只进环境变量，展开结果不再被解析。
+        let evil = format!("plu gin'\"q\"\n$(touch {})", injected.display());
+        let plugin = h.root().join(&evil);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            format!(r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"p","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        let ran = h.root().join("ran");
+        h.script(&plugin, "s.sh", &format!("touch {}", ran.display()));
+        h.hooks_file(
+            &plugin,
+            &hooks_json(
+                "PreToolUse",
+                r#"[{"hooks":[{"command":"\"${PLUGIN_ROOT}\"/s.sh"}]}]"#,
+            ),
+            false,
+        );
+        let hooks = Hooks::load(&plugin_set(&[&plugin])).unwrap();
+        let decision = hooks.run(&tool_ctx(HookEvent::PreToolUse)).await;
+        assert_eq!(decision, HookDecision::Allow);
+        assert!(ran.exists(), "带引号展开的脚本应按字面路径执行");
+        assert!(
+            !injected.exists(),
+            "路径里的 $(…) 被执行了：命令含义被路径改变"
+        );
+    }
+
+    /// 输出超过 [`OUTPUT_CAP_BYTES`]：进程组被杀、按 on_failure 收敛
+    /// （缺省放行、显式 block 阻断），理由说明超限（T2 可控 fake：/dev/zero 洪泛）。
+    #[tokio::test]
+    async fn output_over_cap_kills_group_and_follows_on_failure() {
+        let h = harness();
+        let plugin = h.plugin("p");
+        // 200KB > 64KiB 上限；/dev/zero 洪泛只有在杀组后才能收敛。
+        h.script(&plugin, "flood.sh", "head -c 200000 /dev/zero | tr '\\0' a");
+        for (block, expect_block) in [(false, false), (true, true)] {
+            let hook = if block {
+                json!({"command": "${PLUGIN_ROOT}/flood.sh", "on_failure": "block"})
+            } else {
+                json!({"command": "${PLUGIN_ROOT}/flood.sh"})
+            };
+            h.hooks_file(
+                &plugin,
+                &hooks_json("PreToolUse", &json!([{ "hooks": [hook] }]).to_string()),
+                false,
+            );
+            let hooks = Hooks::load(&plugin_set(&[&plugin])).unwrap();
+            let started = std::time::Instant::now();
+            let decision = hooks.run(&tool_ctx(HookEvent::PreToolUse)).await;
+            assert!(started.elapsed() < Duration::from_secs(30));
+            if expect_block {
+                match decision {
+                    HookDecision::Block(reason) => {
+                        assert!(reason.contains("exceeded"), "{reason}")
+                    }
+                    other => panic!("expected block, got {other:?}"),
+                }
+            } else {
+                assert_eq!(decision, HookDecision::Allow, "超限默认 fail-open 放行");
+            }
+        }
     }
 }

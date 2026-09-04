@@ -8,8 +8,8 @@
 //! 弥补 tokio / rmcp 只杀直接子进程的缺口。shell / MCP stdio / hooks / proxy 都复用这里。
 //!
 //! 输出收集走 `run_bounded`：每路硬上限 + 增量 UTF-8 解码，超限即杀整组并保留
-//! 截断头部与 `BoundedOutput::truncated` 状态；`wait_and_drain` 是带默认上限、
-//! 压平成字符串的兼容入口。
+//! 截断头部与 `BoundedOutput::truncated` 状态。调用方（shell / command / hooks /
+//! install）显式传自己的预算（todo 06 收口后不再有隐式默认上限的兼容入口）。
 
 use std::io;
 use std::sync::Arc;
@@ -201,10 +201,6 @@ pub fn git_command() -> std::process::Command {
 /// 进程退出 / 被杀后给输出管道最多 500ms 收尾（后台进程占着管道时不等死）。
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// [`wait_and_drain`] 兼容入口的每路默认硬上限（1 MiB）。
-/// 新调用方（shell / command / hooks / install）应经 [`run_bounded`] 显式传自己的预算。
-pub(crate) const DEFAULT_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
-
 /// 等待结果（超时 / 取消都不带退出码；输出超限被主动杀组时同样只有
 /// `Exited(None)`，区分靠 [`BoundedOutput::truncated`]）。
 #[derive(Debug, PartialEq, Eq)]
@@ -250,25 +246,6 @@ pub(crate) struct CollectedRun {
     pub stderr: BoundedOutput,
     /// 退出后某路输出读取被 drain 超时切断（后台进程占管道）。
     pub drained_short: bool,
-}
-
-/// [`wait_and_drain`] 的结果：结局 + 两路（默认上限内）输出 + 收尾截断标记。
-/// 超限文本自带 [`BoundedOutput::truncation_note`] 行内标记。
-pub(crate) struct RunOutput {
-    pub outcome: Outcome,
-    pub stdout: String,
-    pub stderr: String,
-    /// 退出后某路输出读取被 drain 超时切断（后台进程占管道）。
-    pub drained_short: bool,
-}
-
-impl RunOutput {
-    pub fn exit_code(&self) -> Option<i32> {
-        match self.outcome {
-            Outcome::Exited(code) => code,
-            _ => None,
-        }
-    }
 }
 
 /// 载荷后台写 stdin（防大输入死锁；脚本不读时 BrokenPipe 忽略）。
@@ -504,46 +481,6 @@ pub(crate) async fn run_bounded(
     })
 }
 
-/// 兼容入口：以 [`DEFAULT_OUTPUT_CAP_BYTES`] 走 [`run_bounded`]，把两路
-/// [`BoundedOutput`] 压平成字符串（超限时行内追加截断摘要）。
-/// 配置错误（未配 pipe）不 panic：压平成 `Exited(None)` + stderr 错误文案。
-pub(crate) async fn wait_and_drain(
-    child: ProcessGroupChild,
-    timeout: Duration,
-    cancel: Option<&CancellationToken>,
-) -> RunOutput {
-    match run_bounded(child, DEFAULT_OUTPUT_CAP_BYTES, timeout, cancel).await {
-        Ok(run) => RunOutput {
-            outcome: run.outcome,
-            stdout: flatten_output(&run.stdout),
-            stderr: flatten_output(&run.stderr),
-            drained_short: run.drained_short,
-        },
-        Err(err) => RunOutput {
-            outcome: Outcome::Exited(None),
-            stdout: String::new(),
-            stderr: format!("subprocess configuration error: {err}"),
-            drained_short: false,
-        },
-    }
-}
-
-/// 压平单路有界输出：保留头部；越限时在末尾接一行截断摘要。
-fn flatten_output(stream: &BoundedOutput) -> String {
-    match stream.truncation_note() {
-        Some(note) => {
-            let mut text = stream.text.clone();
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&note);
-            text.push('\n');
-            text
-        }
-        None => stream.text.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,39 +571,6 @@ mod tests {
         drop(child);
 
         eventually("mcp subprocess gone", || !signalable(pid)).await;
-    }
-
-    #[tokio::test]
-    async fn wait_and_drain_collects_output_and_exit_code() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("echo out; echo err >&2; exit 4")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = ProcessGroupChild::spawn(&mut command).expect("spawn sh");
-        let out = wait_and_drain(child, Duration::from_secs(10), None).await;
-        assert_eq!(out.outcome, Outcome::Exited(Some(4)));
-        assert_eq!(out.exit_code(), Some(4));
-        assert_eq!(out.stdout, "out\n");
-        assert_eq!(out.stderr, "err\n");
-        assert!(!out.drained_short);
-    }
-
-    #[tokio::test]
-    async fn wait_and_drain_timeout_kills_and_reports() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 120")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = ProcessGroupChild::spawn(&mut command).expect("spawn sh");
-        let out = wait_and_drain(child, Duration::from_millis(50), None).await;
-        assert_eq!(out.outcome, Outcome::TimedOut);
-        assert_eq!(out.exit_code(), None);
     }
 
     #[test]
@@ -813,43 +717,5 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("stderr piped"), "{message}");
         assert!(message.contains("Stdio::piped()"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn wait_and_drain_reports_unpiped_child_as_error_not_panic() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("exit 0")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped()); // 故意漏配 stdout
-        let child = ProcessGroupChild::spawn(&mut command).expect("spawn sh");
-        let out = wait_and_drain(child, Duration::from_secs(10), None).await;
-        assert_eq!(out.outcome, Outcome::Exited(None));
-        assert!(
-            out.stderr.contains("subprocess configuration error"),
-            "{}",
-            out.stderr
-        );
-        assert!(out.stderr.contains("stdout piped"), "{}", out.stderr);
-    }
-
-    #[tokio::test]
-    async fn wait_and_drain_inlines_truncation_summary_when_over_default_cap() {
-        let mut command = Command::new("yes");
-        command
-            .arg("0123456789")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = ProcessGroupChild::spawn(&mut command).expect("spawn yes");
-        let out = wait_and_drain(child, Duration::from_secs(30), None).await;
-        assert!(
-            out.stdout.contains("output truncated: kept first"),
-            "expected inline summary, got:\n{}",
-            out.stdout
-        );
-        assert!(out.stdout.starts_with("0123456789\n"));
-        assert!(out.stdout.len() <= DEFAULT_OUTPUT_CAP_BYTES + 256);
     }
 }

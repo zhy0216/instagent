@@ -2,9 +2,14 @@
 //!
 //! 每个启用插件一个实例（id = `cmd:<plugin>`），工具名 `<plugin>__<tool>`
 //! （前缀在 [`ToolSource::list`] 里拼好，Registry 只做模型可见名映射）。
-//! 执行：`${PLUGIN_ROOT}` 展开后用 `sh -c` 跑（与 hooks 同约定），input JSON
-//! 写 stdin，stdout 作为工具结果，退出码非 0 / 超时 / 取消即 `is_error`；
-//! 子进程走 `03` 的进程组（[`ProcessGroupChild`]，超时 kill 整组）。
+//! 执行：命令原样交给 `sh -c`，`${PLUGIN_ROOT}` 经 `PLUGIN_ROOT` 环境变量
+//! 传递、由 shell 自行展开（不替换进命令字符串，ADR 0003 D2 / S11）；
+//! 环境走插件 baseline + manifest allowlist（[`crate::hooks::apply_plugin_env`]），
+//! 默认不泄露 provider credentials / session secrets。input JSON 写 stdin，
+//! stdout 作为工具结果，退出码非 0 / 超时 / 取消 / 输出超限即 `is_error`；
+//! 子进程走 `03` 的进程组（[`ProcessGroupChild`]，超限 / 超时 / 取消 kill 整组），
+//! 输出走 [`crate::subprocess::run_bounded`] 有界收集。工具定义 JSON 读取有
+//! [`MAX_TOOL_DEF_BYTES`] 上限，超限跳过并在诊断里带来源路径。
 //! 解析失败或非法的 tool JSON 跳过不报错（warn 日志）。
 
 use std::path::Path;
@@ -21,8 +26,9 @@ use tokio::process::Command;
 use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
-use crate::subprocess::wait_and_drain;
+use crate::subprocess::run_bounded;
 use crate::subprocess::write_stdin;
+use crate::subprocess::BoundedOutput;
 use crate::subprocess::Outcome;
 use crate::subprocess::ProcessGroupChild;
 use crate::tools::ToolCtx;
@@ -33,6 +39,11 @@ use crate::tools::NAME_SEP;
 
 /// `timeout_secs` 缺省值。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// 每路输出收集硬上限（[`run_bounded`]）：超限杀整个进程组、保留截断头部与
+/// [`BoundedOutput::truncation_note`] 摘要，输出绝不无界进内存（R3 / todo 06）。
+pub const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+/// 单个工具定义 JSON（含 input_schema）的读取上限：超限跳过，诊断带来源路径。
+pub const MAX_TOOL_DEF_BYTES: u64 = 64 * 1024;
 
 /// 单个 command tool 定义。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,7 +51,8 @@ pub struct CommandToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    /// 可执行命令；`${PLUGIN_ROOT}` 在调用前展开。
+    /// 可执行命令；`${PLUGIN_ROOT}` 原样保留，运行时经 `PLUGIN_ROOT` 环境变量
+    /// 由 shell 展开（ADR 0003 D2）。
     pub command: String,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -52,8 +64,10 @@ pub struct CommandToolDef {
 pub struct CommandTools {
     /// `cmd:<plugin>`。
     pub id: String,
-    /// 插件根目录；`${PLUGIN_ROOT}` 的展开值（相对命令的基准目录）。
+    /// 插件根目录；运行时经 `PLUGIN_ROOT` 环境变量传给子进程（相对命令的基准目录）。
     pub plugin_root: PathBuf,
+    /// manifest `extensions[dev.instagent].env` 声明的环境变量名（ADR 0003 D2 allowlist）。
+    pub declared_env: Vec<String>,
     pub tools: Vec<CommandToolDef>,
 }
 
@@ -123,12 +137,22 @@ fn load_plugin(plugin: &Plugin) -> crate::Result<Option<CommandTools>> {
     Ok(Some(CommandTools {
         id: format!("cmd:{}", plugin.manifest.name),
         plugin_root: plugin.root.clone(),
+        declared_env: crate::hooks::declared_env(plugin),
         tools,
     }))
 }
 
+/// 读单个工具定义：字节数封顶 [`MAX_TOOL_DEF_BYTES`]，超限报错（由
+/// [`load_plugin`] 带路径跳过），防止巨大 / 恶意 JSON 无界进内存。
 fn parse_tool_file(path: &Path) -> crate::Result<CommandToolDef> {
-    let text = std::fs::read_to_string(path)?;
+    use std::io::Read;
+    let mut text = String::new();
+    let read = std::fs::File::open(path)?
+        .take(MAX_TOOL_DEF_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if read as u64 > MAX_TOOL_DEF_BYTES {
+        anyhow::bail!("tool definition exceeds {MAX_TOOL_DEF_BYTES} bytes");
+    }
     let def: CommandToolDef = serde_json::from_str(&text)?;
     if def.name.is_empty() || def.name.contains(NAME_SEP) || def.name.contains(':') {
         anyhow::bail!("invalid tool name `{}`", def.name);
@@ -137,11 +161,6 @@ fn parse_tool_file(path: &Path) -> crate::Result<CommandToolDef> {
         anyhow::bail!("tool `{}` has an empty command", def.name);
     }
     Ok(def)
-}
-
-/// `${PLUGIN_ROOT}` → 插件根绝对路径（单次、非递归，与 `06` 展开约定一致）。
-fn expand_plugin_root(command: &str, plugin_root: &Path) -> String {
-    command.replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
 }
 
 #[async_trait]
@@ -166,11 +185,11 @@ impl ToolSource for CommandTools {
         let Some(def) = self.find(name) else {
             return ToolOutput::err(format!("unknown tool: {name}"));
         };
-        let command = expand_plugin_root(&def.command, &self.plugin_root);
 
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&command);
+        cmd.arg("-c").arg(&def.command);
         cmd.current_dir(&ctx.cwd);
+        crate::hooks::apply_plugin_env(&mut cmd, &self.plugin_root, &self.declared_env);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -178,7 +197,7 @@ impl ToolSource for CommandTools {
         let mut child = match ProcessGroupChild::spawn(&mut cmd) {
             Ok(child) => child,
             Err(err) => {
-                return ToolOutput::err(format!("Failed to spawn `{command}`: {err}"));
+                return ToolOutput::err(format!("Failed to spawn `{}`: {err}", def.command));
             }
         };
 
@@ -187,7 +206,10 @@ impl ToolSource for CommandTools {
         write_stdin(&mut child, &payload);
 
         let timeout = Duration::from_secs(def.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        let run = wait_and_drain(child, timeout, Some(&ctx.cancel)).await;
+        let run = match run_bounded(child, OUTPUT_CAP_BYTES, timeout, Some(&ctx.cancel)).await {
+            Ok(run) => run,
+            Err(err) => return ToolOutput::err(format!("subprocess configuration error: {err}")),
+        };
 
         let (exit_code, note) = match run.outcome {
             Outcome::Exited(code) => (code, String::new()),
@@ -200,9 +222,10 @@ impl ToolSource for CommandTools {
             ),
             Outcome::Cancelled => (None, "cancelled; killed the process group. ".to_string()),
         };
-        let stdout = run.stdout;
-        let stderr = run.stderr;
-        let failed = !matches!(exit_code, Some(0));
+        let truncated = run.stdout.truncated || run.stderr.truncated;
+        let stdout = stream_text(&run.stdout);
+        let stderr = stream_text(&run.stderr);
+        let failed = !matches!(exit_code, Some(0)) || truncated;
         let text = if failed {
             let code = exit_code
                 .map(|c| c.to_string())
@@ -217,6 +240,21 @@ impl ToolSource for CommandTools {
             ToolOutput::ok(text)
         }
     }
+}
+
+/// 压平单路有界输出：保留头部；超限时在末尾接截断摘要（含杀组说明），
+/// 让模型拿到可操作的诊断而不只是残缺输出。
+fn stream_text(stream: &BoundedOutput) -> String {
+    let Some(note) = stream.truncation_note() else {
+        return stream.text.clone();
+    };
+    let mut text = stream.text.clone();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&note);
+    text.push('\n');
+    text
 }
 
 #[cfg(test)]
@@ -252,11 +290,22 @@ mod tests {
         }
 
         fn plugin(&self, name: &str) -> PathBuf {
+            self.plugin_with(name, "{}")
+        }
+
+        fn plugin_with(&self, name: &str, manifest_ext: &str) -> PathBuf {
             let root = self.root().join(name);
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(
                 root.join("plugin.json"),
-                format!(r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"{name}","version":"1.0.0"}}"#),
+                format!(
+                    r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"{name}","version":"1.0.0"{}}}"#,
+                    if manifest_ext == "{}" {
+                        String::new()
+                    } else {
+                        format!(",\"extensions\":{{\"{NAMESPACE}\":{manifest_ext}}}")
+                    }
+                ),
             )
             .unwrap();
             root
@@ -506,10 +555,33 @@ mod tests {
         assert_eq!(sources.len(), 1, "只留下有有效工具的插件");
         assert_eq!(sources[0].id, "cmd:good");
         assert_eq!(sources[0].tools.len(), 1, "非法与重名工具跳过");
-        assert_eq!(
-            expand_plugin_root("${PLUGIN_ROOT}/x.sh", Path::new("/p")),
-            "/p/x.sh"
+    }
+
+    /// 超过 [`MAX_TOOL_DEF_BYTES`] 的工具定义跳过（带来源诊断的 warn），
+    /// 不阻塞同插件外其它插件；巨型 JSON 不无界进内存。
+    #[test]
+    fn oversized_tool_definition_is_skipped_with_source() {
+        let h = harness();
+        let big = h.plugin("big");
+        let huge_desc = "x".repeat(MAX_TOOL_DEF_BYTES as usize + 1);
+        h.tool(
+            &big,
+            "big.json",
+            &format!(
+                r#"{{"name":"big","description":"{huge_desc}","input_schema":{{}},"command":"true"}}"#
+            ),
         );
+        let good = h.plugin("good");
+        h.script(&good, "s.sh", "echo ok");
+        h.tool(
+            &good,
+            "t.json",
+            r#"{"name":"t","description":"d","input_schema":{},"command":"${PLUGIN_ROOT}/s.sh"}"#,
+        );
+        let set = plugin_set(&[&big, &good]);
+        let sources = CommandTools::load(&set).unwrap();
+        assert_eq!(sources.len(), 1, "超限定义的插件没有可用工具");
+        assert_eq!(sources[0].id, "cmd:good");
     }
 
     #[tokio::test]
@@ -527,5 +599,109 @@ mod tests {
         let out = sources[0].call("nope", json!({}), &ctx_in(h.root())).await;
         assert!(out.is_error);
         assert!(out.text.contains("unknown tool"));
+    }
+
+    /// ADR 0003 D2：command 工具走插件环境 baseline——只见 `PATH` 等基线、
+    /// `PLUGIN_ROOT` 与 manifest 声明的变量；未声明的 key（模拟
+    /// `OPENAI_API_KEY` 等凭据）读不到。
+    #[tokio::test]
+    async fn env_baseline_only_declared_vars_visible() {
+        let h = harness();
+        let plugin = h.plugin_with("envp", r#"{"env":["INSTAGENT_CMD_DECLARED"]}"#);
+        h.script(
+            &plugin,
+            "env.sh",
+            "printf 'root=%s\\ndeclared=%s\\nundeclared=%s\\nhas_path=%s\\n' \
+             \"$PLUGIN_ROOT\" \"${INSTAGENT_CMD_DECLARED:-absent}\" \
+             \"${INSTAGENT_CMD_UNDECLARED:-absent}\" \
+             \"$([ -n \"${PATH:-}\" ] && echo yes || echo no)\"",
+        );
+        h.tool(
+            &plugin,
+            "env.json",
+            &weather_def("env.sh", None).replace("weather", "env"),
+        );
+        std::env::set_var("INSTAGENT_CMD_DECLARED", "yes");
+        std::env::set_var("INSTAGENT_CMD_UNDECLARED", "leak");
+        let set = plugin_set(&[&plugin]);
+        let sources = CommandTools::load(&set).unwrap();
+        let out = sources[0]
+            .call("envp__env", json!({}), &ctx_in(h.root()))
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains(&format!("root={}", plugin.display())),
+            "PLUGIN_ROOT 应经环境变量可见：{}",
+            out.text
+        );
+        assert!(out.text.contains("declared=yes"), "{}", out.text);
+        assert!(
+            out.text.contains("undeclared=absent"),
+            "白名单外变量泄漏：{}",
+            out.text
+        );
+        assert!(out.text.contains("has_path=yes"), "{}", out.text);
+    }
+
+    /// 插件根路径含空格、引号、换行与命令替换：命令里的 `${PLUGIN_ROOT}`
+    /// 经环境变量传递、在引号内展开（ADR 0003 D2 / S11），路径按字面到达
+    /// 脚本，`$(…)` 不被执行、命令含义不被改变。
+    #[tokio::test]
+    async fn hostile_plugin_root_path_passes_literally() {
+        let h = harness();
+        let injected = h.root().join("injected");
+        let evil = format!("plu gin'\"q\"\n$(touch {})", injected.display());
+        let plugin = h.root().join(&evil);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            format!(r#"{{"$schema":"{PLUGIN_SCHEMA_URL}","name":"p","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        h.script(&plugin, "s.sh", "echo literally-ok");
+        let dir = plugin.join(NAMESPACE).join("tools");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("t.json"),
+            r#"{"name":"t","description":"d","input_schema":{},"command":"\"${PLUGIN_ROOT}\"/s.sh"}"#,
+        )
+        .unwrap();
+        let set = plugin_set(&[&plugin]);
+        let sources = CommandTools::load(&set).unwrap();
+        let out = sources[0].call("p__t", json!({}), &ctx_in(h.root())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("literally-ok"), "{}", out.text);
+        assert!(
+            !injected.exists(),
+            "路径里的 $(…) 被执行了：命令含义被路径改变"
+        );
+    }
+
+    /// 输出超过 [`OUTPUT_CAP_BYTES`]：进程组被杀、is_error，stdout 带
+    /// 截断摘要（可控 fake：/dev/zero 洪泛，只有杀组后才能收敛）。
+    #[tokio::test]
+    async fn output_over_cap_kills_group_and_is_error() {
+        let h = harness();
+        let plugin = h.plugin("flood");
+        h.script(
+            &plugin,
+            "flood.sh",
+            "head -c 1200000 /dev/zero | tr '\\0' a",
+        );
+        h.tool(
+            &plugin,
+            "flood.json",
+            &weather_def("flood.sh", Some(30)).replace("weather", "flood"),
+        );
+        let set = plugin_set(&[&plugin]);
+        let sources = CommandTools::load(&set).unwrap();
+        let started = std::time::Instant::now();
+        let out = sources[0]
+            .call("flood__flood", json!({}), &ctx_in(h.root()))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(out.is_error);
+        assert!(out.text.contains("output truncated"), "{}", out.text);
+        assert!(out.text.contains("process group killed"), "{}", out.text);
     }
 }
