@@ -19,7 +19,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/02-session-boundary.md` ✅ | P1 | medium | session id、坏尾部 salvage、权限、耐久性和 `last` 选择 |
 | `done/03-settings-atomic-merge.md` ✅ | P1 | medium | settings / 安装元数据原子私有写入、tri-state 合并和本地配置忽略 |
 | `04-file-tool-budgets.md` | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
-| `05-subprocess-collector.md` | P1 | medium | 进程输出上限、增量 UTF-8 和无 pipe 配置错误 |
+| `done/05-subprocess-collector.md` ✅ | P1 | medium | 进程输出上限、增量 UTF-8 和无 pipe 配置错误 |
 | `06-process-tool-isolation.md` | P1 | hard | shell/command/hooks 的 bounded output、argv/env 隔离和 hook 策略 |
 | `07-plugin-install-resilience.md` | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
 | `08-config-provider-validation.md` | P1 | hard | config/provider 字段校验、key 来源实现、schema drift 和 context limit 诊断 |
@@ -43,7 +43,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 2. `done/02-session-boundary.md` ✅ — 完成。validate_session_id 白名单、salvage 原子写回+有界时间戳备份、0700/0600 权限、rename 失败清理、list/`last` 诊断跳过。
 3. `03-settings-atomic-merge.md` — 依赖：01。
 4. `04-file-tool-budgets.md` — 依赖：01。
-5. `05-subprocess-collector.md` — 依赖：01。
+5. `done/05-subprocess-collector.md` ✅ — 完成。`run_bounded` 硬上限 collector（越限杀组、保留摘要、增量 UTF-8），`wait_and_drain` 无 pipe 改带上下文错误。
 6. `06-process-tool-isolation.md` — 依赖：01、05。
 7. `07-plugin-install-resilience.md` — 依赖：03、05。
 8. `08-config-provider-validation.md` — 依赖：01。
