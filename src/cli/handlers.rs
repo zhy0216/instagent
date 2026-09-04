@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use instagent::agent::TurnResult;
+use instagent::hooks::HookDecision;
 use instagent::hooks::HookEvent;
 use instagent::plugin::install;
 use instagent::plugin::install::InstallOptions;
@@ -39,15 +40,21 @@ pub async fn chat(
         Session::open_or_resume(resume.as_deref(), &cwd, &rt.provider_name, &rt.model)
             .with_context(|| format!("open session {resume:?}"))?;
 
-    let _ = rt
-        .agent
-        .run_session_event(HookEvent::SessionStart, &session)
-        .await;
+    report_session_hook(
+        HookEvent::SessionStart,
+        rt.agent
+            .run_session_event(HookEvent::SessionStart, &session)
+            .await,
+        &mut std::io::stderr(),
+    );
     let result = repl::chat_loop(&mut rt, &mut session).await;
-    let _ = rt
-        .agent
-        .run_session_event(HookEvent::SessionEnd, &session)
-        .await;
+    report_session_hook(
+        HookEvent::SessionEnd,
+        rt.agent
+            .run_session_event(HookEvent::SessionEnd, &session)
+            .await,
+        &mut std::io::stderr(),
+    );
     rt.agent.tools.shutdown().await;
     result
 }
@@ -72,15 +79,21 @@ pub async fn run(
     let mut session = Session::create(&cwd, &rt.provider_name, &rt.model)?;
     eprintln!("session {}", session.header.id);
 
-    let _ = rt
-        .agent
-        .run_session_event(HookEvent::SessionStart, &session)
-        .await;
+    report_session_hook(
+        HookEvent::SessionStart,
+        rt.agent
+            .run_session_event(HookEvent::SessionStart, &session)
+            .await,
+        &mut std::io::stderr(),
+    );
     let result = run_one_turn(&rt.agent, &mut session, task).await;
-    let _ = rt
-        .agent
-        .run_session_event(HookEvent::SessionEnd, &session)
-        .await;
+    report_session_hook(
+        HookEvent::SessionEnd,
+        rt.agent
+            .run_session_event(HookEvent::SessionEnd, &session)
+            .await,
+        &mut std::io::stderr(),
+    );
     rt.agent.tools.shutdown().await;
 
     match result? {
@@ -108,6 +121,28 @@ async fn run_one_turn(
         .await;
     let _ = printer.await;
     result
+}
+
+/// SessionStart / SessionEnd hook 结果处理（todo 11 / A4，ADR 0003 D3）：
+/// 失败只输出一行含事件（阶段）与来源（错误链上下文）的 stderr warning，
+/// 不改退出码、不打断会话——保持默认兼容。hook 执行内部失败（spawn /
+/// 超时 / 输出超限 / 无决策）已由 `hooks.rs` 按 D3 逐条产出带插件与命令的
+/// warning；不可阻止的会话事件若仍带回 Block/None 决策，同样按 fail-open
+/// 放行并 warning。纯函数，便于稳定断言。
+fn report_session_hook(
+    event: HookEvent,
+    result: instagent::Result<HookDecision>,
+    out: &mut dyn Write,
+) {
+    let warning = match result {
+        Ok(HookDecision::Allow) => return,
+        Ok(decision) => format!(
+            "warning: {event} hook returned {decision:?} on a non-blockable event; \
+             ignored (fail-open)"
+        ),
+        Err(err) => format!("warning: {event} hook failed: {err:#}"),
+    };
+    let _ = writeln!(out, "{warning}");
 }
 
 fn resolve_cwd(cwd: Option<PathBuf>) -> instagent::Result<PathBuf> {
@@ -309,5 +344,43 @@ mod tests {
             .iter()
             .all(|r| !r.contains(&b.header.id)));
         assert!(sessions(SessionsAction::Rm { id: "nope".into() }).is_err());
+    }
+
+    // ---- session hook 失败可见性（todo 11 / A4，ADR 0003 D3） ----
+
+    #[test]
+    fn session_hook_allow_is_silent() {
+        let mut out = Vec::new();
+        report_session_hook(HookEvent::SessionStart, Ok(HookDecision::Allow), &mut out);
+        assert!(out.is_empty(), "正常 session 默认零输出（兼容性不变）");
+    }
+
+    #[test]
+    fn session_hook_error_warns_with_phase_and_source() {
+        let err = anyhow::anyhow!("failed to spawn: no such file")
+            .context("SessionStart hook of plugin brokenplug");
+        let mut out = Vec::new();
+        report_session_hook(HookEvent::SessionStart, Err(err), &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: SessionStart hook failed: SessionStart hook of plugin brokenplug: \
+             failed to spawn: no such file\n"
+        );
+    }
+
+    #[test]
+    fn session_hook_unexpected_decision_warns_but_passes() {
+        // 会话事件不可阻止：Block/None 决策按 fail-open 放行，但必须可见。
+        let mut out = Vec::new();
+        report_session_hook(
+            HookEvent::SessionEnd,
+            Ok(HookDecision::Block("policy".into())),
+            &mut out,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: SessionEnd hook returned Block(\"policy\") on a non-blockable event; \
+             ignored (fail-open)\n"
+        );
     }
 }

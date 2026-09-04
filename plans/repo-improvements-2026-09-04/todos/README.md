@@ -25,7 +25,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/08-config-provider-validation.md` ✅ | P1 | hard | config/provider 字段校验、key 来源实现、schema drift 和 context limit 诊断 |
 | `done/09-message-contract.md` ✅ | P1 | medium | message role/tool id/image 合约与统一边界校验 |
 | `done/10-mcp-inventory.md` ✅ | P1 | medium | MCP 连接部分失败、inventory timeout/cancel、缓存和可见诊断 |
-| `11-agent-event-contract.md` | P2 | medium | event 背压、残缺 stream 和 session hook 错误可见性 |
+| `done/11-agent-event-contract.md` ✅ | P2 | medium | event 背压、残缺 stream 和 session hook 错误可见性 |
 | `12-cli-stream-and-e2e.md` | P1 | hard | stdout/stderr 契约、退出码、取消和 CLI/PTY 回归 |
 | `13-parallel-tools.md` | P1 | hard | 只读工具并行、冲突排序、图片/并发预算和取消 |
 | `done/14-manifest-schema.md` ✅ | P2 | medium | plugin manifest 版本、字段形状和跨字段校验 |
@@ -49,7 +49,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 8. `done/08-config-provider-validation.md` ✅ — 依赖：01。完成。config 字段级校验 + ADR 0003 D1 密钥唯一来源；provider schema 补齐 display_name/description/max_tokens，context_limit 诊断不再静默，provider JSON/HTTP 错误 body 读取有界。
 9. `done/09-message-contract.md` ✅ — 完成。validate 扩为 role/content 矩阵（ToolUse 仅 assistant、ToolResult/Image 仅 user、id/name 非空且全局唯一、紧邻结果 id 多重集精确相等、image MIME/canonical base64/20MiB）；provider wire（openai，proxy 经由它）、Session append/rewrite/salvage 统一调用同一校验核心；错误带消息/block 索引与约束。依赖：01。
 10. `done/10-mcp-inventory.md` ✅ — 完成。connect/list 硬超时、`inventory()` 错误通道不静默空列表、单 server 失败保留健康 source 并产出带 plugin/server 的 note、Registry 清单+route 缓存与 invalidate、mcp.json 1MiB 上限与 headers/command 来源诊断、stdio env 走 D2 baseline（含 PLUGIN_ROOT 环境变量）。依赖：01、05。
-11. `11-agent-event-contract.md` — 依赖：06、09。
+11. `done/11-agent-event-contract.md` ✅ — 完成。event 通道消费契约：`emit` 先 `try_send`，满载最多等 `EMIT_GRACE`(250ms) 后丢弃并经进程级 `dropped_event_count()` 计数（tracing debug 记明细），接收端断开即丢即计数——不消费 / 慢消费 / 断开的调用 turn 都有明确终止，不再无限期卡住；调用方可按容量与 drain 方式自选非阻塞/丢弃语义。残缺 provider stream（A3）：`ToolUseEnd` 前 EOF 的 tool-use 保留已收集片段、按 malformed 提升（loop 补 is_error ToolResult，模型可见，不再静默丢弃），`Done` 前 EOF / 截断记入 `AssistantStream::incomplete`（`StreamIncomplete`，阶段+计数、不回显原文，对齐 09 message 错误模型），同一 note 以 `Event::Error` 上报事件层；取消不算截断，流内 ProviderError 原样上抛（ContextOverflow 重试依赖）。CLI session hook（A4 / D3）：chat/run 的 4 处 `let _ =` 改为 `report_session_hook`，失败输出含事件阶段与来源（错误链）的 stderr warning 行、退出码不变，Block/None 意外决策同样 fail-open + warning。新增 6 个 agent 测试（含不消费/断开 channel 回归）+ 3 个 handler 纯逻辑稳定断言测试。依赖：06、09。
 12. `12-cli-stream-and-e2e.md` — 依赖：06、07、10、11。
 13. `13-parallel-tools.md` — 依赖：04、05、06、09、10、11。
 14. `done/14-manifest-schema.md` ✅ — 依赖：01、08。完成。`plugin.json` 逐字段形状 + 跨字段校验（`version` 必填非空、非 SemVer 按 §5.4 只 warning；`author` 对象封闭；`keywords` 逐元素；`extensions` 命名空间反域名 + 值为对象，`dev.instagent.minKernel` 类型），未知顶层字段与非对象 `extensions` 按规范报告并忽略；读取 1 MiB 硬上限、解析错误只回显截断摘要；错误统一「来源文件 + 插件名 + 字段 + 建议值」。
