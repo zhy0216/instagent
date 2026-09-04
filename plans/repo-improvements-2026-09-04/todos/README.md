@@ -32,7 +32,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `15-discovery-diagnostics.md` | P2 | medium | 插件来源类型和目录枚举错误诊断 |
 | `16-docs-and-rustdoc.md` | P2 | easy | 当前工具数量、ADR/历史计划标记和 rustdoc 警告清理 |
 | `17-ci-release-metadata.md` | P2 | medium | 包元数据、toolchain 支持范围、audit/doc/release CI 门槛 |
-| `18-provider-converter.md` | P2 | medium | provider converter 的 source 注入、fixture 和 round-trip 校验 |
+| `done/18-provider-converter.md` ✅ | P2 | medium | provider converter 的 source 注入、fixture 和 round-trip 校验 |
 | `19-agent-module-split.md` | P2 | hard | 在行为测试护栏下拆分 agent loop 与工具执行职责 |
 | `20-hooks-provider-split.md` | P2 | hard | 在契约锁定后拆分 hooks 与 OpenAI transport/parser |
 | `21-install-module-split.md` | P2 | medium | 在安装回归稳定后拆分安装流程、git 和替换状态机 |
@@ -56,7 +56,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 15. `15-discovery-diagnostics.md` — 依赖：03。
 16. `16-docs-and-rustdoc.md` — 依赖：08、12、13、14。
 17. `17-ci-release-metadata.md` — 依赖：01、16。
-18. `18-provider-converter.md` — 依赖：08。
+18. `done/18-provider-converter.md` ✅ — 完成。converter 改 `--source DIR`/`--fixture` 显式注入（不再硬编码 ~/yyds/goose）；产物按 08 的 ProviderDef/ModelDef 契约做 schema + round-trip 校验，契约外字段剔除、约定字段保留，坏 source/schema 非零退出带文件与字段诊断；新增最小 fixture 与 11 个可重复 python 测试，真实 goose 源重生成 groq/deepseek 与提交物逐字节一致。依赖：08。
 19. `19-agent-module-split.md` — 依赖：11、13、16。
 20. `20-hooks-provider-split.md` — 依赖：06、08、11、13、16。
 21. `21-install-module-split.md` — 依赖：07、12、16。

@@ -1,0 +1,12 @@
+{
+  "name": "beta",
+  "engine": "openai",
+  "display_name": "Beta",
+  "description": "No headers/timeout, base_url already /v1, no models",
+  "api_key_env": "BETA_API_KEY",
+  "base_url": "https://api.beta.test/v1",
+  "headers": null,
+  "timeout_seconds": null,
+  "setup": { "category": "model", "setup_method": "single_api_key" },
+  "models": []
+}

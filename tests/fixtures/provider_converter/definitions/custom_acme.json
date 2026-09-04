@@ -1,0 +1,36 @@
+{
+  "name": "custom_acme",
+  "engine": "openai",
+  "display_name": "Acme AI",
+  "description": "Acme hosted OpenAI-compatible endpoint",
+  "api_key_env": "ACME_API_KEY",
+  "base_url": "https://api.acme.test/v1/chat/completions",
+  "headers": { "X-Acme": "1" },
+  "timeout_seconds": 60,
+  "requires_auth": true,
+  "preserves_thinking": false,
+  "supports_streaming": true,
+  "dynamic_models": false,
+  "model_doc_link": "https://acme.test/models",
+  "env_vars": [{ "name": "ACME_ORG", "description": "org id" }],
+  "setup": { "category": "model", "setup_method": "single_api_key" },
+  "setup_steps": [],
+  "models": [
+    {
+      "name": "acme-1",
+      "context_limit": 131072,
+      "max_tokens": 8192,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null,
+      "request_params": { "temperature": 0.2 }
+    },
+    {
+      "name": "acme-mini",
+      "context_limit": 65536,
+      "max_tokens": null,
+      "reasoning": false
+    }
+  ]
+}
