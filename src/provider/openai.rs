@@ -11,7 +11,7 @@
 //! 1. 带 tool_calls 的 assistant 消息 `content` 必须为 null 或 ""，不能省略字段
 //!    （`format_messages` 内，goose formats/openai.rs:445~454）；
 //! 2. function name 只允许 `[A-Za-z0-9_-]{1,64}`，非法字符替换为 `_`、超长截断
-//!    （[`sanitize_function_name`]，goose formats/openai.rs:1918，长度上限取 64）；
+//!    （`sanitize_function_name`，goose formats/openai.rs:1918，长度上限取 64）；
 //! 3. tool 消息必须紧跟含对应 tool_calls 的 assistant 消息
 //!    （`format_messages`：user 消息里的 ToolResult 先于同消息的文本输出，
 //!    会话不变量（`02`）保证 assistant→results 相邻）；
@@ -57,17 +57,30 @@ use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::tools::ToolSpec;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     pub def: ProviderDef,
     /// 从 `def.api_key_env` 指定的环境变量读取；无 `api_key_env` 时为空串。
+    /// 原始密钥永不进日志：[`Debug`] 实现对其 redact（ADR 0003 D1）。
     pub api_key: String,
     pub http: HttpClient,
 }
 
+/// 手写 Debug：`api_key` 只打印 `<redacted>`，密钥不进日志 / 错误输出
+/// （ADR 0003 D1）。
+impl std::fmt::Debug for OpenAiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiProvider")
+            .field("def", &self.def)
+            .field("api_key", &"<redacted>")
+            .field("http", &self.http)
+            .finish()
+    }
+}
+
 impl OpenAiProvider {
     /// 校验 def（engine=openai、base_url 必填），按 `api_key_env` 读密钥，
-    /// 按 `timeout_seconds` 建 client（构造骨架在共享层 [`engine_parts`]）。
+    /// 按 `timeout_seconds` 建 client（构造骨架在共享层 `engine_parts`）。
     pub fn new(def: &ProviderDef) -> crate::Result<Self> {
         let (api_key, http) = engine_parts(def, EngineKind::Openai)?;
         Ok(Self {
@@ -99,6 +112,8 @@ impl Provider for OpenAiProvider {
         &self,
         req: Request<'_>,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let mut req = req;
+        clamp_max_tokens(&self.def, &mut req);
         let base_url = require_base_url(&self.def)?;
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let body = build_request_body(&req).map_err(to_provider_error)?;
@@ -114,6 +129,19 @@ impl Provider for OpenAiProvider {
 // ---------------------------------------------------------------------------
 // 请求侧：消息 / 工具格式化
 // ---------------------------------------------------------------------------
+
+/// model 表里的 `max_tokens` 是输出上限：请求超过时收敛到该值（todo 08 / S9，
+/// 字段定义见 [`crate::provider::ModelDef`]）。
+fn clamp_max_tokens(def: &ProviderDef, req: &mut Request<'_>) {
+    if let Some(cap) = def
+        .models
+        .iter()
+        .find(|m| m.name == req.model)
+        .and_then(|m| m.max_tokens)
+    {
+        req.max_tokens = req.max_tokens.min(cap);
+    }
+}
 
 fn build_request_body(req: &Request<'_>) -> crate::Result<Value> {
     let mut messages = Vec::new();
@@ -274,8 +302,12 @@ impl OpenAiStreamState {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
+            // 错误摘要有界 + redact（todo 08 / S18 / ADR 0003 D1）。
+            let summary = crate::provider::http::redact_secret_tokens(
+                &crate::provider::http::summarize(msg, crate::provider::http::ERROR_SUMMARY_CHARS),
+            );
             return Err(ProviderError::Transport(format!(
-                "provider error in stream: {msg}"
+                "provider error in stream: {summary}"
             )));
         }
         if let Some(usage) = usage_from_chunk(chunk) {
@@ -1140,12 +1172,14 @@ mod tests {
             .contains("missing base_url"));
 
         const VAR: &str = "INSTAGENT_TEST_09_API_KEY";
+        std::env::remove_var(VAR);
         let mut with_key = def(Some("https://x.invalid/v1"));
         with_key.api_key_env = Some(VAR.to_string());
-        assert!(
-            OpenAiProvider::new(&with_key).is_err(),
-            "env 未设置必须报错"
-        );
+        // 契约（ADR 0003 D1）：声明了 api_key_env 而环境变量未设置 → 构造失败，
+        // 错误带 provider 名与变量名，且不含任何密钥值。
+        let err = OpenAiProvider::new(&with_key).unwrap_err().to_string();
+        assert!(err.contains("test-openai"), "{err}");
+        assert!(err.contains(VAR), "{err}");
 
         std::env::set_var(VAR, "sk-from-env");
         let provider = OpenAiProvider::new(&with_key).unwrap();
@@ -1171,6 +1205,84 @@ mod tests {
             OpenAiProvider::new(&with_timeout).unwrap().http.timeout,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn debug_never_prints_raw_api_key() {
+        let provider = provider_at("https://x.invalid/v1", "sk-from-env-secret");
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("sk-from-env-secret"), "{rendered}");
+    }
+
+    #[test]
+    fn request_max_tokens_clamped_to_model_cap() {
+        let (mut def, _) = tu::provider_parts("test-openai", EngineKind::Openai, "https://x/v1");
+        def.models = vec![crate::provider::ModelDef {
+            name: "gpt-4o".into(),
+            context_limit: None,
+            max_tokens: Some(16),
+        }];
+        let mut req = tu::request("gpt-4o", 1024, &[], &[]);
+        clamp_max_tokens(&def, &mut req);
+        assert_eq!(req.max_tokens, 16);
+        // 请求值低于上限时不改；模型不在表里也不改。
+        let mut req = tu::request("gpt-4o", 8, &[], &[]);
+        clamp_max_tokens(&def, &mut req);
+        assert_eq!(req.max_tokens, 8);
+        let mut req = tu::request("unknown-model", 1024, &[], &[]);
+        clamp_max_tokens(&def, &mut req);
+        assert_eq!(req.max_tokens, 1024);
+    }
+
+    #[tokio::test]
+    async fn wiremock_request_body_carries_clamped_max_tokens() {
+        let server = MockServer::start().await;
+        mount_once(&server, sse_body("data: [DONE]\n\n")).await;
+        let (def, http) = tu::provider_parts(
+            "test-openai",
+            EngineKind::Openai,
+            &format!("{}/v1", server.uri()),
+        );
+        let def = ProviderDef {
+            models: vec![crate::provider::ModelDef {
+                name: "gpt-4o".into(),
+                context_limit: None,
+                max_tokens: Some(16),
+            }],
+            ..def
+        };
+        let provider = OpenAiProvider {
+            def,
+            api_key: String::new(),
+            http,
+        };
+        let messages = vec![Message::user_text("hi".into())];
+        let mut stream = provider.stream(request(&messages, &[])).await.unwrap();
+        collect(&mut stream).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["max_tokens"], 16);
+    }
+
+    #[tokio::test]
+    async fn in_stream_error_summary_is_bounded_and_redacted() {
+        let sse = format!(
+            "data: {{\"error\":{{\"message\":\"bad key sk-abcdef12345 {}\"}}}}\n\ndata: [DONE]\n\n",
+            "y".repeat(2000)
+        );
+        let mut parser = SseParser::default();
+        let events = parser.feed(&sse);
+        let input: BoxStream<'static, crate::Result<SseEvent>> =
+            fstream::iter(events.into_iter().map(Ok)).boxed();
+        let mut stream = sse_to_stream_events(input);
+        let err = stream.next().await.unwrap().unwrap_err();
+        let ProviderError::Transport(message) = &err else {
+            panic!("expected Transport, got {err:?}")
+        };
+        assert!(message.contains("sk-[redacted]"), "{message}");
+        assert!(!message.contains("sk-abcdef12345"), "{message}");
+        assert!(message.chars().count() < 700, "{}", message.chars().count());
     }
 
     #[tokio::test]

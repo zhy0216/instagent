@@ -178,6 +178,7 @@ pub trait StreamEngine: Send {
 }
 
 /// 空 data 跳过 + JSON parse；畸形块 → `Transport("malformed SSE chunk …")`。
+/// 错误摘要有界（截断 + `sk-…` redact，todo 08 / S18）：坏输入不制造巨大日志。
 pub fn parse_chunk(ev: &SseEvent) -> Result<Option<Value>, ProviderError> {
     let data = ev.data.trim();
     if data.is_empty() {
@@ -185,7 +186,12 @@ pub fn parse_chunk(ev: &SseEvent) -> Result<Option<Value>, ProviderError> {
     }
     serde_json::from_str::<Value>(data)
         .map(Some)
-        .map_err(|err| ProviderError::Transport(format!("malformed SSE chunk {data:?}: {err}")))
+        .map_err(|err| {
+            let summary = crate::provider::http::redact_secret_tokens(
+                &crate::provider::http::summarize(data, 200),
+            );
+            ProviderError::Transport(format!("malformed SSE chunk {summary:?}: {err}"))
+        })
 }
 
 /// 共享 SSE → StreamEvent 驱动器：弹队列 → 查 ended → 取 SSE → 引擎 apply；
@@ -272,6 +278,8 @@ pub mod testutil {
         ProviderDef {
             name: name.into(),
             engine,
+            display_name: None,
+            description: None,
             api_key_env: None,
             base_url: base_url.map(str::to_string),
             headers: BTreeMap::new(),

@@ -166,8 +166,11 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
         Some(hooks)
     };
 
-    // context_limit 四级顺序（`10`）：塞回 config 让 `16` assemble 取用。
-    config.context_limit = Some(providers.context_limit(&provider_name, &model, &config));
+    // context_limit 四级顺序（`10`）：塞回 config 让 `16` assemble 取用；
+    // 未知/歧义 provider 的降级告警（todo 08 / R13）进 notes 给用户看。
+    let (context_limit, limit_notes) = providers.context_limit(&provider_name, &model, &config);
+    config.context_limit = Some(context_limit);
+    notes.extend(limit_notes);
     let mut agent = Agent::assemble(&config, provider, registry, hooks)?;
     agent.mcp_instructions = mcp_instructions;
     agent.skill_lines = skill_lines;

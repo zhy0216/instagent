@@ -37,6 +37,8 @@ fn proxy_def(args: Vec<String>, env: BTreeMap<String, String>, timeout_secs: u64
     ProviderDef {
         name: "fake".to_string(),
         engine: EngineKind::Proxy,
+        display_name: None,
+        description: None,
         api_key_env: None,
         base_url: None,
         headers: BTreeMap::from([("x-target-port".to_string(), "${PORT}".to_string())]),

@@ -276,7 +276,7 @@ fn write_file_sync(full: &Path, content: &str, cancel: &CancellationToken) -> To
 }
 
 /// `before` 必须唯一精确匹配，否则报错并给出匹配次数和相近上下文；
-/// `after` 为空即删除。写回走原子替换。整读经 [`read_capped_text`]
+/// `after` 为空即删除。写回走原子替换。整读经 `read_capped_text`
 /// 受 [`MAX_READ_BYTES`] 约束（此前无上限，计划 R9）。
 pub async fn edit_file(path: &Path, before: &str, after: &str, ctx: &ToolCtx) -> ToolOutput {
     let full = resolve_path(path, &ctx.cwd);

@@ -15,7 +15,7 @@
 //!   rewrite / salvage 修复写回额外 `sync_all`，rename 后尽力同步父目录。
 //! - 原子重写：header+消息写随机后缀私有临时文件，旧主文件先复制为带时间戳
 //!   的 `<id>.<ts>.bak.jsonl` 备份（best-effort，每会话保留最近
-//!   [`MAX_BACKUPS`] 份），再 rename 覆盖主文件；rename 失败清理临时文件。
+//!   `MAX_BACKUPS` 份），再 rename 覆盖主文件；rename 失败清理临时文件。
 //!   不变量：主文件任何时刻要么是旧内容要么是新内容，绝不缺失。
 //! - resume 的 salvage（坏行截断 + 合法前缀回退）会把有效前缀**物理写回**
 //!   主 JSONL，保证 resume→append→resume 不再重复丢尾部（S2）。
@@ -225,7 +225,7 @@ impl Session {
         fs::remove_file(&path).with_context(|| format!("remove session file {}", path.display()))
     }
 
-    /// 压缩用原子重写（`16` 调用）：委托 [`atomic_replace`]（私有临时文件 +
+    /// 压缩用原子重写（`16` 调用）：委托 `atomic_replace`（私有临时文件 +
     /// sync + 时间戳备份 + rename + 失败清理 + 父目录同步）。
     pub fn rewrite(&mut self, messages: Vec<Message>) -> crate::Result<()> {
         message::validate(&messages)

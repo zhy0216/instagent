@@ -6,7 +6,9 @@
 //! 按名字查找（K2）：重名报错并要求写成 `plugin/name`；用户插件覆盖 bundled。
 //! engine 分派：`openai` → `09`；`proxy` → `11` 的 [`ProxyProvider`]（拉起 +
 //! 就绪轮询）。
-//! `context_limit` 四级顺序：配置覆盖 → provider models 表 → `08` 前缀小表 → 128k。
+//! `context_limit` 四级顺序：配置覆盖 → provider models 表 → `08` 前缀小表 → 128k；
+//! provider 找不到/歧义时不再静默降级，返回带 provider/model/source 的 warning
+//! note（todo 08 / R13）。provider JSON 读取有大小上限（[`MAX_PROVIDER_JSON_BYTES`]）。
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -33,6 +35,23 @@ use crate::provider::ProviderDef;
 
 /// 插件命名空间下存放 provider JSON 的子目录（第三版 §2.1）。
 const PROVIDERS_DIR: &str = "providers";
+
+/// provider JSON 的读取上限（todo 08 / R9 / S18）：定义文件本身很小，
+/// 超限文件在装载边界拒绝，避免坏输入拖垮解析与错误输出。
+pub const MAX_PROVIDER_JSON_BYTES: u64 = 1024 * 1024;
+
+/// 带大小上限读 provider JSON：超限报错指出文件、实际大小与上限。
+fn read_provider_json(path: &Path) -> Result<String> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .len();
+    anyhow::ensure!(
+        size <= MAX_PROVIDER_JSON_BYTES,
+        "provider file {} is too large: {size} bytes exceeds the {MAX_PROVIDER_JSON_BYTES} byte limit",
+        path.display()
+    );
+    std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
 
 /// 一个 provider 定义 + 它的来源插件（覆盖与消歧的依据）。
 /// `root` 供 `11` 解析 proxy 的 `./` 相对命令（约定同 `06`）。
@@ -81,11 +100,11 @@ impl ProviderRegistry {
             let plugin_data = plugin_data_dir_at(data_base, &plugin.manifest.name)?;
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for path in paths {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?;
+                let text = read_provider_json(&path)?;
                 let def = parse_provider_def(&text, &plugin.root, &plugin_data)
                     .with_context(|| format!("in {}", path.display()))?;
-                validate_def(&def)?;
+                def.validate()
+                    .with_context(|| format!("in {}", path.display()))?;
                 if !seen.insert(def.name.clone()) {
                     bail!(
                         "plugin `{}` declares provider `{}` twice",
@@ -141,19 +160,37 @@ impl ProviderRegistry {
 
     /// 该 (provider, model) 的上下文上限（四级顺序）：配置覆盖 → provider
     /// models 表 → `08` 前缀小表 → 128k（后两级由 [`context_limit_for`] 兜底）。
-    /// provider 找不到或歧义时静默降级到前缀小表。
-    pub fn context_limit(&self, provider: &str, model: &str, config: &Config) -> u32 {
+    ///
+    /// 返回 `(limit, warnings)`：provider 找不到或歧义时不再静默降级到前缀小表，
+    /// 而是返回一条带 provider / model / 来源的 warning（R13 / todo 08）。
+    pub fn context_limit(
+        &self,
+        provider: &str,
+        model: &str,
+        config: &Config,
+    ) -> (u32, Vec<String>) {
         if let Some(limit) = config.context_limit {
-            return limit;
+            return (limit, Vec::new());
         }
-        if let Ok(def) = self.lookup(provider) {
-            if let Some(model_def) = def.models.iter().find(|m| m.name == model) {
-                if let Some(limit) = model_def.context_limit {
-                    return limit;
+        match self.lookup(provider) {
+            Ok(def) => {
+                if let Some(model_def) = def.models.iter().find(|m| m.name == model) {
+                    if let Some(limit) = model_def.context_limit {
+                        return (limit, Vec::new());
+                    }
                 }
+                (context_limit_for(model), Vec::new())
+            }
+            Err(err) => {
+                let limit = context_limit_for(model);
+                let warning = format!(
+                    "context limit for provider `{provider}` / model `{model}` resolved from the \
+                     model-prefix fallback table (source: prefix table, limit {limit}), because: {err}; \
+                     set config `context_limit` or pick a known provider"
+                );
+                (limit, vec![warning])
             }
         }
-        context_limit_for(model)
     }
 
     /// 查找规则：`plugin/name` 精确匹配；裸名先剔除被用户插件覆盖的 bundled
@@ -199,32 +236,6 @@ impl ProviderRegistry {
     fn bare_matches(&self, name: &str) -> Vec<&Entry> {
         self.entries.iter().filter(|e| e.def.name == name).collect()
     }
-}
-
-/// 加载期最小校验：engine 与必填字段匹配。
-fn validate_def(def: &ProviderDef) -> Result<()> {
-    if def.name.is_empty() || def.name.contains('/') {
-        bail!("provider name `{}` is empty or contains `/`", def.name);
-    }
-    match def.engine {
-        EngineKind::Openai => {
-            if def.base_url.as_deref().is_none_or(|u| u.is_empty()) {
-                bail!(
-                    "provider `{}` (engine openai) is missing base_url",
-                    def.name
-                );
-            }
-        }
-        EngineKind::Proxy => {
-            if def.proxy.is_none() {
-                bail!(
-                    "provider `{}` (engine proxy) is missing the proxy section",
-                    def.name
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 解析单个 provider JSON：反序列化 → 变量展开 → 形状检查。
@@ -503,32 +514,79 @@ mod tests {
         );
         let registry = registry(&env, &[p]);
 
-        // 1) 配置覆盖最高。
+        // 1) 配置覆盖最高，且无 warning。
         let config = Config {
             context_limit: Some(999),
             ..Config::default()
         };
-        assert_eq!(registry.context_limit("svc", "known-model", &config), 999);
+        assert_eq!(
+            registry.context_limit("svc", "known-model", &config),
+            (999, vec![])
+        );
         // 2) provider models 表。
         let config = Config::default();
-        assert_eq!(registry.context_limit("svc", "known-model", &config), 555);
-        // 3) 表里有名字但没 limit / 表里没有 → 08 前缀小表。
+        assert_eq!(
+            registry.context_limit("svc", "known-model", &config),
+            (555, vec![])
+        );
+        // 3) 表里有名字但没 limit / 表里没有 → 08 前缀小表（已知 provider 不告警）。
         assert_eq!(
             registry.context_limit("svc", "no-limit", &config),
-            128 * 1024
+            (128 * 1024, vec![])
         );
         assert_eq!(
             registry.context_limit("svc", "claude-sonnet-4-6", &config),
-            200 * 1024
+            (200 * 1024, vec![])
         );
-        // 4) 前缀小表也没有 → 128k 兜底；provider 不存在同样降级。
+        // 4) 前缀小表也没有 → 128k 兜底（已知 provider 不告警）。
         assert_eq!(
             registry.context_limit("svc", "mystery-9000", &config),
-            128 * 1024
+            (128 * 1024, vec![])
         );
+    }
+
+    #[test]
+    fn context_limit_unknown_or_ambiguous_provider_warns_with_source() {
+        let env = isolated();
+        let alpha = plugin(env.data.path().join("alpha"), "alpha", PluginSource::User);
+        let beta = plugin(env.data.path().join("beta"), "beta", PluginSource::User);
+        write_provider(
+            &alpha,
+            "dup.json",
+            &def_json("dup", "openai", "https://a.test/v1"),
+        );
+        write_provider(
+            &beta,
+            "dup.json",
+            &def_json("dup", "openai", "https://b.test/v1"),
+        );
+        let registry = registry(&env, &[alpha, beta]);
+        let config = Config::default();
+
+        // 未知 provider：limit 仍来自前缀小表，但带 provider/model/source 的告警。
+        let (limit, warnings) = registry.context_limit("absent", "mystery-9000", &config);
+        assert_eq!(limit, 128 * 1024);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert!(warning.contains("absent"), "{warning}");
+        assert!(warning.contains("mystery-9000"), "{warning}");
+        assert!(warning.contains("prefix table"), "{warning}");
+        assert!(warning.contains("unknown provider"), "{warning}");
+
+        // 歧义（裸名多插件）同样告警而不是静默。
+        let (limit, warnings) = registry.context_limit("dup", "claude-x", &config);
+        assert_eq!(limit, 200 * 1024);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("multiple plugins"), "{warnings:?}");
+
+        // 配置覆盖时即便 provider 未知也不告警（用户已显式负责）。
+        let config = Config {
+            context_limit: Some(4096),
+            ..Config::default()
+        };
         assert_eq!(
             registry.context_limit("absent", "mystery-9000", &config),
-            128 * 1024
+            (4096, vec![])
         );
     }
 
@@ -571,7 +629,8 @@ mod tests {
             skipped: vec![],
         };
         let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
-        assert!(err.to_string().contains("proxy section"), "{err:#}");
+        // 校验错误带文件上下文，`{:#}` 给出完整错误链。
+        assert!(format!("{err:#}").contains("proxy section"), "{err:#}");
 
         let q = plugin(env.data.path().join("q"), "q", PluginSource::User);
         write_provider(
@@ -593,6 +652,70 @@ mod tests {
             err.to_string().contains("declares provider `dup` twice"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn oversized_provider_json_rejected_at_load_boundary() {
+        let env = isolated();
+        let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
+        let huge = format!(
+            r#"{{"name":"huge","engine":"openai","base_url":"https://h.test/v1","description":"{}"}}"#,
+            "x".repeat(MAX_PROVIDER_JSON_BYTES as usize)
+        );
+        write_provider(&p, "huge.json", &huge);
+        let set = PluginSet {
+            plugins: vec![p],
+            skipped: vec![],
+        };
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("too large"), "{message}");
+        assert!(message.contains("huge.json"), "{message}");
+        assert!(
+            message.contains(&MAX_PROVIDER_JSON_BYTES.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn invalid_numeric_provider_fields_rejected_at_load_boundary() {
+        let env = isolated();
+        let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
+        write_provider(
+            &p,
+            "svc.json",
+            r#"{"name":"svc","engine":"openai","base_url":"https://svc.test/v1","timeout_seconds":0}"#,
+        );
+        let set = PluginSet {
+            plugins: vec![p],
+            skipped: vec![],
+        };
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("timeout_seconds"), "{message}");
+        assert!(message.contains("svc"), "{message}");
+        assert!(message.contains("svc.json"), "{message}");
+    }
+
+    #[test]
+    fn invalid_model_fields_rejected_at_load_boundary() {
+        let env = isolated();
+        let p = plugin(env.data.path().join("p"), "p", PluginSource::User);
+        write_provider(
+            &p,
+            "svc.json",
+            r#"{"name":"svc","engine":"openai","base_url":"https://svc.test/v1",
+               "models":[{"name":"m1","max_tokens":0},{"name":"m2","context_limit":0}]}"#,
+        );
+        let set = PluginSet {
+            plugins: vec![p],
+            skipped: vec![],
+        };
+        let err = ProviderRegistry::from_plugins_at(&set, env.data.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("m1"), "{message}");
+        assert!(message.contains("max_tokens"), "{message}");
+        assert!(message.contains("svc.json"), "{message}");
     }
 
     #[test]
@@ -626,8 +749,23 @@ mod tests {
                 "moonshotai/kimi-k2-instruct-0905",
                 &Config::default()
             ),
-            262144
+            (262144, vec![])
         );
+        // 新形状字段（display_name / description / model max_tokens，S9）：
+        // bundled JSON 携带它们，装载后可读且校验通过。
+        let openai = registry.lookup("openai").unwrap();
+        assert_eq!(openai.display_name.as_deref(), Some("OpenAI"));
+        assert!(openai
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("Chat Completions"));
+        let gpt5 = openai.models.iter().find(|m| m.name == "gpt-5").unwrap();
+        assert_eq!(gpt5.context_limit, Some(400000));
+        assert_eq!(gpt5.max_tokens, Some(32000));
+        // 旧形状字段缺省（deepseek 的 models 无 max_tokens）。
+        let deepseek = registry.lookup("deepseek").unwrap();
+        assert!(deepseek.models.iter().all(|m| m.max_tokens.is_none()));
     }
 
     #[test]

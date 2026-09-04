@@ -81,7 +81,7 @@ pub(crate) fn load_bundled_at(base: &Path) -> crate::Result<Plugin> {
 }
 
 /// [`discover`] + bundled 注入：`05` 的四层不动，bundled 作为内置来源
-/// 补在最低优先级（合并规则见 [`with_bundled`]）。
+/// 补在最低优先级（合并规则见 `with_bundled`）。
 pub fn discover_with_bundled(
     cwd: &Path,
     settings: &Settings,

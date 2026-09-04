@@ -202,8 +202,28 @@ fn build_headers(headers: &BTreeMap<String, String>) -> HeaderMap {
     map
 }
 
+/// HTTP 错误 body 的读取上限（todo 08 / R9）：错误 body 只用于 500 字符
+/// 摘要与重试提示，超限部分直接丢弃，坏响应不能撑爆内存。
+pub const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// 有界读错误 body：按块累积到 [`MAX_ERROR_BODY_BYTES`] 即停。
 async fn read_body(resp: reqwest::Response) -> String {
-    resp.text().await.unwrap_or_default()
+    let mut stream = resp.bytes_stream();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() >= MAX_ERROR_BODY_BYTES {
+                    bytes.truncate(MAX_ERROR_BODY_BYTES);
+                    break;
+                }
+            }
+            // 传输中断：已读部分仍可用于摘要 / 重试提示。
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn parse_body_json(body: &str) -> Value {
@@ -254,7 +274,11 @@ fn event_stream(resp: reqwest::Response) -> BoxStream<'static, crate::Result<Sse
     .boxed()
 }
 
+/// 错误摘要长度上限（字符数）。
+pub const ERROR_SUMMARY_CHARS: usize = 500;
+
 /// 状态码 + 响应体 → [`ProviderError`]（429 带 retry_after；401/403 → Auth）。
+/// 摘要先截断再对 `sk-…` 形态做 redact（ADR 0003 D1：错误输出不带原始密钥）。
 pub fn map_http_error(status: u16, body: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth,
@@ -262,21 +286,49 @@ pub fn map_http_error(status: u16, body: &str) -> ProviderError {
             retry_after: extract_retry_after(&HeaderMap::new(), &parse_body_json(body)),
         },
         _ if is_context_overflow(status, body) => ProviderError::ContextOverflow,
-        _ => ProviderError::Http(status, summarize(body)),
+        _ => ProviderError::Http(
+            status,
+            redact_secret_tokens(&summarize(body, ERROR_SUMMARY_CHARS)),
+        ),
     }
 }
 
-/// 响应体摘要（截到 500 字符，按 char 边界）。
-fn summarize(body: &str) -> String {
-    const MAX: usize = 500;
-    if body.len() <= MAX {
-        return body.to_owned();
+/// 文本摘要：按 char 边界截到 `max` 个字符（错误消息有界，todo 08 / S18）。
+pub(crate) fn summarize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
     }
-    let mut end = MAX;
-    while !body.is_char_boundary(end) {
-        end -= 1;
+    text.chars().take(max).collect()
+}
+
+/// redact `sk-…` 形态的密钥（ADR 0003 D1）：`sk-` 后跟随 >= 8 个
+/// `[A-Za-z0-9_-]` 且前面不是字母数字（避免误伤 `mask-…` 之类词）时替换为
+/// `sk-[redacted]`。
+pub(crate) fn redact_secret_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut start = 0;
+    while let Some(rel) = text[start..].find("sk-") {
+        let idx = start + rel;
+        let word_char_before = text[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        let tail = &text[idx + 3..];
+        let run: usize = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .map(char::len_utf8)
+            .sum();
+        if !word_char_before && run >= 8 {
+            out.push_str(&text[start..idx]);
+            out.push_str("sk-[redacted]");
+        } else {
+            out.push_str(&text[start..idx + 3 + run]);
+        }
+        start = idx + 3 + run;
     }
-    body[..end].to_owned()
+    out.push_str(&text[start..]);
+    out
 }
 
 /// 400 且文案含 "prompt is too long" / "context_length_exceeded" /
@@ -509,6 +561,34 @@ mod tests {
     }
 
     #[test]
+    fn summarize_truncates_on_char_boundary() {
+        assert_eq!(summarize("boom", ERROR_SUMMARY_CHARS), "boom");
+        assert_eq!(summarize(&"x".repeat(600), ERROR_SUMMARY_CHARS).len(), 500);
+        // 多字节字符按字符数截，不产生半个字符。
+        assert_eq!(summarize("中文中文中文", 3), "中文中");
+    }
+
+    #[test]
+    fn redact_secret_tokens_masks_sk_shaped_keys() {
+        assert_eq!(
+            redact_secret_tokens("invalid api key sk-abcdef12345 provided"),
+            "invalid api key sk-[redacted] provided"
+        );
+        // 短于 8 个跟随字符的不算密钥形态。
+        assert_eq!(redact_secret_tokens("sk-short"), "sk-short");
+        // 词中出现的 `sk-` 不误伤（mask-… / task-…）。
+        assert_eq!(
+            redact_secret_tokens("mask-12345678 done"),
+            "mask-12345678 done"
+        );
+        // Bearer 头形态。
+        assert_eq!(
+            redact_secret_tokens("Bearer sk-AAAAAAAAAAAAAAAA"),
+            "Bearer sk-[redacted]"
+        );
+    }
+
+    #[test]
     fn context_overflow_detection_centered_in_one_fn() {
         for phrase in [
             "prompt is too long: 200001 tokens",
@@ -628,5 +708,35 @@ mod tests {
         ));
         // 400 不在重试集合内：只发一次请求。
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_sse_error_body_is_bounded_and_redacted() {
+        let server = MockServer::start().await;
+        // 超大错误 body 里夹带密钥形态：读取有界、摘要有界、密钥被 redact。
+        let mut body = String::from("boom sk-topsecretkey99 ");
+        body.push_str(&"x".repeat(MAX_ERROR_BODY_BYTES * 2));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let err = test_client()
+            .post_sse(
+                &format!("{}/v1/chat/completions", server.uri()),
+                &BTreeMap::new(),
+                &serde_json::json!({}),
+            )
+            .await
+            .map(drop)
+            .unwrap_err();
+        let pe = err.downcast_ref::<ProviderError>().unwrap();
+        let ProviderError::Http(500, message) = pe else {
+            panic!("expected Http(500), got {pe:?}")
+        };
+        assert!(message.chars().count() <= ERROR_SUMMARY_CHARS, "{message}");
+        assert!(message.contains("sk-[redacted]"), "{message}");
+        assert!(!message.contains("sk-topsecretkey99"), "{message}");
     }
 }

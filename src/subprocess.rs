@@ -7,8 +7,8 @@
 //! 另加 `ProcessGroupChild` 投递守卫：drop 时 SIGKILL 整个进程组（含孙进程），
 //! 弥补 tokio / rmcp 只杀直接子进程的缺口。shell / MCP stdio / hooks / proxy 都复用这里。
 //!
-//! 输出收集走 [`run_bounded`]：每路硬上限 + 增量 UTF-8 解码，超限即杀整组并保留
-//! 截断头部与 [`BoundedOutput::truncated`] 状态；[`wait_and_drain`] 是带默认上限、
+//! 输出收集走 `run_bounded`：每路硬上限 + 增量 UTF-8 解码，超限即杀整组并保留
+//! 截断头部与 `BoundedOutput::truncated` 状态；`wait_and_drain` 是带默认上限、
 //! 压平成字符串的兼容入口。
 
 use std::io;

@@ -7,7 +7,7 @@
 //! `enabledPlugins` 三态语义按 ADR 0003 D5：缺失 = 不表态、非空 = 白名单、
 //! `[]` = 显式空白名单终值（低层不得恢复任何 enabled 名字）；
 //! `disabledPlugins` 维持并集，缺失与 `[]` 等价。
-//! 所有写路径走 [`write_private_atomic`]（同目录临时文件 + fsync + rename，
+//! 所有写路径走 `write_private_atomic`（同目录临时文件 + fsync + rename，
 //! Unix mode 0600），崩溃或 rename 失败只会留下旧的完整文件或新的完整文件。
 
 use std::collections::HashSet;
