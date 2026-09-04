@@ -9,6 +9,7 @@
 - 使用说明：[`docs/usage.md`](docs/usage.md)
 - 架构总览：[`docs/architecture.md`](docs/architecture.md)
 - 决策记录：[`docs/adr/`](docs/adr/)（0001 不支持 Anthropic；0002 sandbox 内 agent，UI/permission 非目标；0003 仓库边界与运行时策略）
+- 发布与校验政策：[`docs/release.md`](docs/release.md)（toolchain/MSRV、安全扫描豁免、CI 门槛）
 - 历史设计文档：`docs/goose-*.md` 是当时的计划书，不是当前契约（文首有说明）
 - 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
 - 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
@@ -22,7 +23,8 @@ cargo build --release          # 产物 target/release/instagent
 cargo install --path . --bin instagent   # 或直接装到 ~/.cargo/bin（只装主二进制，不含测试 fixture）
 ```
 
-工具链要求见 `rust-toolchain.toml`。
+工具链由 `rust-toolchain.toml` 固定（1.94.0，本地与 CI 同一版本）；
+MSRV 与升级政策见 [`docs/release.md`](docs/release.md)。
 
 ## 快速上手
 
@@ -183,7 +185,7 @@ settings 里启用但目录已删的插件同样只警告不致命。详见第�
 ## 开发
 
 ```bash
-bash scripts/ci.sh        # = CI 全量：fmt / clippy / test
+bash scripts/ci.sh        # = CI 全量：fmt / clippy / test / rustdoc / release smoke / --help
 cargo run -- --help
 ```
 
@@ -193,6 +195,8 @@ cargo run -- --help
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo rustdoc --lib -- -D warnings
+cargo check --release --all-targets
 ```
 
 ## 手工验证清单（todos/18 · CLI 与运行时装配）

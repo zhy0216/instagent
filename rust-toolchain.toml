@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# 固定经过验证的 toolchain（plan E1：不允许无记录的 moving stable）。
+# 本地与 CI 都由此文件取得同一版本；升级策略与验证清单见 docs/release.md。
+channel = "1.94.0"
 components = ["rustfmt", "clippy"]

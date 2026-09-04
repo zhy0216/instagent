@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 定期依赖公告扫描（安全政策：docs/release.md）。
+    - cron: "0 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,18 +19,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # toolchain 由 rust-toolchain.toml 固定（rustup 首次调用自动安装），
+      # 保证本地与 CI 同一可复现版本；不用 moving stable。
       - uses: Swatinem/rust-cache@v2
-      # 依赖漏洞扫描（cargo-audit/RUSTSEC）。必须不阻断：修复通告需要升级依赖，
-      # 违反 AGENTS.md「不加依赖、不升级依赖」锁定，此步只暴露问题供维护者决策。
-      - uses: rustsec/audit-check@v2.0.0
-        continue-on-error: true
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # rustdoc 断链即失败（todos/16 已清零存量警告）。
+      - run: cargo rustdoc --lib -- -D warnings
+      # release smoke：release profile 下全 target 可编译。
+      - run: cargo check --release --all-targets
       # 与 scripts/ci.sh 对齐的 --help smoke。
       - run: cargo run -q -- --help
+  audit:
+    # cargo-audit（RUSTSEC 公告）扫描。安全政策与豁免记录见 docs/release.md：
+    # PR/push 上不阻断——修复公告需要升级依赖，违反 AGENTS.md 的依赖锁定；
+    # owner 为仓库维护者 @zhy0216，负责定期评估公告并决定是否解锁升级。
+    # 定时任务（schedule）上阻断，让公告以红灯形式暴露给 owner。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        continue-on-error: ${{ github.event_name != 'schedule' }}
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

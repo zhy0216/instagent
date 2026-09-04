@@ -3,6 +3,17 @@ name = "instagent"
 version = "0.1.0"
 edition = "2021"
 description = "插件为核心的最小 agent（Rust 从零实现）"
+# 发布元数据与 toolchain/MSRV 政策见 docs/release.md（plan E1/E2）。
+# license 对齐只读参考基线 block/goose（Apache-2.0，搬运片段在 commit 注明出处）。
+license = "Apache-2.0"
+repository = "https://github.com/zhy0216/instagent"
+homepage = "https://github.com/zhy0216/instagent"
+documentation = "https://github.com/zhy0216/instagent/tree/main/docs"
+# MSRV：1.93 为经验证的最低支持版本（`cargo +1.93.1 check --all-targets` 通过，
+# 2026-09-05）；CI/本地固定 toolchain 见 rust-toolchain.toml。
+rust-version = "1.93"
+keywords = ["agent", "llm", "cli", "plugins", "ai"]
+categories = ["command-line-utilities", "development-tools"]
 # 18：fixture bin（mcp-fixture-server / fake-proxy-server）加入后 `cargo run`
 # 有歧义；验收命令 `cargo run -- --help` 需要默认 bin 指向主 CLI。
 default-run = "instagent"
