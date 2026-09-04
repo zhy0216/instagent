@@ -263,7 +263,7 @@ impl Agent {
             )
             .await;
             let started = Instant::now();
-            let output = tokio::select! {
+            let mut output = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
                 out = self.tools.call(call, &ctx) => out,
@@ -285,7 +285,12 @@ impl Agent {
                     .with_tool_output(output.text.clone());
                 let _ = hooks.run(&hook_ctx).await;
             }
+            // 图片块与 ToolResult 进同一条 user 消息（结果在前）。
+            let image = output.image.take();
             results.push(Content::tool_result(call, output));
+            if let Some(img) = image {
+                results.push(Content::Image(img));
+            }
         }
         results
     }
@@ -511,6 +516,9 @@ mod tests {
     use crate::message::SUMMARY_PREFIX;
     use crate::session::SessionHeader;
     use crate::tools::BuiltinTools;
+    use crate::tools::ImageData;
+    use crate::tools::ToolSource;
+    use crate::tools::ToolSpec;
     use async_trait::async_trait;
     use futures::stream;
     use futures::stream::BoxStream;
@@ -778,6 +786,108 @@ mod tests {
             }
         )));
         assert!(events.iter().any(|e| matches!(e, Event::Usage(_))));
+    }
+
+    /// 产图 stub 来源（不依赖 02 的 read_image）：look_image 返回带 image 的 ToolOutput。
+    const STUB_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    struct ImageSource;
+
+    #[async_trait]
+    impl ToolSource for ImageSource {
+        fn id(&self) -> &str {
+            "test:image"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "look_image".into(),
+                description: "stub image producer".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+            }]
+        }
+
+        async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput {
+                text: "Loaded image from stub".into(),
+                is_error: false,
+                image: Some(ImageData {
+                    data: STUB_PNG_B64.into(),
+                    media_type: "image/png".into(),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_image_lands_in_user_message_and_survives_resume() {
+        // create / resume 走 INSTAGENT_DATA_DIR（与全 crate 共用 lock_env），
+        // 两个同步块各自短暂持锁，不跨 await。
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![
+                StreamEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "look_image".into(),
+                },
+                StreamEvent::ToolUseDelta("{}".into()),
+                StreamEvent::ToolUseEnd,
+                done(5, 1),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("saw it".into()), done(9, 1)]),
+        ]);
+        let mut test_agent = agent(provider.clone(), 100_000);
+        let mut registry = Registry::new();
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        registry.register(Arc::new(ImageSource));
+        test_agent.tools = Arc::new(registry);
+        let mut session = {
+            let _guard = crate::config::lock_env();
+            std::env::set_var("INSTAGENT_DATA_DIR", dir.path());
+            Session::create(dir.path(), "mock", "mock-model").unwrap()
+        };
+
+        let (result, _) = run(&test_agent, &mut session, "look at it").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+
+        // 落盘的 user 消息恰为 [ToolResult, Image]（结果在前）。
+        let results = &session.messages[2].content;
+        assert_eq!(results.len(), 2);
+        match &results[..] {
+            [Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }, Content::Image(img)] => {
+                assert_eq!(tool_use_id, "t1");
+                assert!(!is_error);
+                assert_eq!(content, "Loaded image from stub");
+                assert_eq!(img.media_type, "image/png");
+                assert_eq!(img.data, STUB_PNG_B64);
+            }
+            other => panic!("expected [ToolResult, Image], got {other:?}"),
+        }
+
+        // resume 后 Image 块字节不变（借 01 的 serde 形状）。
+        let image_json = serde_json::to_string(&session.messages[2].content[1]).unwrap();
+        assert_eq!(
+            image_json,
+            format!(r#"{{"data":"{STUB_PNG_B64}","media_type":"image/png"}}"#)
+        );
+        let resumed = {
+            let _guard = crate::config::lock_env();
+            std::env::set_var("INSTAGENT_DATA_DIR", dir.path());
+            let resumed = Session::resume(&session.header.id).unwrap();
+            std::env::remove_var("INSTAGENT_DATA_DIR");
+            resumed
+        };
+        assert_eq!(resumed.messages, session.messages);
+        assert_eq!(
+            serde_json::to_string(&resumed.messages[2].content[1]).unwrap(),
+            image_json
+        );
     }
 
     #[tokio::test]
