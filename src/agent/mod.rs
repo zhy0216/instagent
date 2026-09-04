@@ -8,6 +8,18 @@
 //! [`Agent::run_session_event`]，由 `18` 的会话生命周期调用。
 //! `hooks` 为 None 时行为与未接 hooks 完全一致。
 //!
+//! 工具并行执行（todo 13）：同一 assistant turn 内可证明独立的只读调用以
+//! 有界并发执行（上限 [`PARALLEL_TOOL_LIMIT`]）；写操作、顺序敏感与同资源
+//! 调用保持原顺序串行。能力元数据见 [`crate::tools::CallCapability`]：
+//! `read_only` 来自各来源声明，资源键由内核按已知工具语义分配。工具自动
+//! 执行、无交互审批（ADR 0002）；sandbox 是唯一强制隔离层（ADR 0003 D6），
+//! 并行不引入新的信任假设——只并行只读调用，冲突判定失败的方向永远是降级
+//! 为串行。hooks 不受影响：PreToolUse 仍在串行阶段按序执行，PostToolUse
+//! 在各任务内随结果触发。共享总预算与取消：并行任务共用同一 [`ToolCtx`]
+//! 与会话图片预算（[`SESSION_IMAGE_BUDGET`]）；取消时在途任务经
+//! `tokio::select!` 短路（子进程靠 `kill_on_drop` 回收）、未启动的单元补
+//! `Content::interrupted`，事件与结果仍按调用 id 一一对应，会话不变量不变。
+//!
 //! 事件通道消费契约（todo 11 / A2）：channel 只给 UI 看，调用方自行选择
 //! 消费方式——及时 drain（交互式 UI）、给足容量（近似 unbounded、事件不丢）、
 //! 或不消费（事件在 [`EMIT_GRACE`] 宽限后被丢弃并计数，见
@@ -24,6 +36,7 @@ pub mod event;
 pub mod prompt;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,6 +46,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -50,9 +64,11 @@ use crate::provider::Provider;
 use crate::provider::Request;
 use crate::provider::StreamEvent;
 use crate::session::Session;
+use crate::tools::CallCapability;
 use crate::tools::Registry;
 use crate::tools::ToolCall;
 use crate::tools::ToolCtx;
+use crate::tools::ToolKind;
 use crate::tools::ToolOutput;
 use crate::ProviderError;
 
@@ -61,6 +77,17 @@ pub use event::Event;
 /// 事件通道背压宽限（A2）：channel 满时 `Agent::emit` 最多再等这么久，
 /// 之后丢弃事件并计数——turn 不为 UI 无限期等待。
 pub const EMIT_GRACE: Duration = Duration::from_millis(250);
+
+/// 并行执行并发上限（todo 13）：同一 turn 内最多同时执行这么多个工具调用。
+/// 模型单条消息的调用数天然有限，上限只防 IO / 子进程风暴。
+pub const PARALLEL_TOOL_LIMIT: usize = 4;
+
+/// 会话图片总字节预算（todo 13 / S15 最小行为）：同一会话全部
+/// `Content::Image` 解码后字节之和的上限；新图片会使总量超限时不再附上，
+/// 对应工具结果带可操作提示。请求侧兜底见
+/// [`crate::provider::openai::REQUEST_IMAGE_BUDGET`]；不引入 RM2 的
+/// blob/reference 存储，不引入新 decoder。
+pub const SESSION_IMAGE_BUDGET: u64 = 64 * 1024 * 1024;
 
 // ponytail: 进程级计数——instagent 单 agent 进程；若将来并发多 Agent 需要
 // 分开记账，再把计数挪进调用方自选的 sink。
@@ -195,8 +222,8 @@ impl Agent {
     }
 
     /// 第二版 §2.5 伪代码：append user → 循环 {compact::maybe → stream_assistant
-    /// → append assistant → 无 tool call 即 Done → 串行执行 →
-    /// 结果合成一条 user 消息}。
+    /// → append assistant → 无 tool call 即 Done → 执行工具（`execute_calls`，
+    /// 独立只读并行）→ 结果合成一条 user 消息}。
     pub async fn run_turn(
         &self,
         session: &mut Session,
@@ -267,9 +294,14 @@ impl Agent {
         Ok(TurnResult::MaxTurns)
     }
 
-    /// 逐个执行 tool call：malformed / 取消短路 → PreToolUse hook →
-    /// emit ToolStart → 执行 → emit ToolDone → PostToolUse hook。
-    /// 每个 call 产出一个 ToolResult，顺序与 calls 一致。
+    /// 三段式执行 tool call（todo 13）：
+    /// ① 串行决策——按序处理 malformed / 取消 / PreToolUse hook（语义与逐字
+    ///    同串行版一致，交互点与策略钩子不进并行阶段）；
+    /// ② 按能力元数据把待执行调用划成执行单元（[`execution_units`]）——
+    ///    同单元全为 ReadOnly 且资源键互不相同，Serial 调用各自独立成单元；
+    /// ③ 单元按原顺序串行执行，单元内调用以 [`PARALLEL_TOOL_LIMIT`] 有界并发。
+    /// 每个 call 产出一个 ToolResult，顺序与 calls 一致；图片块受会话预算
+    /// [`SESSION_IMAGE_BUDGET`] 约束。
     async fn execute_calls(
         &self,
         session: &Session,
@@ -282,19 +314,21 @@ impl Agent {
             cwd: session.header.cwd.clone(),
             cancel: cancel.clone(),
         };
-        let mut results: Vec<Content> = Vec::with_capacity(calls.len());
+
+        // 阶段 1：串行决策。
+        let mut dispositions: Vec<Disposition> = Vec::with_capacity(calls.len());
         for call in calls {
             if let Some(detail) = streamed.malformed.get(&call.id) {
-                results.push(Content::tool_result(
+                dispositions.push(Disposition::Finished(Content::tool_result(
                     call,
                     ToolOutput::err(format!(
                         "tool input JSON is broken and the tool was not executed: {detail}"
                     )),
-                ));
+                )));
                 continue;
             }
             if streamed.cancelled || cancel.is_cancelled() {
-                results.push(Content::interrupted(call));
+                dispositions.push(Disposition::Finished(Content::interrupted(call)));
                 continue;
             }
             // hook 触发点：PreToolUse 在调用之前；阻止 → is_error 结果，工具不执行。
@@ -313,50 +347,109 @@ impl Agent {
                         },
                     )
                     .await;
-                    results.push(Content::tool_result(call, ToolOutput::err(text)));
+                    dispositions.push(Disposition::Finished(Content::tool_result(
+                        call,
+                        ToolOutput::err(text),
+                    )));
                     continue;
                 }
             }
-            Self::emit(
-                events,
-                Event::ToolStart {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.clone(),
-                },
-            )
-            .await;
-            let started = Instant::now();
-            let mut output = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
-                out = self.tools.call(call, &ctx) => out,
-            };
-            Self::emit(
-                events,
-                Event::ToolDone {
-                    id: call.id.clone(),
-                    preview: preview_text(&output.text),
-                    is_error: output.is_error,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                },
-            )
-            .await;
-            // hook 触发点：PostToolUse 观察事件，决策忽略。
-            if let Some(hooks) = &self.hooks {
-                let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
-                    .with_tool(call.name.clone(), Some(call.input.clone()))
-                    .with_tool_output(output.text.clone());
-                let _ = hooks.run(&hook_ctx).await;
+            let cap = self.tools.capability(call).await;
+            dispositions.push(Disposition::Ready {
+                call: call.clone(),
+                cap,
+            });
+        }
+
+        // 阶段 2/3：单元串行、单元内并发；结果按原下标落槽。
+        let mut slots: Vec<Option<Vec<Content>>> = dispositions
+            .iter()
+            .map(|d| match d {
+                Disposition::Finished(content) => Some(vec![content.clone()]),
+                Disposition::Ready { .. } => None,
+            })
+            .collect();
+        let semaphore = Semaphore::new(PARALLEL_TOOL_LIMIT);
+        let image_used = AtomicU64::new(session_image_bytes(&session.messages));
+        for unit in execution_units(&dispositions) {
+            if cancel.is_cancelled() {
+                // 未启动的单元：补 interrupted（不变量：每个 ToolUse 恰一个答复）。
+                for &idx in &unit {
+                    if let Disposition::Ready { call, .. } = &dispositions[idx] {
+                        slots[idx] = Some(vec![Content::interrupted(call)]);
+                    }
+                }
+                continue;
             }
-            // 图片块与 ToolResult 进同一条 user 消息（结果在前）。
-            let image = output.image.take();
-            results.push(Content::tool_result(call, output));
-            if let Some(img) = image {
-                results.push(Content::Image(img));
+            let tasks = unit.iter().map(|&idx| {
+                let Disposition::Ready { call, .. } = &dispositions[idx] else {
+                    unreachable!("execution units only reference Ready dispositions");
+                };
+                async {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .expect("semaphore is never closed");
+                    Self::emit(
+                        events,
+                        Event::ToolStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                        },
+                    )
+                    .await;
+                    let started = Instant::now();
+                    let mut output = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
+                        out = self.tools.call(call, &ctx) => out,
+                    };
+                    // 图片预算（todo 13）：超限不附上，结果文本带可操作提示。
+                    let mut kept_image = None;
+                    if let Some(img) = output.image.take() {
+                        match reserve_image_bytes(
+                            &image_used,
+                            img.decoded_bytes(),
+                            SESSION_IMAGE_BUDGET,
+                        ) {
+                            Ok(()) => kept_image = Some(img),
+                            Err(note) => output.text.push_str(&note),
+                        }
+                    }
+                    Self::emit(
+                        events,
+                        Event::ToolDone {
+                            id: call.id.clone(),
+                            preview: preview_text(&output.text),
+                            is_error: output.is_error,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        },
+                    )
+                    .await;
+                    // hook 触发点：PostToolUse 观察事件，决策忽略。
+                    if let Some(hooks) = &self.hooks {
+                        let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
+                            .with_tool(call.name.clone(), Some(call.input.clone()))
+                            .with_tool_output(output.text.clone());
+                        let _ = hooks.run(&hook_ctx).await;
+                    }
+                    // 图片块与 ToolResult 进同一条 user 消息（结果在前）。
+                    let mut blocks = vec![Content::tool_result(call, output)];
+                    if let Some(img) = kept_image {
+                        blocks.push(Content::Image(img));
+                    }
+                    blocks
+                }
+            });
+            for (&idx, blocks) in unit.iter().zip(futures::future::join_all(tasks).await) {
+                slots[idx] = Some(blocks);
             }
         }
-        results
+        slots
+            .into_iter()
+            .flat_map(|slot| slot.expect("every call is answered exactly once (todo 13)"))
+            .collect()
     }
 
     /// hook 触发点：Stop。被阻止 → 注入提醒 user 消息并返回 true（本轮继续跑）；
@@ -593,6 +686,93 @@ fn finish_turn(
         })?;
     }
     Ok(())
+}
+
+/// 阶段 1 对单个调用的处置（todo 13）：Finished 已有结果（malformed /
+/// 取消 / hook 阻止），Ready 等待阶段 2/3 执行。
+enum Disposition {
+    Ready { call: ToolCall, cap: CallCapability },
+    Finished(Content),
+}
+
+/// 执行单元划分（todo 13）：按原顺序扫描，Ready 调用仅当 ReadOnly 且资源键
+/// 与单元内其它调用互不相同时加入当前单元；Serial 调用各自独立成单元；
+/// Finished 不执行、不影响划分。单元按原顺序串行执行，单元内并行——
+/// 写操作、同资源冲突与依赖调用因此保持原顺序。
+fn execution_units(dispositions: &[Disposition]) -> Vec<Vec<usize>> {
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut batch: Vec<usize> = Vec::new();
+    let mut resources: HashSet<String> = HashSet::new();
+    for (idx, disposition) in dispositions.iter().enumerate() {
+        let Disposition::Ready { cap, .. } = disposition else {
+            continue;
+        };
+        match cap.kind {
+            ToolKind::Serial => {
+                flush_batch(&mut units, &mut batch, &mut resources);
+                units.push(vec![idx]);
+            }
+            ToolKind::ReadOnly => {
+                if let Some(resource) = &cap.resource {
+                    if resources.contains(resource) {
+                        flush_batch(&mut units, &mut batch, &mut resources);
+                    }
+                    resources.insert(resource.clone());
+                }
+                batch.push(idx);
+            }
+        }
+    }
+    flush_batch(&mut units, &mut batch, &mut resources);
+    units
+}
+
+fn flush_batch(
+    units: &mut Vec<Vec<usize>>,
+    batch: &mut Vec<usize>,
+    resources: &mut HashSet<String>,
+) {
+    if !batch.is_empty() {
+        units.push(std::mem::take(batch));
+        resources.clear();
+    }
+}
+
+/// 会话历史中全部图片块的解码字节合计（会话图片预算的基线）。
+fn session_image_bytes(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(|block| match block {
+            Content::Image(image) => image.decoded_bytes(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// 原子地预留图片字节预算：接受则累计，超限返回可操作提示。CAS 防同 turn
+/// 的并行调用同时通过检查——超限必拒，不留竞争误差。
+fn reserve_image_bytes(used: &AtomicU64, bytes: u64, budget: u64) -> Result<(), String> {
+    let mut current = used.load(Ordering::SeqCst);
+    loop {
+        if current + bytes > budget {
+            return Err(image_budget_note(current, bytes, budget));
+        }
+        match used.compare_exchange(current, current + bytes, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(()),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// 被拒图片附在工具结果文本里的可操作提示（todo 13）。
+fn image_budget_note(used: u64, bytes: u64, budget: u64) -> String {
+    format!(
+        "\n\n[image not attached: session image budget of {} MiB exceeded (session already \
+         holds {used} image bytes, this image is {bytes} bytes). Finish the current analysis \
+         or start a new session before reading more images.]",
+        budget / (1024 * 1024)
+    )
 }
 
 /// ToolDone 预览：前 10 行 / 1KB（渲染细则归 `18`）。
@@ -1633,5 +1813,520 @@ mod tests {
         assert!(streamed.cancelled);
         assert_eq!(streamed.incomplete, None);
         assert!(streamed.malformed.is_empty());
+    }
+
+    // ---- 并行工具执行（todo 13） ----
+
+    fn tool_use_events(id: &str, name: &str, raw_json: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolUseStart {
+                id: id.into(),
+                name: name.into(),
+            },
+            StreamEvent::ToolUseDelta(raw_json.into()),
+            StreamEvent::ToolUseEnd,
+        ]
+    }
+
+    fn agent_with(provider: Arc<MockProvider>, source: Arc<dyn ToolSource>) -> Agent {
+        let mut registry = Registry::new();
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        registry.register(source);
+        let mut test_agent = agent(provider, 100_000);
+        test_agent.tools = Arc::new(registry);
+        test_agent
+    }
+
+    /// 只读探针：记录实时 / 峰值并发度并驻留固定时长。
+    struct ConcurrencyProbe {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        hold: Duration,
+    }
+
+    impl ConcurrencyProbe {
+        fn new(hold: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                hold,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolSource for ConcurrencyProbe {
+        fn id(&self) -> &str {
+            "test:concurrency"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![
+                ToolSpec {
+                    name: "probe_read".into(),
+                    description: "read-only probe".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: true,
+                },
+                ToolSpec {
+                    name: "probe_write".into(),
+                    description: "serial probe".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: false,
+                },
+            ]
+        }
+
+        async fn call(&self, name: &str, input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.hold).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolOutput::ok(format!("{name}:{}", input["tag"]))
+        }
+    }
+
+    /// 两个调用互相等待：串行执行会死锁，只有并行能双双通过（原方案 §拆解）。
+    struct PeerProbe {
+        barrier: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl ToolSource for PeerProbe {
+        fn id(&self) -> &str {
+            "test:barrier"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "needs_peer".into(),
+                description: "waits for a peer call".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+            }]
+        }
+
+        async fn call(&self, _name: &str, input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            self.barrier.wait().await;
+            ToolOutput::ok(format!("met {}", input["tag"].as_str().unwrap_or_default()))
+        }
+    }
+
+    /// 永不自行返回的只读调用：只有取消能回收任务（future 被 drop）。
+    struct HangProbe;
+
+    #[async_trait]
+    impl ToolSource for HangProbe {
+        fn id(&self) -> &str {
+            "test:hang"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "hang".into(),
+                description: "never returns".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+            }]
+        }
+
+        async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            std::future::pending::<()>().await;
+            unreachable!("hang probe is only reclaimed by cancellation")
+        }
+    }
+
+    /// tag=bad 时失败的只读探针：验证并行失败隔离。
+    struct FlakyProbe;
+
+    #[async_trait]
+    impl ToolSource for FlakyProbe {
+        fn id(&self) -> &str {
+            "test:flaky"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "flaky".into(),
+                description: "fails on tag=bad".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+            }]
+        }
+
+        async fn call(&self, _name: &str, input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if input["tag"] == "bad" {
+                ToolOutput::err("boom".to_string())
+            } else {
+                ToolOutput::ok(format!("ok {}", input["tag"]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_independent_read_only_calls_run_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = tool_use_events("t1", "needs_peer", r#"{"tag":"a"}"#);
+        events.extend(tool_use_events("t2", "needs_peer", r#"{"tag":"b"}"#));
+        events.push(done(4, 2));
+        let provider = MockProvider::new(vec![
+            scripted(events),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(
+            provider.clone(),
+            Arc::new(PeerProbe {
+                barrier: tokio::sync::Barrier::new(2),
+            }),
+        );
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run(&test_agent, &mut session, "go"),
+        )
+        .await
+        .expect("串行执行会死锁在 barrier：独立只读调用必须并行");
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "t1");
+        assert_eq!(results[1].0, "t2");
+        assert!(results[0].1.contains("met a"), "{}", results[0].1);
+        assert!(results[1].1.contains("met b"), "{}", results[1].1);
+    }
+
+    #[tokio::test]
+    async fn parallel_calls_are_bounded_by_concurrency_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = ConcurrencyProbe::new(Duration::from_millis(50));
+        let total = PARALLEL_TOOL_LIMIT + 2;
+        let mut events = Vec::new();
+        for i in 1..=total {
+            events.extend(tool_use_events(
+                &format!("t{i}"),
+                "probe_read",
+                &format!(r#"{{"tag":"x{i}"}}"#),
+            ));
+        }
+        events.push(done(6, 3));
+        let provider = MockProvider::new(vec![
+            scripted(events),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(provider.clone(), probe.clone());
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&test_agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(
+            probe.max_active.load(Ordering::SeqCst),
+            PARALLEL_TOOL_LIMIT,
+            "峰值并发必须恰为上限（{total} 个只读调用，上限 {}）",
+            PARALLEL_TOOL_LIMIT
+        );
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), total);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.0, format!("t{}", i + 1), "结果顺序与调用顺序一致");
+            assert!(!r.2, "{}", r.1);
+            assert!(r.1.contains(&format!("x{}", i + 1)), "{}", r.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_kind_calls_never_overlap_with_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = ConcurrencyProbe::new(Duration::from_millis(30));
+        let mut events = tool_use_events("t1", "probe_write", r#"{"tag":"w"}"#);
+        events.extend(tool_use_events("t2", "probe_read", r#"{"tag":"r"}"#));
+        events.push(done(4, 2));
+        let provider = MockProvider::new(vec![
+            scripted(events),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(provider.clone(), probe.clone());
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&test_agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(
+            probe.max_active.load(Ordering::SeqCst),
+            1,
+            "写（Serial）与读分属不同单元，永不重叠"
+        );
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results[0].0, "t1");
+        assert_eq!(results[1].0, "t2", "即使串行也保持原调用顺序");
+    }
+
+    #[test]
+    fn execution_units_group_independent_read_only_and_isolate_conflicts() {
+        let ready = |kind: ToolKind, resource: Option<&str>| Disposition::Ready {
+            call: ToolCall {
+                id: "t".to_string(),
+                name: "probe".to_string(),
+                input: serde_json::json!({}),
+            },
+            cap: CallCapability {
+                kind,
+                resource: resource.map(str::to_string),
+            },
+        };
+        let finished = || Disposition::Finished(Content::Text("done".to_string()));
+
+        // 独立只读（资源键互异 / 无资源键）→ 同一单元。
+        let d = vec![
+            ready(ToolKind::ReadOnly, Some("f1")),
+            ready(ToolKind::ReadOnly, Some("f2")),
+            ready(ToolKind::ReadOnly, None),
+        ];
+        assert_eq!(execution_units(&d), vec![vec![0, 1, 2]]);
+
+        // 同资源键冲突 → 按原顺序串行。
+        let d = vec![
+            ready(ToolKind::ReadOnly, Some("f1")),
+            ready(ToolKind::ReadOnly, Some("f1")),
+        ];
+        assert_eq!(execution_units(&d), vec![vec![0], vec![1]]);
+
+        // Serial（写 / 顺序敏感）独立成单元，两侧只读各自成组。
+        let d = vec![
+            ready(ToolKind::ReadOnly, None),
+            ready(ToolKind::Serial, None),
+            ready(ToolKind::ReadOnly, None),
+        ];
+        assert_eq!(execution_units(&d), vec![vec![0], vec![1], vec![2]]);
+
+        // Finished（malformed / 取消 / hook 阻止）不参与划分。
+        let d = vec![
+            finished(),
+            ready(ToolKind::ReadOnly, None),
+            finished(),
+            ready(ToolKind::ReadOnly, None),
+        ];
+        assert_eq!(execution_units(&d), vec![vec![1, 3]]);
+    }
+
+    #[tokio::test]
+    async fn cancel_reclaims_parallel_calls_and_keeps_invariants() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let mut events = Vec::new();
+        for i in 1..=3 {
+            events.extend(tool_use_events(&format!("t{i}"), "hang", "{}"));
+        }
+        events.push(done(3, 1));
+        let provider = MockProvider::new(vec![scripted(events)]);
+        let test_agent = agent_with(provider.clone(), Arc::new(HangProbe));
+        let mut session = temp_session(dir.path());
+
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let (result, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_with(&test_agent, &mut session, "go", token),
+        )
+        .await
+        .expect("取消必须在有界时间内回收全部并行任务");
+        assert_eq!(result.unwrap(), TurnResult::Interrupted);
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 3, "每个调用恰有一个答复");
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.0, format!("t{}", i + 1));
+            assert_eq!(r.1, INTERRUPTED_TEXT);
+            assert!(r.2);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_failure_is_isolated_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = tool_use_events("t1", "flaky", r#"{"tag":"a"}"#);
+        events.extend(tool_use_events("t2", "flaky", r#"{"tag":"bad"}"#));
+        events.extend(tool_use_events("t3", "flaky", r#"{"tag":"c"}"#));
+        events.push(done(6, 3));
+        let provider = MockProvider::new(vec![
+            scripted(events),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(provider.clone(), Arc::new(FlakyProbe));
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&test_agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done, "单个失败不终止 turn");
+        crate::message::validate(&session.messages).unwrap();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].2, "{}", results[0].1);
+        assert!(results[1].2, "失败必须落在 t2");
+        assert_eq!(results[1].1, "boom");
+        assert!(!results[2].2, "{}", results[2].1);
+    }
+
+    #[tokio::test]
+    async fn events_and_results_pair_one_to_one_with_call_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = ConcurrencyProbe::new(Duration::from_millis(20));
+        let mut events_in = Vec::new();
+        for i in 1..=3 {
+            events_in.extend(tool_use_events(
+                &format!("t{i}"),
+                "probe_read",
+                &format!(r#"{{"tag":"x{i}"}}"#),
+            ));
+        }
+        events_in.push(done(6, 3));
+        let provider = MockProvider::new(vec![
+            scripted(events_in),
+            scripted(vec![StreamEvent::TextDelta("done".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(provider, probe);
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&test_agent, &mut session, "go").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+
+        // 每个调用 id 恰一个 ToolStart / ToolDone，且 Start 先于 Done。
+        for id in ["t1", "t2", "t3"] {
+            let position = |predicate: &dyn Fn(&Event) -> bool| {
+                events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| predicate(e).then_some(i))
+                    .collect::<Vec<_>>()
+            };
+            let starts = position(&|e| matches!(e, Event::ToolStart { id: eid, .. } if eid == id));
+            let dones = position(&|e| matches!(e, Event::ToolDone { id: eid, .. } if eid == id));
+            assert_eq!(starts.len(), 1, "{id} 的 ToolStart 必须恰一个");
+            assert_eq!(dones.len(), 1, "{id} 的 ToolDone 必须恰一个");
+            assert!(starts[0] < dones[0], "{id} 的 Start 必须先于 Done");
+        }
+
+        // tool result 与调用 id 一一对应（顺序同 calls）。
+        let results = tool_results(&session.messages[2]);
+        let ids: Vec<&str> = results.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(ids, vec!["t1", "t2", "t3"]);
+        crate::message::validate(&session.messages).unwrap();
+    }
+
+    // ---- 会话图片预算（todo 13 / S15 最小行为） ----
+
+    #[test]
+    fn session_image_budget_rejects_with_actionable_note() {
+        let used = AtomicU64::new(0);
+        reserve_image_bytes(&used, 60, 100).unwrap();
+        assert_eq!(used.load(Ordering::SeqCst), 60);
+        let note = reserve_image_bytes(&used, 50, 100).unwrap_err();
+        assert!(note.contains("image budget"), "{note}");
+        assert!(note.contains("start a new session"), "可操作提示：{note}");
+        assert!(note.contains("60"), "{note}");
+        assert_eq!(used.load(Ordering::SeqCst), 60, "被拒图片不消耗预算");
+        reserve_image_bytes(&used, 40, 100).unwrap();
+        assert_eq!(used.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn session_image_bytes_sums_history_images() {
+        let messages = vec![
+            Message::user_text("hi".into()),
+            Message::assistant(vec![Content::Text("see".into())], None),
+            Message {
+                role: Role::User,
+                content: vec![
+                    Content::Image(ImageData {
+                        data: "Zm9v".into(),
+                        media_type: "image/png".into(),
+                    }),
+                    Content::Image(ImageData {
+                        data: "Zg==".into(),
+                        media_type: "image/png".into(),
+                    }),
+                ],
+                ts: 0,
+                usage: None,
+            },
+        ];
+        assert_eq!(session_image_bytes(&messages), 4); // 3 + 1 解码字节
+        assert_eq!(session_image_bytes(&messages[..2]), 0);
+    }
+
+    /// 超过会话预算的单张图片：不附上，工具结果带可操作提示，turn 照常完成。
+    #[tokio::test]
+    async fn over_budget_image_is_rejected_with_actionable_note() {
+        struct BigImage;
+
+        #[async_trait]
+        impl ToolSource for BigImage {
+            fn id(&self) -> &str {
+                "test:big"
+            }
+
+            async fn list(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "big_image".into(),
+                    description: "produces one huge image".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: true,
+                }]
+            }
+
+            async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+                // 无 padding 全 'A' base64：解码字节 = len/4*3 > SESSION_IMAGE_BUDGET。
+                let len = (SESSION_IMAGE_BUDGET as usize / 3 + 1) * 4;
+                ToolOutput {
+                    text: "loaded".to_string(),
+                    is_error: false,
+                    image: Some(ImageData {
+                        data: "A".repeat(len),
+                        media_type: "image/png".into(),
+                    }),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            scripted(vec![
+                StreamEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "big_image".into(),
+                },
+                StreamEvent::ToolUseDelta("{}".into()),
+                StreamEvent::ToolUseEnd,
+                done(3, 1),
+            ]),
+            scripted(vec![StreamEvent::TextDelta("ok".into()), done(2, 1)]),
+        ]);
+        let test_agent = agent_with(provider.clone(), Arc::new(BigImage));
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&test_agent, &mut session, "look").await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        crate::message::validate(&session.messages).unwrap();
+        let user = &session.messages[2];
+        assert_eq!(user.content.len(), 1, "超预算图片不得附上");
+        match &user.content[0] {
+            Content::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error, "工具本身成功，只是图片被拒");
+                assert!(
+                    content.contains("[image not attached: session image budget"),
+                    "{content}"
+                );
+                assert!(content.contains("start a new session"), "{content}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 }

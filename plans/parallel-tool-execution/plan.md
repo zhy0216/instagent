@@ -1,87 +1,107 @@
-# 并行执行工具（v2 候选落地）
+# 并行执行工具（已落地：repo-improvements todo 13）
+
+> 本文档最初版本写于 ADR 0002 之前，含交互式 approval / trust 假设，已全部
+> 删除。当前实现与 ADR 0002（工具自动执行、无审批 / trust / mode UI）、
+> ADR 0003（D2 env、D6 containment 责任边界）对齐。
 
 ## 意图
 
-模型一条回复里返回多个 tool call 时，instagent 目前在 `execute_calls`
-（`src/agent/mod.rs:220`）里用一个 `for` 循环逐个执行：审批 → hook → 执行 →
-下一个。读多个文件、跑多个独立命令时要串行等 N 次往返。本方案把它改成
-goose（commit `4ad43df`，`agents/state_machine/ops_toolcalling.rs`）的
-"先批量决策、再并发执行、按原序收集"两段式，即 `docs/goose-from-scratch-plan.md`
-§7 v2 表里的"并行执行工具"（估算 100 行）。
+模型一条回复里返回多个 tool call 时，instagent 过去在 `execute_calls`
+（`src/agent/mod.rs`）里用一个 `for` 循环逐个执行：读多个文件、跑多个独立
+命令要串行等 N 次往返。本方案把同一 assistant turn 内**可证明独立的只读
+调用**改为有界并发执行；写操作、同资源冲突与顺序敏感调用保持原顺序串行。
+同时给图片加单请求 / 单会话总字节预算（S15 的最小行为），并更新本文档删除
+过时的审批叙述。
 
-分析结论：接收侧已支持并行（两个 provider 的流式组装都能还原一条消息里的多个
-tool_use，有 `parallel_tool_calls` fixture），`Registry::call` / `ToolSource`
-均为 `&self + Send + Sync`，rmcp client 支持并发调用，`Registry` 的锁只护路由表
-查询——执行层没有阻碍。真正耦合串行的是**审批**（`approval.decide` 交互式阻塞）
-和 **PreToolUse hook**（外部命令、按插件顺序串行），这两者必须留在串行阶段。
+## 安全前提（sandbox 边界与并行安全）
 
-## 目标
-
-- 同一条 assistant 消息里的多个合法 tool call 并发执行（`futures::future::join_all`）。
-- 会话不变量不变：结果 `Vec<Content>` 顺序与 calls 一致，每个 `tool_use_id` 恰好一个答复。
-- 审批、PreToolUse hook 的语义与时序不变（仍逐个、按序、可交互）。
-- 取消语义不变：运行中的 call 走现有 `tokio::select!` 短路，未启动的补 `Content::interrupted`。
-
-## 非目标
-
-- 不做并发上限（goose 也不做；模型单条消息的 call 数天然有限）。
-- 不加配置开关（不加 `parallel_tools: bool` 之类，YAGNI）。
-- 不改 `render.rs`（事件按 id 键控，交错的 ToolStart/ToolDone 渲染只是观感问题，
-  且与 goose 一致；将来嫌乱再给 ToolDone 带名字）。
-- 不动 `docs/goose-from-scratch-plan.md` §7 表（roadmap 文档不回改）。
+- **工具自动执行，无交互审批**（ADR 0002）：并行化不引入任何交互式
+  approval / trust / mode UI；PreToolUse / PostToolUse hook 仍是唯一的策略
+  层，且是配置驱动的非交互决策。
+- **唯一强制隔离层是外部 sandbox**（ADR 0003 D6）：应用层不承诺路径
+  containment，并行的安全判定因此只做**保守降级**——判定不确定时一律串行。
+  并行只发生在声明为只读的调用之间；写、顺序敏感、同资源冲突的调用永远按
+  原顺序串行。资源键只做词法比较（不解析相对 / 绝对别名与符号链接）：
+  漏配只可能让两个只读调用并行（互读无害），误配只会降级为串行，两个方向
+  都不破坏顺序、不产生新的越权面。
+- **并行不改变信任假设**：各 `ToolSource` 对并发 `call` 的安全性与串行时
+  相同——`Registry` 锁只护路由表；builtin 是无状态函数；command 工具每次起
+  独立子进程（进程组 + `kill_on_drop`）；rmcp client 支持并发；skills 只读
+  文件。MCP 工具未声明 `readOnlyHint` 时默认按顺序敏感（串行）。
+- **预算与取消是共享的**：并行任务共用同一 `ToolCtx`（cwd + 取消令牌）、
+  工具各自的输出预算（04/05/06 已落地的上限全部不变），以及会话图片预算。
 
 ## 方案
 
-### 三段式重写 `execute_calls`（`src/agent/mod.rs`，唯一改动的业务文件）
+### 能力元数据（`src/tools/mod.rs`）
 
-**阶段 1：串行决策（保持现有顺序）**
-按 calls 顺序逐个处理，产出每个 call 的处置：
+- `ToolKind`：`ReadOnly`（可与其它只读调用并行）/ `Serial`（写或顺序敏感，
+  串行）。只读声明来自各来源既有的 `ToolSpec::read_only`。
+- `CallCapability { kind, resource }`：`resource` 是调用级资源冲突键。内核
+  只为内置 fs 系工具（read / write / edit / tree / read_image）按输入
+  `path` 字段生成；其它来源（MCP / command / skills）无可靠资源声明 →
+  `None`，仅依赖 `kind`。
+- `Registry::capability(call)`：查已注册 `ToolSpec`（未知工具保守按
+  `Serial`）+ 来源路由得到能力。
 
-- `streamed.malformed` 命中 → 直接得错误结果（现状不变）；
-- `streamed.cancelled || cancel.is_cancelled()` → `Content::interrupted`（现状不变）;
-- `approval.decide` 拒绝 → deny 事件 + 结果（现状不变）；
-- PreToolUse hook Block → 错误结果（现状不变）；
-- 其余 → 标记为 **Execute**，进入阶段 2。
+### 三段式执行（`src/agent/mod.rs` `execute_calls`）
 
-即：交互点（审批）与外部命令（hook）全部留在串行段，行为与今天逐字一致。
+1. **串行决策**：按原顺序处理 malformed（is_error 结果）、取消
+   （`Content::interrupted`）、PreToolUse hook（Block → is_error 结果）。
+   交互点与策略钩子不进并行阶段，语义与串行版逐字一致。
+2. **执行单元划分**（`execution_units`）：Ready 调用按原顺序扫描——同单元
+   内全为 ReadOnly 且资源键互不相同；Serial 调用各自独立成单元；Finished
+   不执行、不影响划分。
+3. **执行**：单元按原顺序串行执行；单元内调用以
+   `futures::future::join_all` + `Semaphore`（`PARALLEL_TOOL_LIMIT = 4`）
+   有界并发。结果按原下标落槽，最终顺序与 calls 一致。
 
-**阶段 2：并发执行**
-对阶段 1 标为 Execute 的 calls，每个包一个 async 任务（内容 = 现循环体里的
-执行段：emit ToolStart → `tokio::select!` cancel / `tools.call` → emit ToolDone
-→ PostToolUse hook），`futures::future::join_all` 并发跑。
-任务返回 `(原下标, Content)`。
+不变量：
 
-**阶段 3：按原序收集**
-结果写入 `Vec<Option<Content>>` 的对应下标，最后 `unwrap` 成 `Vec<Content>`，
-保证顺序与 calls 一致（与现状相同）。
+- 每个 `tool_use_id` 恰一个答复；结果顺序与 calls 一致（`message::validate`
+  兜底）。
+- 事件仍按调用 id 键控（`ToolStart` / `ToolDone` 各带 id）；并发只使不同
+  id 的事件交错，不产生孤儿事件。
+- 取消：在途任务经 `tokio::select!` 短路（子进程靠 `kill_on_drop` 回收）、
+  未启动的单元补 `Content::interrupted`；`kill_on_drop` 与进程组约定不变。
+- PostToolUse hook 在各任务内随结果触发（观察型事件，决策忽略）。
 
-### 设计决策
+### 图片预算（S15 最小行为，不含 RM2 blob/reference）
 
-| 决策 | 选择 | 理由 |
-|---|---|---|
-| 审批位置 | 串行阶段，全部批完再执行 | 交互式提示不可并发；goose 同构（审批由独立操作提前解决，执行时不再交互） |
-| PreToolUse hook | 串行阶段逐个跑 | hooks 协议是外部命令按插件顺序串行（`hooks.rs:296`）；goose 的 dispatch 循环同样串行跑 pre-hook |
-| PostToolUse hook | 在各任务内、各自结果出来后跑 | 观察型事件、决策被忽略，随完成时序触发即可（goose `with_post_tool_hooks` 同款） |
-| 结果顺序 | 按 calls 原序 | 会话不变量与现状一致；tool_use_id 配对虽不依赖顺序，但保持稳定便于测试与 diff |
-| 并发原语 | `futures::future::join_all` | 依赖已在（`compact.rs` 已用 `futures`）；无需 `select_all`——instagent 的 ToolResult 是 await 出的值，不是 goose 那种多路流 |
-| 取消 | 任务内沿用现有 `tokio::select!`；阶段 1 开头检查短路 | 与现状逐字一致，不新增语义 |
+- **会话总预算**（`src/agent/mod.rs` `SESSION_IMAGE_BUDGET = 64 MiB`）：
+  同一会话全部 `Content::Image` 解码字节之和的上限。新图片会使总量超限时
+  不附上，对应工具结果文本带可操作提示（已用多少、本图多大、建议完成当前
+  分析或开新会话）。原子计数（CAS）防并行调用同时通过检查。
+- **单请求预算**（`src/provider/openai.rs` `REQUEST_IMAGE_BUDGET = 32 MiB`）：
+  请求边界对历史图片先**去重**（相同 `media_type + data` 只内嵌首次出现，
+  其余替换为去重提示），解码字节总和仍超限时按**生命周期淘汰**（最旧优先、
+  保留最新），被淘汰位置替换为可操作的重读提示。
+- 不做 blob/reference 存储、不引入新 decoder 依赖、不改会话格式；两层预算
+  都只在边界做替换 / 拒绝，会话 JSONL 保持原样。
 
-### 拆解
+## 拆解（单任务，一个 commit）
 
-单任务，无内部依赖（一个 commit）：
+1. `src/tools/mod.rs`：`ToolKind` / `CallCapability` / `Registry::capability`、
+   `ImageData::decoded_bytes`，及能力解析测试。
+2. `src/agent/mod.rs`：三段式 `execute_calls`、`execution_units`、会话图片
+   预算与拒绝提示，及并发 / 顺序 / 取消 / 失败隔离 / 事件配对 / 预算测试。
+3. `src/provider/openai.rs`：`REQUEST_IMAGE_BUDGET`、`plan_images`
+   （去重 + 淘汰）、`format_messages` 接线，及预算测试。
+4. 本文档更新（删除 approval / trust 假设，写明 sandbox 边界与并行安全前提）。
 
-1. 重写 `execute_calls` 为三段式（约 -100 / +120 行，含拆分出的执行任务函数）。
-2. 新增测试（同文件 `mod tests`，沿用 `MockProvider` + 脚本流约定）：
-   - **并发证明**：注册一个测试用 `ToolSource`，`call` 里等
-     `tokio::sync::Barrier::new(2)`——串行执行会死锁（套 `tokio::time::timeout`
-     断言不超时），并发则双双通过；
-   - **顺序保持**：一条 assistant 消息两个 call，结果顺序与 calls 一致；
-   - **混合分支**：malformed + deny + 正常并发混排，各自结果落在正确下标；
-   - **取消**：并发执行中 cancel，运行中的得 interrupted 错误结果、未启动的得
-     `Content::interrupted`，会话不变量校验（`message.rs` 的校验函数）通过。
-3. 现有 21 个 loop 测试（`mod tests` 里 `full_loop_text_tool_text`、
-   `approve_deny_becomes_error_tool_result`、`pre_tool_use_block_*` 等）不改语义，
-   必须原样通过——它们是串行行为的回归基线。
+## 测试覆盖
+
+- **并发**：两个只读调用等 `Barrier::new(2)`——串行会死锁、并行双双通过
+  （10s timeout 兜底）；6 个只读调用峰值并发恰为 `PARALLEL_TOOL_LIMIT`。
+- **顺序 / 冲突**：`execution_units` 纯函数覆盖同资源键、Serial、Finished
+  混排的划分；写（Serial）与读分属不同单元、峰值并发为 1 的端到端断言。
+- **取消 / 超时**：3 个永不返回的只读调用并行中取消——有界时间内全部回收，
+  每个调用恰一个 interrupted 结果，`message::validate` 通过。
+- **失败隔离**：并行中单个调用失败，其余照常成功，失败落在正确的调用 id。
+- **事件顺序**：每个调用 id 恰一个 `ToolStart` / `ToolDone` 且 Start 先于
+  Done；tool result 与调用 id 一一对应且顺序同 calls。
+- **图片预算**：去重只内嵌首次出现；超限从最旧淘汰、替换文本可操作；会话
+  预算拒绝新图且提示可操作、被拒图片不落会话。
 
 ## 校验
 
@@ -89,21 +109,16 @@ tool_use，有 `parallel_tool_calls` fixture），`Registry::call` / `ToolSource
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo rustdoc --lib -- -D warnings
 ```
 
-（AGENTS.md 约定的三条，每个 commit 必须全绿。）
-
-验收：新增的 barrier 测试证明并发；既有测试全绿证明审批 / hook / 取消 / 会话
-不变量无语义回归。
+（AGENTS.md 约定的三条 + rustdoc，每个 commit 必须全绿。）
 
 ## 风险与假设
 
-- **假设**：`ToolSource` 实现（builtin / mcp / command / skills）对并发 `call`
-  安全。已核对：`Registry` 锁只护路由表；builtin 是无状态函数；command tools 每次
-  起独立子进程（`03` 的进程组 + kill_on_drop）；rmcp client 支持并发。skills 来源
-  只读文件。若将来出现有状态来源，需在其实现内部自行同步。
-- **风险**：approve 模式下多个 call 会连续弹审批提示再一起执行——这是预期行为
-  （先批后跑），与逐个"批一个跑一个"的体感不同，在 commit message 里写明即可。
-- **风险**：并发事件交错使 `render.rs` 的 `✓ {elapsed} ms` 行与 `▶` 行不一定相邻。
-  纯观感，非目标内，不处理。
-- **假设**：模型单条消息的 tool call 数量较小（实践中 < 20），不设并发上限。
+- 模型单条消息的 tool call 数量较小（实践中 < 20），并发上限 4 已足够；
+  若 MCP 等远端并行来源成为瓶颈，调整 `PARALLEL_TOOL_LIMIT` 即可。
+- 并发事件交错使 `render` 的 `✓ {elapsed} ms` 行与 `▶` 行不一定相邻——
+  事件按 id 键控，纯观感，不处理。
+- `readOnlyHint` / `read_only` 声明是来源的自我描述；恶意来源谎报只读属于
+  sandbox 的责任面（ADR 0002 / 0003 D6），应用层不为它做额外验证。

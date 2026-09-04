@@ -52,6 +52,46 @@ pub struct ImageData {
     pub media_type: String,
 }
 
+impl ImageData {
+    /// base64 负载的解码后字节数（4 字符 → 3 字节，扣尾部 padding）；只做
+    /// 预算记账，不解码、不引入 decoder（todo 13 图片预算）。
+    pub fn decoded_bytes(&self) -> u64 {
+        let groups = self.data.len() / 4;
+        let pad = self
+            .data
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'=')
+            .count()
+            .min(2);
+        (groups * 3).saturating_sub(pad) as u64
+    }
+}
+
+/// 工具执行类别（todo 13）：同一 assistant turn 内并行调度的唯一依据。
+/// 只读声明来自各来源 [`ToolSpec::read_only`]；没有声明或未知的工具一律按
+/// 顺序敏感处理——只并行可证明独立的只读调用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    /// 只读：不改变外部状态，可与其他 ReadOnly 调用并行。
+    ReadOnly,
+    /// 写操作或顺序敏感：保持原顺序串行执行。
+    Serial,
+}
+
+/// 单个待执行调用的能力 = 工具级只读标记 + 调用级资源键（todo 13）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallCapability {
+    pub kind: ToolKind,
+    /// 资源冲突键（如内置 fs 工具输入的 `path`）；同一 turn 内同键调用视为
+    /// 顺序敏感，按原顺序串行。None = 资源未知，只依赖 `kind` 判断。
+    /// 键只做词法比较（不解析相对/绝对别名与符号链接——路径 containment
+    /// 是 sandbox 的责任面，ADR 0003 D6）：漏配只可能让两个只读调用并行
+    /// （互读无害），误配只会降级为串行，都不破坏顺序。
+    pub resource: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub text: String,
@@ -247,6 +287,21 @@ impl Registry {
         }
     }
 
+    /// 解析一个调用的执行能力（todo 13 并行调度依据）：`read_only` 取已注册
+    /// [`ToolSpec`]（未知工具保守按顺序敏感）；资源键只由内核为内置 fs 系
+    /// 工具生成（输入的 `path` 字段，词法比较，见 [`CallCapability::resource`]）。
+    pub async fn capability(&self, call: &ToolCall) -> CallCapability {
+        let specs = self.list().await;
+        let kind = match specs.iter().find(|s| s.name == call.name) {
+            Some(spec) if spec.read_only => ToolKind::ReadOnly,
+            _ => ToolKind::Serial,
+        };
+        let resource = self.lookup_cached(&call.name).and_then(|route| {
+            builtin_resource_key(self.sources[route.source].id(), &route.name, &call.input)
+        });
+        CallCapability { kind, resource }
+    }
+
     async fn lookup(&self, visible: &str) -> Option<Route> {
         if let Some(route) = self.lookup_cached(visible) {
             return Some(route);
@@ -266,6 +321,21 @@ impl Registry {
         for source in &self.sources {
             source.shutdown().await;
         }
+    }
+}
+
+/// 内置 fs 系工具的资源键（todo 13）：输入 `path` 字段原样作为冲突键。
+/// 其余来源（MCP / command / skills）没有可靠的资源声明 → None。
+fn builtin_resource_key(source_id: &str, name: &str, input: &Value) -> Option<String> {
+    if source_id != "builtin" {
+        return None;
+    }
+    match name {
+        "read" | "write" | "edit" | "tree" | "read_image" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
     }
 }
 
@@ -598,6 +668,115 @@ mod tests {
             !output.is_error,
             "缓存外新工具应触发重建而非 unknown: {}",
             output.text
+        );
+    }
+
+    // ---- 能力元数据（todo 13） ----
+
+    #[test]
+    fn image_decoded_bytes_matches_base64_vectors() {
+        let png = |data: &str| ImageData {
+            data: data.to_string(),
+            media_type: "image/png".to_string(),
+        };
+        // 与 message.rs 的 check_base64 向量同口径（解码字节数）。
+        assert_eq!(png("Zg==").decoded_bytes(), 1);
+        assert_eq!(png("Zm8=").decoded_bytes(), 2);
+        assert_eq!(png("Zm9v").decoded_bytes(), 3);
+        assert_eq!(png("Zm9vYmFy").decoded_bytes(), 6);
+        // 预算记账不因坏输入 panic / 下溢（校验在 message 边界）。
+        assert_eq!(png("").decoded_bytes(), 0);
+        assert_eq!(png("==").decoded_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_capability_marks_builtin_read_only_with_resource_key() {
+        let mut registry = Registry::new();
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        registry.list().await;
+
+        let call = |name: &str, input: Value| ToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            input,
+        };
+        assert_eq!(
+            registry
+                .capability(&call("read", json!({"path": "a.txt"})))
+                .await,
+            CallCapability {
+                kind: ToolKind::ReadOnly,
+                resource: Some("a.txt".to_string()),
+            }
+        );
+        assert_eq!(
+            registry
+                .capability(&call("write", json!({"path": "b.txt", "content": "x"})))
+                .await,
+            CallCapability {
+                kind: ToolKind::Serial,
+                resource: Some("b.txt".to_string()),
+            },
+            "写操作即使带资源键也必须串行"
+        );
+        assert_eq!(
+            registry
+                .capability(&call("shell", json!({"command": "ls"})))
+                .await,
+            CallCapability {
+                kind: ToolKind::Serial,
+                resource: None,
+            }
+        );
+        // 未知工具保守按顺序敏感。
+        assert_eq!(
+            registry.capability(&call("nope", json!({}))).await.kind,
+            ToolKind::Serial
+        );
+    }
+
+    /// 声明 read_only 的远端来源（模拟带 readOnlyHint 的 MCP 工具）。
+    struct ReadOnlySource;
+
+    #[async_trait]
+    impl ToolSource for ReadOnlySource {
+        fn id(&self) -> &str {
+            "mcp:p/srv"
+        }
+
+        async fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "remote_read".to_string(),
+                description: "remote read".to_string(),
+                input_schema: json!({"type": "object"}),
+                read_only: true,
+            }]
+        }
+
+        async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput::ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_capability_trusts_declared_read_only_without_resource() {
+        let mut registry = Registry::new();
+        registry.register(Arc::new(ReadOnlySource));
+        registry.register(Arc::new(BuiltinTools::new(None)));
+        registry.list().await;
+
+        // 非内置来源声明 read_only 也采信，但资源键未知 → None。
+        let mcp_call = ToolCall {
+            id: "t".to_string(),
+            name: "remote_read".to_string(),
+            input: json!({"path": "x"}),
+        };
+        assert_eq!(
+            registry.capability(&mcp_call).await,
+            CallCapability {
+                kind: ToolKind::ReadOnly,
+                resource: None,
+            }
         );
     }
 

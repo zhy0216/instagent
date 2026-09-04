@@ -22,8 +22,16 @@
 //! arguments 又会按 index 交错到达，所以 tool 事件在流结束（`[DONE]` /
 //! 断流）时按 index 升序整组 flush（Start→Delta→End），文本 delta 即时透传。
 //! 构造入参 = provider JSON 定义，供 `10` registry 调用。
+//!
+//! 图片请求预算（todo 13 / S15 最小行为）：每次请求对历史图片先去重
+//! （相同内容只内嵌首次出现），解码字节总和仍超 [`REQUEST_IMAGE_BUDGET`]
+//! 时从最旧开始淘汰（生命周期淘汰、保留最新），被淘汰 / 去重的位置替换为
+//! 可操作的重读提示。会话侧的新图拒绝见 [`crate::agent::SESSION_IMAGE_BUDGET`]；
+//! 不做 RM2 的 blob/reference 存储，不引入新 decoder。
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use async_trait::async_trait;
@@ -146,12 +154,17 @@ fn clamp_max_tokens(def: &ProviderDef, req: &mut Request<'_>) {
     }
 }
 
+/// 单请求图片总字节预算（todo 13 / S15）：一次请求内嵌全部图片的解码字节
+/// 上限；先对重复图片去重，超限按生命周期淘汰（最旧优先）。会话侧预算见
+/// [`crate::agent::SESSION_IMAGE_BUDGET`]。
+pub const REQUEST_IMAGE_BUDGET: u64 = 32 * 1024 * 1024;
+
 fn build_request_body(req: &Request<'_>) -> crate::Result<Value> {
     let mut messages = Vec::new();
     if !req.system.is_empty() {
         messages.push(json!({"role": "system", "content": req.system}));
     }
-    messages.extend(format_messages(req.messages));
+    messages.extend(format_messages(req.messages, REQUEST_IMAGE_BUDGET));
 
     let mut body = json!({
         "model": req.model,
@@ -169,10 +182,103 @@ fn build_request_body(req: &Request<'_>) -> crate::Result<Value> {
     Ok(body)
 }
 
+/// 单个图片槽位（消息下标, block 下标）在本请求内的处置（todo 13）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePlan {
+    /// 正常内嵌（该内容在本请求内的首次出现）。
+    Embed,
+    /// 与请求内更早的图片内容相同，去重（替换为提示文本）。
+    Duplicate,
+    /// 预算超限被淘汰（替换为可重读提示文本）。
+    Evicted,
+}
+
+/// 去重指纹：FNV-1a 64（media_type + data）。碰撞只影响去重判定（概率极
+/// 低），不影响字节记账，也不触碰会话数据。
+fn image_fingerprint(image: &crate::tools::ImageData) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let bytes = image
+        .media_type
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0u8))
+        .chain(image.data.as_bytes());
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 图片预算规划（todo 13 / S15 最小行为）：相同内容只内嵌首次出现（去重）；
+/// 解码字节总和仍超 `budget` 时，从最旧开始淘汰、保留最新（生命周期淘汰）。
+/// 被淘汰内容的所有出现位置都标为 Evicted。纯函数，可用小预算测试；生产
+/// 接线用 [`REQUEST_IMAGE_BUDGET`]。
+fn plan_images(messages: &[Message], budget: u64) -> HashMap<(usize, usize), ImagePlan> {
+    // (槽位, 指纹, 解码字节)，按出现顺序。
+    let mut occurrences: Vec<((usize, usize), u64, u64)> = Vec::new();
+    let mut first_slot: HashMap<u64, (usize, usize)> = HashMap::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        for (block_index, block) in message.content.iter().enumerate() {
+            let Content::Image(image) = block else {
+                continue;
+            };
+            let fingerprint = image_fingerprint(image);
+            first_slot
+                .entry(fingerprint)
+                .or_insert((message_index, block_index));
+            occurrences.push((
+                (message_index, block_index),
+                fingerprint,
+                image.decoded_bytes(),
+            ));
+        }
+    }
+    // 预算：canonical（首次）出现自新到旧保留，直至总额用尽。
+    let mut embedded: HashSet<u64> = HashSet::new();
+    let mut used = 0u64;
+    for &(slot, fingerprint, bytes) in occurrences.iter().rev() {
+        if first_slot.get(&fingerprint) != Some(&slot) {
+            continue;
+        }
+        if used + bytes <= budget {
+            used += bytes;
+            embedded.insert(fingerprint);
+        }
+    }
+    occurrences
+        .into_iter()
+        .map(|(slot, fingerprint, _)| {
+            let decision = if !embedded.contains(&fingerprint) {
+                ImagePlan::Evicted
+            } else if first_slot[&fingerprint] == slot {
+                ImagePlan::Embed
+            } else {
+                ImagePlan::Duplicate
+            };
+            (slot, decision)
+        })
+        .collect()
+}
+
+/// 去重槽位的替换文本（可操作：说明相同内容已在前文内嵌）。
+const DUPLICATE_IMAGE_NOTE: &str =
+    "[duplicate image omitted: identical image content is already embedded earlier in this request]";
+
+/// 淘汰槽位的替换文本（可操作：超出哪个预算、如何重新取回）。
+fn evicted_image_note(budget: u64) -> String {
+    format!(
+        "[image omitted: request image budget of {} MiB exceeded; re-read the file if you still need it]",
+        budget / (1024 * 1024)
+    )
+}
+
 /// [`Message`] 列表 → OpenAI `messages` 数组（怪癖 1 / 3 / 4 的请求侧）。
-fn format_messages(messages: &[Message]) -> Vec<Value> {
+/// 图片按 [`plan_images`] 在 `image_budget` 内去重 / 淘汰。
+fn format_messages(messages: &[Message], image_budget: u64) -> Vec<Value> {
+    let image_plan = plan_images(messages, image_budget);
     let mut out = Vec::new();
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         match message.role {
             Role::Assistant => {
                 let mut texts = Vec::new();
@@ -212,7 +318,7 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                 let mut texts = Vec::new();
                 let mut results = Vec::new();
                 let mut images = Vec::new();
-                for content in &message.content {
+                for (block_index, content) in message.content.iter().enumerate() {
                     match content {
                         Content::Text(text) => texts.push(text.clone()),
                         Content::ToolResult {
@@ -226,12 +332,20 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                         })),
                         Content::ToolUse { .. } => {}
                         // goose convert_image 的 OpenAI 形状：data URL。
-                        Content::Image(img) => images.push(json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{};base64,{}", img.media_type, img.data),
+                        Content::Image(img) => match image_plan[&(message_index, block_index)] {
+                            ImagePlan::Embed => images.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", img.media_type, img.data),
+                                }
+                            })),
+                            ImagePlan::Duplicate => {
+                                images.push(json!({"type": "text", "text": DUPLICATE_IMAGE_NOTE}))
                             }
-                        })),
+                            ImagePlan::Evicted => images.push(
+                                json!({"type": "text", "text": evicted_image_note(image_budget)}),
+                            ),
+                        },
                     }
                 }
                 // 怪癖 3：tool 消息紧跟含 tool_calls 的 assistant 消息；
@@ -508,7 +622,7 @@ mod tests {
                 None,
             ),
         ];
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         assert_eq!(spec.len(), 2);
         let assistant = &spec[1];
         assert_eq!(assistant["role"], "assistant");
@@ -534,7 +648,7 @@ mod tests {
             ],
             None,
         )];
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         assert_eq!(spec[0]["content"], "thinking");
         // 怪癖 4 请求侧：空输入序列化为 "{}"。
         assert_eq!(spec[0]["tool_calls"][0]["function"]["arguments"], "{}");
@@ -627,7 +741,7 @@ mod tests {
             Message::assistant(vec![Content::Text("done".into())], None),
         ];
         crate::message::validate(&messages).unwrap();
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
         // assistant(tool_calls) → 两条 tool → user 文本，顺序如此即满足怪癖 3。
         assert_eq!(
@@ -673,7 +787,7 @@ mod tests {
             },
         ];
         crate::message::validate(&messages).unwrap();
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
         // 怪癖 3 在有图时不被破坏：tool 仍紧跟含 tool_calls 的 assistant。
         assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
@@ -701,7 +815,7 @@ mod tests {
             ts: 0,
             usage: None,
         }];
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         assert_eq!(
             spec,
             vec![json!({
@@ -718,8 +832,143 @@ mod tests {
     fn user_message_without_image_keeps_string_content() {
         // 回归：无 Image 时行为逐字不变（quirk3_* 之外再钉死形状）。
         let messages = vec![Message::user_text("plain".into())];
-        let spec = format_messages(&messages);
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
         assert_eq!(spec, vec![json!({"role": "user", "content": "plain"})]);
+    }
+
+    // ---- 图片请求预算：去重 + 生命周期淘汰（todo 13 / S15） ----
+
+    fn image_content(data: &str) -> Content {
+        Content::Image(crate::tools::ImageData {
+            data: data.to_string(),
+            media_type: "image/png".to_string(),
+        })
+    }
+
+    fn user_blocks(content: Vec<Content>) -> Message {
+        Message {
+            role: Role::User,
+            content,
+            ts: 0,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn plan_images_dedupes_identical_content_to_first_occurrence() {
+        let messages = vec![
+            user_blocks(vec![image_content("AAA=")]),
+            Message::assistant(vec![Content::Text("next".into())], None),
+            user_blocks(vec![image_content("AAA="), image_content("AA==")]),
+        ];
+        let plan = plan_images(&messages, 1024);
+        assert_eq!(plan[&(0, 0)], ImagePlan::Embed);
+        assert_eq!(
+            plan[&(2, 0)],
+            ImagePlan::Duplicate,
+            "相同内容只内嵌首次出现"
+        );
+        assert_eq!(plan[&(2, 1)], ImagePlan::Embed);
+    }
+
+    #[test]
+    fn plan_images_evicts_oldest_first_when_over_budget() {
+        // "AAA=" = 2 解码字节、"AA==" = 1 解码字节；预算 2 → 保最新。
+        let messages = vec![
+            user_blocks(vec![image_content("AAA=")]),
+            Message::assistant(vec![Content::Text("next".into())], None),
+            user_blocks(vec![image_content("AA==")]),
+        ];
+        let plan = plan_images(&messages, 2);
+        assert_eq!(plan[&(0, 0)], ImagePlan::Evicted, "生命周期淘汰：最旧先出");
+        assert_eq!(plan[&(2, 0)], ImagePlan::Embed);
+
+        // 被删内容的后续重复出现同样淘汰（内容根本没有内嵌）。
+        let with_dup = vec![
+            user_blocks(vec![image_content("AAA=")]),
+            Message::assistant(vec![Content::Text("next".into())], None),
+            user_blocks(vec![image_content("AAA="), image_content("AA==")]),
+        ];
+        let plan = plan_images(&with_dup, 1);
+        assert_eq!(plan[&(0, 0)], ImagePlan::Evicted);
+        assert_eq!(plan[&(2, 0)], ImagePlan::Evicted);
+        assert_eq!(plan[&(2, 1)], ImagePlan::Embed);
+
+        // 预算充足：全部内嵌，无淘汰。
+        let plan = plan_images(&with_dup, REQUEST_IMAGE_BUDGET);
+        assert_eq!(plan[&(0, 0)], ImagePlan::Embed);
+        assert_eq!(plan[&(2, 0)], ImagePlan::Duplicate);
+        assert_eq!(plan[&(2, 1)], ImagePlan::Embed);
+    }
+
+    #[test]
+    fn format_messages_replaces_evicted_and_duplicate_images_with_notes() {
+        let messages = vec![
+            Message::user_text("look".into()),
+            Message::assistant(
+                vec![Content::ToolUse {
+                    id: "c1".into(),
+                    name: "read_image".into(),
+                    input: json!({"path": "x.png"}),
+                }],
+                None,
+            ),
+            user_blocks(vec![
+                Content::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "Loaded image".into(),
+                    is_error: false,
+                },
+                image_content("AAA="), // 2 字节：超预算 → 淘汰
+                image_content("AAA="), // 重复且内容未内嵌 → 淘汰
+                image_content("AA=="), // 1 字节：最新 → 保留
+            ]),
+        ];
+        crate::message::validate(&messages).unwrap();
+        let spec = format_messages(&messages, 1);
+        let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        let parts = spec[3]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("re-read the file"),
+            "淘汰提示可操作：{}",
+            parts[0]["text"]
+        );
+        assert_eq!(parts[1]["type"], "text");
+        assert_eq!(
+            parts[2],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AA=="}
+            }),
+            "预算内保留最新图片"
+        );
+    }
+
+    #[test]
+    fn format_messages_dedupe_note_explains_identical_content() {
+        let messages = vec![
+            user_blocks(vec![image_content("AAA=")]),
+            Message::assistant(vec![Content::Text("next".into())], None),
+            user_blocks(vec![image_content("AAA=")]),
+        ];
+        let spec = format_messages(&messages, REQUEST_IMAGE_BUDGET);
+        let parts = spec[2]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate image omitted"),
+            "{}",
+            parts[0]["text"]
+        );
     }
 
     // ---- 响应侧状态机 ----
