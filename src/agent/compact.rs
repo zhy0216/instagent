@@ -212,6 +212,11 @@ pub(crate) fn format_history(messages: &[Message]) -> String {
                         "tool_result {tool_use_id} (error={is_error}): {body}\n"
                     ));
                 }
+                Content::Image(img) => out.push_str(&format!(
+                    "{role}: [image: {}, {} base64 bytes omitted]\n",
+                    img.media_type,
+                    img.data.len()
+                )),
             }
         }
     }

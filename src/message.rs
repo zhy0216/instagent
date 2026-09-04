@@ -23,7 +23,7 @@ pub enum Role {
     Assistant,
 }
 
-/// 无 Image / Thinking（v1）。
+/// 含 Image（图片支持方案），无 Thinking（v1）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Content {
@@ -38,6 +38,8 @@ pub enum Content {
         content: String,
         is_error: bool,
     },
+    /// 形状 `{"data": ..., "media_type": ...}`（ImageData）。
+    Image(crate::tools::ImageData),
 }
 
 /// 只有 assistant 消息有 usage；压缩触发直接用上一次响应的 `input`。
@@ -213,11 +215,46 @@ mod tests {
                 content: "file1".into(),
                 is_error: false,
             },
+            Content::Image(crate::tools::ImageData {
+                data: "aGVsbG8=".into(),
+                media_type: "image/png".into(),
+            }),
         ];
         for c in &contents {
             let json = serde_json::to_string(c).unwrap();
             let back: Content = serde_json::from_str(&json).unwrap();
             assert_eq!(&back, c);
+        }
+        assert_eq!(
+            serde_json::to_string(&contents[3]).unwrap(),
+            r#"{"data":"aGVsbG8=","media_type":"image/png"}"#
+        );
+    }
+
+    #[test]
+    fn untagged_old_shapes_do_not_match_image() {
+        let old: Vec<(Content, &str)> = vec![
+            (Content::Text("hi".into()), r#""hi""#),
+            (
+                Content::ToolUse {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+                r#"{"id":"t1","name":"shell","input":{"command":"ls"}}"#,
+            ),
+            (
+                Content::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "file1".into(),
+                    is_error: false,
+                },
+                r#"{"tool_use_id":"t1","content":"file1","is_error":false}"#,
+            ),
+        ];
+        for (expected, json) in old {
+            let parsed: Content = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed, expected, "{json} 不应误配为 Image");
         }
     }
 
@@ -328,6 +365,7 @@ mod tests {
         let out = ToolOutput {
             text: "42".into(),
             is_error: false,
+            image: None,
         };
         assert_eq!(
             Content::tool_result(&call, out),

@@ -43,10 +43,21 @@ pub struct ToolSpec {
     pub read_only: bool,
 }
 
+/// 图片负载：base64 数据 + media type（图片支持方案 §数据模型）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageData {
+    /// base64 标准字母表编码的原始字节。
+    pub data: String,
+    /// image/png | image/jpeg | image/gif | image/webp。
+    pub media_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageData>,
 }
 
 impl ToolOutput {
@@ -54,6 +65,7 @@ impl ToolOutput {
         Self {
             text,
             is_error: false,
+            image: None,
         }
     }
 
@@ -61,6 +73,7 @@ impl ToolOutput {
         Self {
             text,
             is_error: true,
+            image: None,
         }
     }
 }
@@ -307,6 +320,18 @@ mod tests {
         // 前缀相同、后缀不同的两个超长名字不会撞车。
         let other = format!("{}b", "a".repeat(99));
         assert_ne!(visible, model_visible_name(&other));
+    }
+
+    #[test]
+    fn tool_output_json_shape_is_backward_compatible() {
+        let out = ToolOutput::ok("hi".into());
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            r#"{"text":"hi","is_error":false}"#,
+            "无 image 时序列化结果与加字段前逐字一致"
+        );
+        let old: ToolOutput = serde_json::from_str(r#"{"text":"hi","is_error":false}"#).unwrap();
+        assert_eq!(old.image, None);
     }
 
     #[tokio::test]

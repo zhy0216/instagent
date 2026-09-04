@@ -401,6 +401,7 @@ fn call_result_to_output(result: &CallToolResult) -> ToolOutput {
     ToolOutput {
         text,
         is_error: result.is_error.unwrap_or(false),
+        image: None,
     }
 }
 

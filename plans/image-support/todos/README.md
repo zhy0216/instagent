@@ -7,7 +7,7 @@
 
 | 文件 | 优先级 | 难度 | 说明 |
 |---|---|---|---|
-| 01-data-model.md | P0 | medium | `ImageData` / `ToolOutput.image` / `Content::Image` 新变体 + 两处穷举匹配占位臂 + serde round-trip 测试 |
+| done/01-data-model.md ✅ | P0 | medium | `ImageData` / `ToolOutput.image` / `Content::Image` 新变体 + 两处穷举匹配占位臂 + serde round-trip 测试 |
 | 02-read-image-tool.md | P1 | hard | 新工具 `read_image`：手写 base64、魔数嗅探、错误文案、注册与端到端测试 |
 | 03-loop-wiring.md | P1 | medium | `execute_calls` 把 `output.image` 拆成同消息 `Image` 块 + loop 级测试 |
 | 04-openai-serialization.md | P1 | medium | `format_messages` user 分支含图时改 parts 数组（data URL）+ 回归测试 |
@@ -15,7 +15,7 @@
 
 ## 文件
 
-1. `01-data-model.md` — 无依赖，先行（其余全部依赖它）。
+1. `done/01-data-model.md` ✅ — 完成。无依赖，先行（其余全部依赖它）。
 2. `02-read-image-tool.md` — 依赖 01。可与 03/04/05 并行。
 3. `03-loop-wiring.md` — 依赖 01。可与 02/04/05 并行。
 4. `04-openai-serialization.md` — 依赖 01。可与 02/03/05 并行。

@@ -160,6 +160,8 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                             }));
                         }
                         Content::ToolResult { .. } => {}
+                        // 模型流不会产出图片，仅保穷举。
+                        Content::Image(_) => {}
                     }
                 }
                 let mut converted = json!({"role": "assistant"});
@@ -191,6 +193,8 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                             "content": text,
                         })),
                         Content::ToolUse { .. } => {}
+                        // ponytail: 04 implements image parts（content 数组 + image_url data URL）
+                        Content::Image(_) => {}
                     }
                 }
                 // 怪癖 3：tool 消息紧跟含 tool_calls 的 assistant 消息；
