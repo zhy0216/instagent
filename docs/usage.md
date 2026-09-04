@@ -1,7 +1,7 @@
 # instagent 使用说明
 
-instagent 是一个**以插件为核心**的最小 agent：内核只有 5 个内置工具
-（`shell` `read` `write` `edit` `tree`）和一个 agent loop；provider、MCP
+instagent 是一个**以插件为核心**的最小 agent：内核只有 6 个内置工具
+（`shell` `read` `write` `edit` `tree` `read_image`）和一个 agent loop；provider、MCP
 server、skills、hooks、斜杠命令、command tools 全部以插件形式加载——连内置的
 5 个 provider 定义（openai / ollama / groq / deepseek / openrouter）
 也来自一个随二进制分发的 bundled 插件。
@@ -49,8 +49,10 @@ cargo install --path . --bin instagent       # 装到 ~/.cargo/bin
 ```yaml
 provider: groq                 # bundled 插件里的 provider 名字
 model: llama-3.3-70b-versatile
-api_key_env: GROQ_API_KEY      # 从哪个环境变量读密钥
 ```
+
+密钥不写进 config.yaml（ADR 0003 D1）：唯一来源是 provider JSON
+`api_key_env` 指定的环境变量（如 groq 的 `GROQ_API_KEY`），见第二步。
 
 **第二步：导出密钥并启动：**
 
@@ -151,8 +153,6 @@ settings，见 §4.3）。所有字段可缺省，缺省取默认值：
 |---|---|---|
 | `provider` | 无 | provider 名字，定义来自插件（§9）；重名时写 `插件名/provider名` |
 | `model` | 无 | 模型名 |
-| `api_key_env` | 无 | 从该环境变量读密钥（推荐方式） |
-| `api_key` | 无 | 直接写密钥（文件会按 0600 权限保存；优先用 `api_key_env`） |
 | `max_tokens` | `8192` | 单次回复最大 token |
 | `max_turns` | `1000` | 单条用户消息内最多循环多少轮工具调用 |
 | `context_limit` | 无 | 覆盖模型上下文上限（默认按 §9 的四级推导） |
@@ -160,12 +160,15 @@ settings，见 §4.3）。所有字段可缺省，缺省取默认值：
 | `shell` | `$SHELL` | `shell` 工具使用的解释器 |
 | `plugins` | `[]` | 额外插件搜索目录（支持 `~`；相对路径按启动时 cwd 解析） |
 
+config.yaml 不含任何密钥字段（ADR 0003 D1）：密钥唯一来源是 provider JSON
+`api_key_env` 指定的环境变量；写了旧 `api_key` / `api_key_env` 键的文件在
+加载期直接报错并给迁移提示。
+
 示例：
 
 ```yaml
 provider: openai
 model: gpt-5
-api_key_env: OPENAI_API_KEY
 max_tokens: 4096
 compaction_threshold: 0.65
 shell: /bin/zsh
@@ -201,7 +204,7 @@ plugins:
 |---|---|
 | User | `~/.config/instagent/settings.json` |
 | Project | `<项目>/.config/instagent/settings.json` |
-| Local | `<项目>/.config/instagent/settings.local.json`（建议 gitignore） |
+| Local | `<项目>/.config/instagent/settings.local.json`（可能含 secrets，请加入项目 gitignore；instagent 仓库自身已忽略该路径） |
 
 ```json
 {
@@ -210,11 +213,12 @@ plugins:
 }
 ```
 
-- `enabledPlugins`：**写了就是白名单模式**，只有列出的插件启用；不写则"除
-  `disabledPlugins` 外全部启用"。
-- `disabledPlugins`：黑名单。
+- `enabledPlugins` 三态（ADR 0003 D5）：**缺失** = 不表态（"除
+  `disabledPlugins` 外全部启用"）；**非空** = 白名单，只有列出的启用；
+  **显式 `[]`** = 空白名单终值，禁用全部，低层不得恢复任何名字。
+- `disabledPlugins`：黑名单，各层取并集；缺失与 `[]` 等价。
 - 同名插件的 enabled/disabled 字段：以最高层出现的为准；某层缺省的字段
-  不参与覆盖（注意区分"没写"和"写了空数组"）。
+  不参与覆盖（"没写"与"写了空数组"是两种语义，见上）。
 
 ---
 
@@ -504,7 +508,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 以上述 `groq-and-review` 为例，启用后：
 
-- 模型可见工具：内置 5 个 + `everything__echo` 等（MCP）+
+- 模型可见工具：内置 6 个 + `everything__echo` 等（MCP）+
   `groq-and-review__weather`（command tool）+ `load_skill`（skills）；
 - system prompt 多一行 `groq-and-review:review — …`（skill 索引）；
 - 配置里 `provider: groq` 可用；
@@ -553,7 +557,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 |---|---|
 | `name` | provider 名（配置里 `provider:` 引用的名字） |
 | `engine` | `openai`（OpenAI 兼容 `/v1`）/ `proxy`（拉起本地代理进程） |
-| `api_key_env` | 密钥环境变量名（密钥只能走环境变量或用户配置，不能写死在插件里） |
+| `api_key_env` | 密钥环境变量名（密钥唯一来源是这里指向的环境变量：不能写死在插件里，也不能写进 config.yaml，ADR 0003 D1） |
 | `base_url` | `openai` 引擎写到 `/v1`（请求时拼 `/chat/completions`） |
 | `headers` | 额外请求头，支持 `${env:NAME}` 展开 |
 | `timeout_seconds` | 请求超时，默认 600 |
@@ -626,7 +630,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 | 现象 | 处理 |
 |---|---|
-| 启动报配置解析错 | 检查 config.yaml 的 YAML 语法 |
+| 启动报配置解析错 | 检查 config.yaml 的 YAML 语法，或残留的旧 `api_key` / `api_key_env` 键（报错会带迁移提示，ADR 0003 D1） |
 | provider 重名报错 | 配置里写 `插件名/provider名` |
 | `proxy not ready` | proxy 进程未在 `timeout_secs` 内就绪：手动跑该命令确认能监听 `${PORT}` 并在 `ready` 路径返回 200 |
 | 想看详细日志 | `RUST_LOG=warn instagent chat`（或 `info` / `debug`），日志走 stderr |

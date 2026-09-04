@@ -12,7 +12,7 @@
 //! 统一边界：provider wire（`OpenAiProvider::stream`）、`Session::append` /
 //! `rewrite` / salvage 与任何消息入口都调用同一套校验；append 额外容忍
 //! "尾部 assistant 的 tool calls 尚未答复"这一 loop 中间态
-//! （[`validate_for_append`]，结果由同一次 `finish_turn` 的下一条 append 补上）。
+//! （`validate_for_append`，结果由同一次 `finish_turn` 的下一条 append 补上）。
 
 use anyhow::bail;
 use serde::Deserialize;
@@ -424,7 +424,7 @@ fn tool_use_ids(message: &Message) -> Vec<&str> {
 ///
 /// 统一消息边界：provider wire（`OpenAiProvider::stream`，proxy 引擎经由它）、
 /// `Session::rewrite` 与 resume salvage 都调用本函数；`Session::append` 调用
-/// [`validate_for_append`]（同一核心，仅多容忍 loop 中间态）。不变量 4 是构造
+/// `validate_for_append`（同一核心，仅多容忍 loop 中间态）。不变量 4 是构造
 /// 约定（`Content::interrupted`），不是校验项。错误带消息索引 / block 索引 /
 /// 约束名，不回显消息原文。
 pub fn validate(messages: &[Message]) -> crate::Result<()> {

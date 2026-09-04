@@ -45,7 +45,7 @@ use crate::subprocess::ProcessGroupChild;
 /// 默认超时 30s（§2.7）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// 每路输出收集硬上限：hook 决策载荷很小，64 KiB 足够；超限杀整个进程组，
-/// 截断状态经 [`crate::subprocess::BoundedOutput::truncated`] 上报（todo 06 / R3）。
+/// 截断状态经 `crate::subprocess::BoundedOutput::truncated` 上报（todo 06 / R3）。
 pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 /// Stop 连续阻止上限（goose 默认 8），防死循环。
 pub const STOP_BLOCK_LIMIT: u32 = 8;

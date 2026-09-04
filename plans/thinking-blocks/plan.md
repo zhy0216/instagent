@@ -1,5 +1,11 @@
 # thinking 块（Anthropic extended thinking）
 
+> **已关闭：被 ADR 0001 淘汰，不再执行。** 本方案的前提是原生 Anthropic
+> 引擎（`src/provider/anthropic.rs`），该引擎与 `anthropic-engine` feature、
+> `anthropic-compat` bundled provider 已随 ADR 0001（`docs/adr/`）整体移除，
+> 文中引用的文件、fixture 与行号均已不存在。当前消息模型没有 Thinking
+> 变体（见 `src/message.rs`）。以下内容仅作历史保留。
+
 ## 意图
 
 落地 `docs/goose-from-scratch-plan.md` §7 v2 候选表里的"thinking 块（Anthropic

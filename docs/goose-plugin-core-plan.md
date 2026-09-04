@@ -1,5 +1,13 @@
 # 插件为核心的最小 agent 计划（第三版）
 
+> **历史文档，不是当前契约。** 本文是 2026-09-02 的设计计划；实现以
+> `README.md`、`docs/usage.md`、`docs/architecture.md` 与 `docs/adr/` 为准。
+> 与实现不一致之处：§2.4 的可选 anthropic engine 已被 ADR 0001 移除；
+> approval / trust / mode UI 相关设想已被 ADR 0002 否弃；env、密钥、
+> stdout 契约等运行时策略以 ADR 0003 为准。命名映射：`mini-agent` →
+> `instagent`、`dev.miniagent` → `dev.instagent`、`MINI_AGENT_*` →
+> `INSTAGENT_*`（全表见 README"命名对照"）。
+
 - 日期：2026-09-02
 - 参考基线：`~/yyds/goose` commit `4ad43df`
 - 前两版：`goose-core-cherry-pick-plan.md`（抽取）、`goose-from-scratch-plan.md`（从零）。

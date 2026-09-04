@@ -1,6 +1,6 @@
 # 架构总览
 
-内核 = agent loop + provider 引擎 + 各组件的加载/执行机制；除 5 个内置工具外，
+内核 = agent loop + provider 引擎 + 各组件的加载/执行机制；除 6 个内置工具外，
 所有能力（含 provider）都从插件目录声明式加载。
 
 ## 内核（编译进二进制的核心）
@@ -9,7 +9,7 @@
 |---|---|
 | `src/agent/` | agent loop：`assemble` / `run_turn` / 流式输出、压缩（`compact.rs`）、hooks 触发点 |
 | `src/provider/` | provider **引擎**层：`openai.rs` / `proxy.rs` 两种引擎 + 共享 SSE 流驱动（`shared.rs`）+ `registry.rs` |
-| `src/tools/` | `ToolSource` trait + Registry；唯一内置内容 = 5 个工具 `shell` `read` `write` `edit` `tree`（`builtin/`） |
+| `src/tools/` | `ToolSource` trait + Registry；唯一内置内容 = 6 个工具 `shell` `read` `write` `edit` `tree` `read_image`（`builtin/`） |
 | `src/plugin/` | 插件加载器：manifest 校验、四级发现（`--plugin` > 项目 > 用户 > bundled，同名覆盖）、install / enable |
 | `src/hooks.rs` | hooks 运行时——内核只提供执行机制，脚本来自插件 |
 | `src/commands.rs` | 斜杠命令加载器（`dev.instagent/commands/*.md`） |

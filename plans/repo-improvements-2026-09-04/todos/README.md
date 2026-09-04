@@ -30,7 +30,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/13-parallel-tools.md` ✅ | P1 | hard | 只读工具并行、冲突排序、图片/并发预算和取消 |
 | `done/14-manifest-schema.md` ✅ | P2 | medium | plugin manifest 版本、字段形状和跨字段校验 |
 | `done/15-discovery-diagnostics.md` ✅ | P2 | medium | 插件来源类型和目录枚举错误诊断 |
-| `16-docs-and-rustdoc.md` | P2 | easy | 当前工具数量、ADR/历史计划标记和 rustdoc 警告清理 |
+| `done/16-docs-and-rustdoc.md` ✅ | P2 | easy | 当前工具数量、ADR/历史计划标记和 rustdoc 警告清理 |
 | `17-ci-release-metadata.md` | P2 | medium | 包元数据、toolchain 支持范围、audit/doc/release CI 门槛 |
 | `done/18-provider-converter.md` ✅ | P2 | medium | provider converter 的 source 注入、fixture 和 round-trip 校验 |
 | `19-agent-module-split.md` | P2 | hard | 在行为测试护栏下拆分 agent loop 与工具执行职责 |
@@ -54,7 +54,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 13. `done/13-parallel-tools.md` ✅ — 完成。工具能力元数据（`ToolKind` / `CallCapability` / `Registry::capability`：`read_only` 取各来源声明，资源键只由内核为内置 fs 系工具按输入 `path` 生成，未知工具保守串行）；`execute_calls` 三段式（串行决策 → `execution_units` 划分 → 单元串行 / 单元内 `join_all` + `Semaphore` 有界并发，`PARALLEL_TOOL_LIMIT=4`），写 / 同资源 / 顺序敏感调用保持原顺序，结果按原下标落槽；取消时在途任务短路、未启动单元补 `interrupted`，事件与结果按调用 id 一一对应、会话不变量不变；会话图片预算 `SESSION_IMAGE_BUDGET=64MiB`（超限拒绝新图、工具结果带可操作提示，CAS 防并行超限），请求侧 `REQUEST_IMAGE_BUDGET=32MiB`（相同内容去重、超限按生命周期淘汰最旧优先，替换为可重读提示）；`plans/parallel-tool-execution/plan.md` 同步重写，删除 ADR 0002 之前的 approval/trust 假设并写明 sandbox 边界与并行安全前提。新增 17 测试覆盖并发 / 顺序 / 取消 / 超时 / 失败隔离 / 事件配对 / 图片预算；未引入新 rustdoc 警告（存量 8 个 private-link 警告归 16）。依赖：04、05、06、09、10、11。
 14. `done/14-manifest-schema.md` ✅ — 依赖：01、08。完成。`plugin.json` 逐字段形状 + 跨字段校验（`version` 必填非空、非 SemVer 按 §5.4 只 warning；`author` 对象封闭；`keywords` 逐元素；`extensions` 命名空间反域名 + 值为对象，`dev.instagent.minKernel` 类型），未知顶层字段与非对象 `extensions` 按规范报告并忽略；读取 1 MiB 硬上限、解析错误只回显截断摘要；错误统一「来源文件 + 插件名 + 字段 + 建议值」。
 15. `done/15-discovery-diagnostics.md` ✅ — 依赖：03。完成。`PluginSource` 拆出 `Cli` kind + `display_name()`，skipped/错误统一「来源 [绝对路径]: 原因」；目录枚举改为区分"不匹配"（散文件、无 `plugin.json` 的目录 → 静默）与"读取失败"（权限、IO、坏 symlink、逐条 entry 失败 → 汇总诊断），commands 侧同口径且有界读取（256 KiB）；`Settings::whitelist()` + 共享 `plugin_enabled()` 把 ADR 0003 D5 三态接到 discovery/bundled（显式 `[]` = 禁用全部），写回忠实表达三态。依赖：03。
-16. `16-docs-and-rustdoc.md` — 依赖：08、12、13、14。
+16. `done/16-docs-and-rustdoc.md` ✅ — 依赖：08、12、13、14。完成。README/usage/architecture/tools 模块文档的内置工具数同步为 6（含 `read_image`）；api_key/api_key_env 描述按 ADR 0003 D1 校正（config.yaml 不含密钥、旧键加载期报错、唯一来源为 provider JSON 指向的环境变量），run -t 输出契约描述按 ADR 0003 D4 改为 stdout 仅最终答案，settings 三态与 settings.local gitignore 说明对齐 ADR 0003 D5，README 补 ADR 0003 索引；`docs/goose-*.md` 两份历史设计文档加"历史/当前映射"标记（不整体改写）；`plans/thinking-blocks/plan.md` 标记已被 ADR 0001 淘汰关闭（parallel-tool-execution 已由 13 重写，无残留）。rustdoc：8 处 public→private intra-doc 链接（hooks/message/shell/command）降级为代码段，`cargo rustdoc --lib -- -D warnings` 通过；bundled/openai/fake_proxy_server 存量已在 08 前后清零。
 17. `17-ci-release-metadata.md` — 依赖：01、16。
 18. `done/18-provider-converter.md` ✅ — 完成。converter 改 `--source DIR`/`--fixture` 显式注入（不再硬编码 ~/yyds/goose）；产物按 08 的 ProviderDef/ModelDef 契约做 schema + round-trip 校验，契约外字段剔除、约定字段保留，坏 source/schema 非零退出带文件与字段诊断；新增最小 fixture 与 11 个可重复 python 测试，真实 goose 源重生成 groq/deepseek 与提交物逐字节一致。依赖：08。
 19. `19-agent-module-split.md` — 依赖：11、13、16。

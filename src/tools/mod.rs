@@ -1,6 +1,6 @@
 //! 工具层：`ToolSource` trait + Registry + 命名规则（第三版 §2.5；第二版 §2.4）。
 //!
-//! 四个来源实现：[`BuiltinTools`]（内核 5 工具）、[`McpSource`]（插件 mcp.json
+//! 四个来源实现：[`BuiltinTools`]（内核 6 工具）、[`McpSource`]（插件 mcp.json
 //! 的每个 server 一个实例）、[`CommandTools`]（`dev.instagent/tools/*.json`）、
 //! [`SkillsSource`]（只暴露 load_skill）。
 //!

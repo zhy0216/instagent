@@ -1,14 +1,15 @@
 # instagent
 
-插件为核心的最小 agent（Rust 从零实现）。除了 5 个最简单的内置工具
-（`shell` `read` `write` `edit` `tree`），provider、MCP、skills、hooks、
+插件为核心的最小 agent（Rust 从零实现）。除了 6 个最简单的内置工具
+（`shell` `read` `write` `edit` `tree` `read_image`），provider、MCP、skills、hooks、
 斜杠命令、command tools 全部以**插件**形式加载——provider 也不例外，
 内置的 5 个 provider（openai / ollama / groq / deepseek / openrouter）
 同样来自一个 bundled 插件。
 
 - 使用说明：[`docs/usage.md`](docs/usage.md)
 - 架构总览：[`docs/architecture.md`](docs/architecture.md)
-- 决策记录：[`docs/adr/`](docs/adr/)（0001 不支持 Anthropic；0002 sandbox 内 agent，UI/permission 非目标）
+- 决策记录：[`docs/adr/`](docs/adr/)（0001 不支持 Anthropic；0002 sandbox 内 agent，UI/permission 非目标；0003 仓库边界与运行时策略）
+- 历史设计文档：`docs/goose-*.md` 是当时的计划书，不是当前契约（文首有说明）
 - 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
 - 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
 - 插件规范：[Agent Plugins v1.0.0](https://agent-plugins.org/specification)
@@ -35,8 +36,11 @@ instagent --help
    ```yaml
    provider: groq                # bundled 插件里的名字；重名时写 plugin/name
    model: llama-3.3-70b-versatile
-   api_key_env: GROQ_API_KEY     # 从该环境变量读密钥
    ```
+
+   密钥不写进 config.yaml（ADR 0003 D1）：唯一来源是 provider JSON
+   `api_key_env` 指定的环境变量（如 groq 的 `GROQ_API_KEY`），旧
+   `api_key` / `api_key_env` 键在加载期直接报错并给迁移提示。
 
 2. export 密钥并开跑：
 
@@ -153,7 +157,7 @@ schema，只用它选本地校验规则）：
 }
 ```
 
-装上之后模型能看到：`shell` `read` `write` `edit` `tree`（内置）、
+装上之后模型能看到：`shell` `read` `write` `edit` `tree` `read_image`（内置）、
 `everything__echo` 等（MCP）、`groq-and-review__weather`（command tool）、
 `load_skill`（skills）；system prompt 里多一行 `groq-and-review:review — …`；
 配置里 `provider: groq` 生效；`/review` 可用；每次调 `shell` 前 `guard.sh` 先跑。
@@ -207,8 +211,9 @@ cargo test
    `(compacted)`；`/clear` 会丢弃上下文（会话文件原子重写、留 `.bak.jsonl`）。
 4. **--resume last**：退出后 `cargo run -- chat --resume last`，确认历史被读回、
    模型能引用上一会话内容；`instagent sessions list` 两行、`sessions rm <id>` 可删。
-5. **run -t**：`cargo run -- run -t "list files"`，无交互跑完，stdout 有最终回复
-   与 `usage:` 行，工具调用打 `▶ shell  …` + 预览/耗时。
+5. **run -t**：`cargo run -- run -t "list files"`，无交互跑完，stdout 只有最终回复
+   （输出契约 ADR 0003 D4）；`usage:` 行、`session <id>` 与工具调用
+   `▶ shell  …` + 预览/耗时都在 stderr。
 6. **plugin 子命令**：`cargo run -- plugin install <本地含 hooks/mcp/tools 的
    插件路径>` → 不提问直接装好；`plugin list / show / disable / enable` 正常；
    启用后 chat 启动即加载其 mcp/hooks/command tools（安全由 sandbox 隔离承担）。

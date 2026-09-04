@@ -1,7 +1,7 @@
 //! shell 工具（第二版 §2.4）。
 //!
 //! `$SHELL -c` 或 `bash -c`，cwd 为会话目录，用 `03` 的进程组 + kill_on_drop；
-//! 输出走 [`run_bounded`] 有界收集（每路 [`COLLECT_CAP_BYTES`] 硬上限）：
+//! 输出走 `run_bounded` 有界收集（每路 [`COLLECT_CAP_BYTES`] 硬上限）：
 //! 超限 / 超时 / 取消时 drop [`ProcessGroupChild`] kill 整组（含孙进程），
 //! 并返回可操作摘要（截断标记、原因、杀组说明）。builtin shell 是 ADR 0003 D2
 //! 的唯一例外：保留父进程完整环境（它是模型操作 sandbox 用户 shell 的通道）。
@@ -36,7 +36,7 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// 超出时给前 50 行 / 10KB 预览，全文存临时文件并返回路径。
 pub const PREVIEW_LINES: usize = 50;
 pub const PREVIEW_BYTES: usize = 10 * 1024;
-/// [`run_bounded`] 每路收集硬上限（1 MiB）：比展示上限高一个量级，给
+/// `run_bounded` 每路收集硬上限（1 MiB）：比展示上限高一个量级，给
 /// spill 文件留余地；超限杀整个进程组、保留截断头部与摘要（R3 / todo 06）。
 pub const COLLECT_CAP_BYTES: usize = 1024 * 1024;
 /// spill 文件保留期：每次新保存前清理过期文件（惰性、有界），

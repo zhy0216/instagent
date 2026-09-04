@@ -1,5 +1,14 @@
 # 从零写一个最小 agent 的计划（goose 只当参考）
 
+> **历史文档，不是当前契约。** 本文是 2026-09-02 的设计计划；实现以
+> `README.md`、`docs/usage.md`、`docs/architecture.md` 与 `docs/adr/` 为准。
+> 与实现不一致之处：anthropic 引擎（§2.3 等）已被 ADR 0001 移除，当前引擎
+> 只有 openai / proxy；§0 的工具审批（auto / approve / chat + 白名单）已被
+> ADR 0002 否弃；配套文档 `goose-core-cherry-pick-plan.md` 未随仓库保留。
+> 命名映射：`mini-agent` → `instagent`、`MINI_AGENT_*` → `INSTAGENT_*`
+> （全表见 README"命名对照"）。loop、消息、会话、压缩、CLI 的多数设计
+> （§2.2、2.5、2.6、2.7、2.11）仍被沿用。
+
 - 日期：2026-09-02
 - 参考基线：`~/yyds/goose` commit `4ad43df`（下文所有 goose 文件路径和行号都以此为准）
 - 配套文档：`goose-core-cherry-pick-plan.md`（抽取方案），两份计划的功能范围一致，便于对比

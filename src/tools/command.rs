@@ -8,7 +8,7 @@
 //! 默认不泄露 provider credentials / session secrets。input JSON 写 stdin，
 //! stdout 作为工具结果，退出码非 0 / 超时 / 取消 / 输出超限即 `is_error`；
 //! 子进程走 `03` 的进程组（[`ProcessGroupChild`]，超限 / 超时 / 取消 kill 整组），
-//! 输出走 [`crate::subprocess::run_bounded`] 有界收集。工具定义 JSON 读取有
+//! 输出走 `crate::subprocess::run_bounded` 有界收集。工具定义 JSON 读取有
 //! [`MAX_TOOL_DEF_BYTES`] 上限，超限跳过并在诊断里带来源路径。
 //! 解析失败或非法的 tool JSON 跳过不报错（warn 日志）。
 
@@ -39,8 +39,8 @@ use crate::tools::NAME_SEP;
 
 /// `timeout_secs` 缺省值。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// 每路输出收集硬上限（[`run_bounded`]）：超限杀整个进程组、保留截断头部与
-/// [`BoundedOutput::truncation_note`] 摘要，输出绝不无界进内存（R3 / todo 06）。
+/// 每路输出收集硬上限（`run_bounded`）：超限杀整个进程组、保留截断头部与
+/// `BoundedOutput::truncation_note` 摘要，输出绝不无界进内存（R3 / todo 06）。
 pub const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 /// 单个工具定义 JSON（含 input_schema）的读取上限：超限跳过，诊断带来源路径。
 pub const MAX_TOOL_DEF_BYTES: u64 = 64 * 1024;
