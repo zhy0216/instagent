@@ -21,7 +21,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `done/04-file-tool-budgets.md` ✅ | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
 | `done/05-subprocess-collector.md` ✅ | P1 | medium | 进程输出上限、增量 UTF-8 和无 pipe 配置错误 |
 | `06-process-tool-isolation.md` | P1 | hard | shell/command/hooks 的 bounded output、argv/env 隔离和 hook 策略 |
-| `07-plugin-install-resilience.md` | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
+| `done/07-plugin-install-resilience.md` ✅ | P1 | medium | git 安装超时/进程组、替换回滚、孤儿备份和诊断 |
 | `08-config-provider-validation.md` | P1 | hard | config/provider 字段校验、key 来源实现、schema drift 和 context limit 诊断 |
 | `09-message-contract.md` | P1 | medium | message role/tool id/image 合约与统一边界校验 |
 | `done/10-mcp-inventory.md` ✅ | P1 | medium | MCP 连接部分失败、inventory timeout/cancel、缓存和可见诊断 |
@@ -45,7 +45,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 4. `done/04-file-tool-budgets.md` ✅ — 完成。fs/tree/skills/image 阻塞逻辑移入 `spawn_blocking` 并按行/按块检查取消；tree 增加 entries/字节/输出/深度/时间五预算与结构化截断 note（`depth=0` 受内部深度兜底）；read/edit/write 与 skill 文件设字节上限（metadata 预检 + `take(MAX+1)` 兜底增长竞态）；skill description 强制非空、supporting file 明确 no-follow；image 摘要带 base64 负载大小供后续总预算观测（新增 22 测试，取消耗时实测 ≤0.5ms）。
 5. `done/05-subprocess-collector.md` ✅ — 完成。`run_bounded` 硬上限 collector（越限杀组、保留摘要、增量 UTF-8），`wait_and_drain` 无 pipe 改带上下文错误。
 6. `06-process-tool-isolation.md` — 依赖：01、05。
-7. `07-plugin-install-resilience.md` — 依赖：03、05。
+7. `done/07-plugin-install-resilience.md` ✅ — 完成。git clone/rev-parse 走 `run_bounded` wrapper（进程组+kill_on_drop、超时、取消、bounded output，超时 fake git 进程组无残留），错误只回显截断摘要且去 URL 凭据；replace_dir 回滚失败指明备份路径、`.replaced-*` 孤儿备份换入前清扫、`.tmp-install` staging 孤儿 TTL 清扫；copy_tree symlink 契约（一律拒绝）+ 测试。
 8. `08-config-provider-validation.md` — 依赖：01。
 9. `09-message-contract.md` — 依赖：01。
 10. `done/10-mcp-inventory.md` ✅ — 完成。connect/list 硬超时、`inventory()` 错误通道不静默空列表、单 server 失败保留健康 source 并产出带 plugin/server 的 note、Registry 清单+route 缓存与 invalidate、mcp.json 1MiB 上限与 headers/command 来源诊断、stdio env 走 D2 baseline（含 PLUGIN_ROOT 环境变量）。依赖：01、05。

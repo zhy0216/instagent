@@ -1,7 +1,8 @@
 //! 插件安装 / 更新（第三版 §2.10；逻辑参考 goose `plugins/mod.rs`，只读）。
 //!
-//! `install`：git-url 用 `03` 的 `git_command` 子进程 clone（不引 libgit2），
-//! 本地路径直接复制 → `04` 校验 `plugin.json` → 写 `.install.json`
+//! `install`：git-url 经统一 Tokio subprocess wrapper clone（进程组 +
+//! `kill_on_drop` + 超时 + bounded output，超限/超时/取消整组 SIGKILL；
+//! 不引 libgit2），本地路径直接复制 → `04` 校验 `plugin.json` → 写 `.install.json`
 //! （source、commit、时间）→ 放入 `~/.agents/plugins/<name>/`。staging +
 //! rename 替换，旧目录在替换成功前不动。
 //! `update`：按 `.install.json` 重新拉取；`commit` 为 `None` 即本地路径
@@ -12,13 +13,17 @@
 //! list / show / enable / disable 为数据层，CLI 接线在 `18`。
 //! `PLUGIN_DATA`：[`plugin_data_dir`] = `<data_dir>/plugins/<name>/`，按需创建。
 
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::bail;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::plugin::discovery::agents_dir;
@@ -29,12 +34,34 @@ use crate::plugin::Plugin;
 use crate::plugin::PluginSource;
 use crate::settings::Settings;
 use crate::subprocess::git_command;
+use crate::subprocess::run_bounded;
+use crate::subprocess::CollectedRun;
+use crate::subprocess::Outcome;
+use crate::subprocess::ProcessGroupChild;
 
 /// `.install.json` 文件名（goose `.goose-plugin-install.json` 的对应物）。
 pub const INSTALL_METADATA: &str = ".install.json";
 
 /// 24h 自动更新节流间隔（goose `AUTO_UPDATE_INTERVAL_HOURS`）。
 pub const AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// `git clone` 整体超时：到点整组 SIGKILL，不留挂起进程。
+pub const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `git rev-parse` 这类本地快命令的超时。
+pub const GIT_QUICK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// git 子进程单路输出的收集硬上限（超出即杀组并只保留头部摘要）。
+const GIT_OUTPUT_CAP_BYTES: usize = 64 * 1024;
+
+/// 错误信息里回显 git 输出的字节上限（只显示截断摘要，绝不整段倾倒）。
+const GIT_ERROR_DISPLAY_BYTES: usize = 512;
+
+/// `replace_dir` 换入前挪走旧目录的备份前缀。
+const REPLACED_PREFIX: &str = ".replaced-";
+
+/// 崩溃进程遗留在 `.tmp-install` 下的 staging 孤儿超过这个时长即清理。
+const STAGING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// 安装来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,8 +159,7 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
             if url.trim().is_empty() {
                 bail!("plugin git source must not be empty");
             }
-            clone_git_repo(url, &staging.path)?;
-            let commit = head_commit(&staging.path)?;
+            let commit = fetch_git_commit(url, &staging.path)?;
             remove_git_dir(&staging.path)?;
             Some(commit)
         }
@@ -143,8 +169,8 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
             None
         }
     };
-    let manifest =
-        read_manifest(&staging.path).with_context(|| format!("validate plugin at {source:?}"))?;
+    let manifest = read_manifest(&staging.path)
+        .with_context(|| format!("validate plugin at {}", source_display(source)))?;
     let info = InstallInfo {
         source: match source {
             InstallSource::GitUrl(url) => url.clone(),
@@ -305,8 +331,7 @@ fn update_at(name: &str, now: i64) -> crate::Result<()> {
         );
     }
     let staging = Staging::new()?;
-    clone_git_repo(&old.source, &staging.path)?;
-    let commit = head_commit(&staging.path)?;
+    let commit = fetch_git_commit(&old.source, &staging.path)?;
     remove_git_dir(&staging.path)?;
     let manifest = read_manifest(&staging.path)
         .with_context(|| format!("validate updated plugin `{name}`"))?;
@@ -335,6 +360,7 @@ fn place(
     write_install_info(&staging.path, info)?;
     let root = user_plugins_dir()?;
     std::fs::create_dir_all(&root)?;
+    cleanup_orphan_backups(&root);
     let dest = root.join(&manifest.name);
     replace_dir(&staging.path, &dest)?;
     staging.commit();
@@ -378,6 +404,7 @@ impl Staging {
     fn new() -> crate::Result<Self> {
         let parent = agents_dir()?.join(".tmp-install");
         std::fs::create_dir_all(&parent)?;
+        cleanup_stale_staging(&parent, SystemTime::now());
         Ok(Self {
             path: parent.join(Uuid::new_v4().to_string()),
             committed: false,
@@ -401,11 +428,52 @@ impl Drop for Staging {
     }
 }
 
-/// 换入 dest：旧目录先挪去同目录备份，任一步失败即回滚（goose 同款）。
+/// 清理策略：`.tmp-install` 下 mtime 老于 [`STAGING_MAX_AGE`] 的条目一定是
+/// 崩溃进程遗留（活着的 staging 在当次进程内由 Drop 删除），下次建 staging 前扫掉。
+/// `now` 参数化以便测试注入假时钟。
+fn cleanup_stale_staging(parent: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let stale = modified
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STAGING_MAX_AGE);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 清理策略：换入新版本前，扫掉插件根下遗留的 `.replaced-*` 孤儿备份
+/// （上次替换 rename 成功后删备份失败、或回滚失败崩溃的产物）。
+/// 回滚失败的错误信息会指明备份路径供手动恢复；下一次同插件 install 即回收点。
+fn cleanup_orphan_backups(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(REPLACED_PREFIX)
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 换入 dest：旧目录先挪去同目录备份，换入失败即回滚（goose 同款）。
+/// 回滚也失败时绝不静默吞掉：错误指明可手动恢复的备份路径（孤儿备份的
+/// 自动回收见 [`cleanup_orphan_backups`]）。
 fn replace_dir(source: &Path, dest: &Path) -> crate::Result<()> {
     let backup = if dest.exists() {
         let backup = dest.with_file_name(format!(
-            ".replaced-{}-{}",
+            "{REPLACED_PREFIX}{}-{}",
             dest.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("plugin"),
@@ -425,49 +493,174 @@ fn replace_dir(source: &Path, dest: &Path) -> crate::Result<()> {
         }
         Err(err) => {
             if let Some(backup) = &backup {
-                let _ = std::fs::rename(backup, dest);
+                if let Err(restore_err) = std::fs::rename(backup, dest) {
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "install into {} failed and the old plugin could not be moved back; \
+                         recover it manually from {} ({restore_err})",
+                        dest.display(),
+                        backup.display()
+                    )));
+                }
             }
             Err(err).with_context(|| format!("install into {}", dest.display()))
         }
     }
 }
 
-fn clone_git_repo(url: &str, dest: &Path) -> crate::Result<()> {
-    let output = git_command()
+/// 公共 install/update 是同步入口（CLI handlers 与 assembly 未 async 化），
+/// 而 git 流程要跑在 Tokio wrapper 上。专用 OS 线程 + 私有 current-thread
+/// runtime：既能在"已在 runtime 里"的调用线程上安全执行（同线程嵌套
+/// block_on 会 panic），也把挂起/超时/杀组的取消语义完整保留。
+fn block_on_dedicated<T: Send + 'static>(
+    future: impl Future<Output = crate::Result<T>> + Send + 'static,
+) -> crate::Result<T> {
+    std::thread::Builder::new()
+        .name("instagent-git".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create git subprocess runtime")?;
+            runtime.block_on(future)
+        })
+        .context("spawn git subprocess thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("git subprocess thread panicked"))?
+}
+
+/// clone → rev-parse HEAD：一次 git 拉取的可取消整体（同步入口用的胶水）。
+fn fetch_git_commit(url: &str, dest: &Path) -> crate::Result<String> {
+    let url = url.to_string();
+    let dest = dest.to_path_buf();
+    block_on_dedicated(async move {
+        clone_git_repo(&url, &dest, GIT_CLONE_TIMEOUT, None).await?;
+        head_commit(&dest, GIT_QUICK_TIMEOUT, None).await
+    })
+}
+
+/// 统一 git 子进程入口：`git_command` 的加固参数 + 进程组 / `kill_on_drop`
+/// （[`ProcessGroupChild`]）、超时、取消与双路 bounded output（[`run_bounded`]）。
+/// 超时 / 取消 / 输出越限时整组（含孙进程）SIGKILL，不残留。
+async fn run_git(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> crate::Result<CollectedRun> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = ProcessGroupChild::spawn(command).context("failed to spawn `git`")?;
+    run_bounded(child, GIT_OUTPUT_CAP_BYTES, timeout, cancel)
+        .await
+        .context("collect git subprocess output")
+}
+
+fn git_command_async() -> tokio::process::Command {
+    tokio::process::Command::from(git_command())
+}
+
+async fn clone_git_repo(
+    url: &str,
+    dest: &Path,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> crate::Result<()> {
+    let mut command = git_command_async();
+    command
         .arg("clone")
         .arg("--depth")
         .arg("1")
         // 无网络凭据时直接失败而不是挂起等输入。
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg(url)
-        .arg(dest)
-        .output()
-        .context("failed to run `git clone`")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let message = if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        };
-        bail!("failed to clone plugin repository: {}", message.trim());
+        .arg(dest);
+    let run = run_git(&mut command, timeout, cancel).await?;
+    if run.outcome == Outcome::Exited(Some(0)) {
+        return Ok(());
     }
-    Ok(())
+    let message = match run.outcome {
+        Outcome::TimedOut => format!("timed out cloning plugin repository after {timeout:?}"),
+        Outcome::Cancelled => "cancelled while cloning plugin repository".to_string(),
+        _ => format!(
+            "failed to clone plugin repository: {}",
+            git_error_summary(&run, Some(url))
+        ),
+    };
+    bail!(message)
 }
 
-fn head_commit(dir: &Path) -> crate::Result<String> {
-    let output = git_command()
-        .arg("-C")
-        .arg(dir)
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .context("failed to run `git rev-parse`")?;
-    if !output.status.success() {
-        bail!("plugin git source has no commits (rev-parse HEAD failed)");
+async fn head_commit(
+    dir: &Path,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> crate::Result<String> {
+    let mut command = git_command_async();
+    command.arg("-C").arg(dir).arg("rev-parse").arg("HEAD");
+    let run = run_git(&mut command, timeout, cancel).await?;
+    let commit = run.stdout.text.trim().to_string();
+    if run.outcome != Outcome::Exited(Some(0)) || commit.is_empty() {
+        bail!(
+            "plugin git source has no commits (rev-parse HEAD failed): {}",
+            git_error_summary(&run, None)
+        );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(commit)
+}
+
+/// git 失败的可读摘要：stderr 优先（git 的诊断走 stderr），去凭据、封顶截断。
+fn git_error_summary(run: &CollectedRun, redact: Option<&str>) -> String {
+    let stream = if run.stderr.text.trim().is_empty() {
+        &run.stdout
+    } else {
+        &run.stderr
+    };
+    let mut text = stream.text.trim().to_string();
+    if let Some(url) = redact {
+        text = text.replace(url, "<git-url>");
+    }
+    if text.len() > GIT_ERROR_DISPLAY_BYTES {
+        let mut cut = GIT_ERROR_DISPLAY_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    if let Some(note) = stream.truncation_note() {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    if text.is_empty() {
+        text = "(no git output)".to_string();
+    }
+    text
+}
+
+/// 去掉 URL 里的 `user:password@` 凭据段，用于错误展示（不落日志、不回显）。
+fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    match url[authority_start..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}{}",
+            &url[..authority_start],
+            &url[authority_start + at..]
+        ),
+        None => url.to_string(),
+    }
+}
+
+fn source_display(source: &InstallSource) -> String {
+    match source {
+        InstallSource::GitUrl(url) => redact_url(url),
+        InstallSource::Path(path) => path.display().to_string(),
+    }
 }
 
 fn remove_git_dir(dir: &Path) -> crate::Result<()> {
@@ -480,6 +673,11 @@ fn remove_git_dir(dir: &Path) -> crate::Result<()> {
 
 /// 递归复制目录树；跳过任意层级的 `.git` 与顶层 `.install.json`
 /// （源可能是先前安装过的目录）。
+///
+/// symlink 契约：源树中**任何**层级的 symlink（指向文件或目录皆同）一律
+/// 显式拒绝并报出路径，既不复制链接本身也不跟随其目标——防止 staging
+/// 借道指向源树外的文件（如 `~/.ssh`）；非目录非文件的特殊文件（fifo、
+/// socket、设备）同样拒绝。
 fn copy_tree(source: &Path, dest: &Path) -> crate::Result<()> {
     copy_tree_at(source, dest, true)
 }
@@ -492,11 +690,23 @@ fn copy_tree_at(source: &Path, dest: &Path, top_level: bool) -> crate::Result<()
         if name == ".git" || (top_level && name == INSTALL_METADATA) {
             continue;
         }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!(
+                "plugin source contains symlink `{}`; symlinks are rejected, not copied",
+                entry.path().display()
+            );
+        }
         let target = dest.join(name);
-        if entry.file_type()?.is_dir() {
+        if file_type.is_dir() {
             copy_tree_at(&entry.path(), &target, false)?;
-        } else {
+        } else if file_type.is_file() {
             std::fs::copy(entry.path(), &target)?;
+        } else {
+            bail!(
+                "plugin source contains non-regular file `{}`",
+                entry.path().display()
+            );
         }
     }
     Ok(())
@@ -910,5 +1120,322 @@ mod tests {
             !tmp_root.exists() || std::fs::read_dir(&tmp_root).unwrap().next().is_none(),
             "staging left behind in {tmp_root:?}"
         );
+    }
+
+    #[test]
+    fn git_clone_failure_leaves_no_staging_or_partial_target() {
+        let env = isolated();
+        let err = install(
+            &InstallSource::GitUrl("file:///definitely-not-a-repo-42".into()),
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to clone"), "{err}");
+        let tmp_root = agents_dir().unwrap().join(".tmp-install");
+        assert!(
+            !tmp_root.exists() || std::fs::read_dir(&tmp_root).unwrap().next().is_none(),
+            "staging left behind in {tmp_root:?}"
+        );
+        let root = env.agents.path().join("plugins");
+        assert!(
+            !root.exists() || std::fs::read_dir(&root).unwrap().next().is_none(),
+            "half install under {root:?}"
+        );
+    }
+
+    #[test]
+    fn replace_dir_rolls_old_plugin_back_when_swap_fails() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("alpha");
+        write_plugin(&dest, "alpha", "1.0.0");
+        let missing_source = dir.path().join("no-such-staging");
+
+        let err = replace_dir(&missing_source, &dest).unwrap_err();
+        assert!(err.to_string().contains("install into"), "{err}");
+        assert!(
+            dest.join("plugin.json").is_file(),
+            "old plugin must be back in place after a failed swap"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REPLACED_PREFIX)),
+            "rollback must not leave a .replaced-* backup behind"
+        );
+    }
+
+    #[test]
+    fn orphan_replaced_backups_are_swept_before_place() {
+        let env = isolated();
+        let root = env.agents.path().join("plugins");
+        let orphan = root.join(format!("{REPLACED_PREFIX}alpha-deadbeef"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("stale"), b"stale").unwrap();
+
+        let src = local_plugin(&env, "beta", "1.0.0");
+        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        assert!(
+            !orphan.exists(),
+            "orphan backup must be cleaned on next place"
+        );
+    }
+
+    #[test]
+    fn stale_staging_swept_by_injected_clock() {
+        let parent = TempDir::new().unwrap();
+        let entry = parent.path().join("crashed-install");
+        std::fs::create_dir_all(&entry).unwrap();
+
+        // 新鲜（now 与 mtime 同刻）：不动。
+        cleanup_stale_staging(parent.path(), SystemTime::now());
+        assert!(entry.exists());
+
+        // 假时钟前进超过 TTL：崩溃遗留被扫掉。
+        cleanup_stale_staging(parent.path(), SystemTime::now() + STAGING_MAX_AGE * 2);
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn redact_url_strips_credentials_only() {
+        assert_eq!(
+            redact_url("https://user:sekret@gitlab.example/x/y.git"),
+            "https://@gitlab.example/x/y.git"
+        );
+        assert_eq!(redact_url("file:///tmp/repo"), "file:///tmp/repo");
+        assert_eq!(redact_url("https://host/x"), "https://host/x");
+        assert_eq!(
+            redact_url("git@github.com:owner/repo.git"),
+            "git@github.com:owner/repo.git"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_rejects_symlinks_at_any_level() {
+        let env = isolated();
+        let src = env.data.path().join("linksrc");
+        write_plugin(&src, "alpha", "1.0.0");
+        std::fs::create_dir_all(src.join("skills")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("escape")).unwrap();
+        std::os::unix::fs::symlink("/tmp", src.join("skills/dirlink")).unwrap();
+
+        let err = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("symlink"), "{message}");
+        assert!(
+            !env.agents.path().join("plugins").join("alpha").exists(),
+            "rejected install must not create the target"
+        );
+    }
+
+    // ---- fake git：超时 / 取消 / 输出洪泛 / 失败回显 的进程组回收 ----
+
+    #[cfg(unix)]
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    #[cfg(unix)]
+    fn signalable(pid: i32) -> bool {
+        unsafe { kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> i32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no pid recorded in {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn wait_group_gone(child_pid: i32, grandchild_pid: Option<i32>) {
+        for _ in 0..200 {
+            let child_gone = !signalable(child_pid) && !signalable(-child_pid);
+            let grandchild_gone = grandchild_pid.is_none_or(|pid| !signalable(pid));
+            if child_gone && grandchild_gone {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "fake git process group still alive: child {child_pid}, \
+             grandchild {grandchild_pid:?}, group {}",
+            -child_pid
+        );
+    }
+
+    /// 把 fake git（POSIX shell 脚本）插到 PATH 最前；Drop 恢复 PATH。
+    /// lock_env 与其它改环境变量的测试互斥（fake git 在 PATH 上时，
+    /// 别的测试起的真 git 会中招，必须串行）。
+    #[cfg(unix)]
+    struct FakeGit {
+        _lock: MutexGuard<'static, ()>,
+        old_path: Option<std::ffi::OsString>,
+        _bin: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGit {
+        fn drop(&mut self) {
+            match &self.old_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_git(script: &str) -> FakeGit {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::config::lock_env();
+        let bin = TempDir::new().unwrap();
+        let old_path = std::env::var_os("PATH");
+        let path = bin.path().join("git");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut new_path = bin.path().as_os_str().to_os_string();
+        if let Some(old) = &old_path {
+            new_path.push(":");
+            new_path.push(old);
+        }
+        std::env::set_var("PATH", new_path);
+        FakeGit {
+            _lock,
+            old_path,
+            _bin: bin,
+        }
+    }
+
+    /// 挂起型 fake git：记录自身与孙进程 pid，`wait` 挂住不退。
+    #[cfg(unix)]
+    fn hanging_git(dir: &Path) -> String {
+        format!(
+            "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+            dir.join("git.pid").display(),
+            dir.join("grandchild.pid").display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_timeout_kills_hanging_git_and_grandchild() {
+        let dir = TempDir::new().unwrap();
+        let _fake = fake_git(&hanging_git(dir.path()));
+        let dest = TempDir::new().unwrap();
+
+        // 超时取 2s：只放宽 macOS 首次 exec 的启动延迟，超时杀组语义不变。
+        let err = clone_git_repo(
+            "https://example.invalid/hang.git",
+            &dest.path().join("clone"),
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        wait_group_gone(
+            read_pid(&dir.path().join("git.pid")),
+            Some(read_pid(&dir.path().join("grandchild.pid"))),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_clone_kills_process_group() {
+        let dir = TempDir::new().unwrap();
+        let _fake = fake_git(&hanging_git(dir.path()));
+        let dest = TempDir::new().unwrap();
+
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let started = dir.path().join("git.pid");
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                if started.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            cancel.cancel();
+        });
+        let err = clone_git_repo(
+            "https://example.invalid/hang.git",
+            &dest.path().join("clone"),
+            Duration::from_secs(60),
+            Some(&token),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+
+        wait_group_gone(
+            read_pid(&dir.path().join("git.pid")),
+            Some(read_pid(&dir.path().join("grandchild.pid"))),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_output_overflow_kills_group_and_bounds_error() {
+        let dir = TempDir::new().unwrap();
+        let _fake = fake_git(&format!(
+            "echo $$ > '{}'; yes fake-git-flood-0123456789",
+            dir.path().join("git.pid").display()
+        ));
+        let dest = TempDir::new().unwrap();
+
+        let err = clone_git_repo(
+            "https://example.invalid/flood.git",
+            &dest.path().join("clone"),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("failed to clone"), "{message}");
+        assert!(message.contains("truncated"), "{message}");
+        assert!(
+            message.len() < GIT_OUTPUT_CAP_BYTES / 2,
+            "error echo must stay bounded, got {} bytes",
+            message.len()
+        );
+        wait_group_gone(read_pid(&dir.path().join("git.pid")), None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_failure_error_redacts_credentials_from_git_output() {
+        let url = "https://user:sekrittok@gitlab.example/x/y.git";
+        let _fake = fake_git(&format!(
+            "echo \"fatal: Authentication failed for '{url}/'\" >&2; exit 128"
+        ));
+        let dest = TempDir::new().unwrap();
+
+        let err = clone_git_repo(
+            url,
+            &dest.path().join("clone"),
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("failed to clone"), "{message}");
+        assert!(!message.contains("sekrittok"), "{message}");
+        assert!(message.contains("<git-url>"), "{message}");
     }
 }
