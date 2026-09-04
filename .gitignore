@@ -1,3 +1,8 @@
 /target
 *.bak.jsonl
 .DS_Store
+
+# 项目本地 settings（可能含 secrets，ADR 0003 D5/§4.3）；示例模板仍可提交。
+.config/instagent/settings.local.json
+# 原子写入残留的同目录临时文件（settings / 安装元数据）。
+.config/instagent/*.tmp

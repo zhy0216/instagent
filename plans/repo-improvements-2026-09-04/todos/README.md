@@ -17,7 +17,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 |---|---|---|---|
 | `done/01-policy-decisions.md` ✅ | P1 | medium | 固化密钥、环境、hook、CLI 流和 settings 语义，以及 sandbox 责任边界 |
 | `02-session-boundary.md` | P1 | medium | session id、坏尾部 salvage、权限、耐久性和 `last` 选择 |
-| `03-settings-atomic-merge.md` | P1 | medium | settings / 安装元数据原子私有写入、tri-state 合并和本地配置忽略 |
+| `done/03-settings-atomic-merge.md` ✅ | P1 | medium | settings / 安装元数据原子私有写入、tri-state 合并和本地配置忽略 |
 | `04-file-tool-budgets.md` | P1 | hard | fs/tree/skills/image 的阻塞、路径、大小、深度和取消边界 |
 | `05-subprocess-collector.md` | P1 | medium | 进程输出上限、增量 UTF-8 和无 pipe 配置错误 |
 | `06-process-tool-isolation.md` | P1 | hard | shell/command/hooks 的 bounded output、argv/env 隔离和 hook 策略 |

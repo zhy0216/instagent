@@ -258,25 +258,25 @@ pub fn show(cwd: &Path, name: &str) -> crate::Result<InstalledPlugin> {
 /// 白名单模式下同时加入 `enabledPlugins`。
 pub fn enable(name: &str) -> crate::Result<()> {
     ensure_installed(name)?;
-    let mut settings = load_user_settings()?;
+    let mut settings = Settings::load_user()?;
     settings.disabled_plugins.retain(|p| p != name);
     if !settings.enabled_plugins.is_empty() && !settings.enabled_plugins.contains(&name.to_string())
     {
         settings.enabled_plugins.push(name.to_string());
     }
-    save_user_settings(&settings)
+    settings.save_user()
 }
 
 /// 禁用：移出 `enabledPlugins` 并同时记入 `disabledPlugins`——后者保证
 /// 白名单变空、退化为黑名单模式后依然是禁用态。
 pub fn disable(name: &str) -> crate::Result<()> {
     ensure_installed(name)?;
-    let mut settings = load_user_settings()?;
+    let mut settings = Settings::load_user()?;
     settings.enabled_plugins.retain(|p| p != name);
     if !settings.disabled_plugins.contains(&name.to_string()) {
         settings.disabled_plugins.push(name.to_string());
     }
-    save_user_settings(&settings)
+    settings.save_user()
 }
 
 fn ensure_installed(name: &str) -> crate::Result<()> {
@@ -284,25 +284,6 @@ fn ensure_installed(name: &str) -> crate::Result<()> {
     let dir = user_plugins_dir()?.join(name);
     read_manifest(&dir)
         .with_context(|| format!("plugin `{name}` is not installed at {}", dir.display()))?;
-    Ok(())
-}
-
-fn load_user_settings() -> crate::Result<Settings> {
-    let path = crate::config::config_dir()?.join("settings.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn save_user_settings(settings: &Settings) -> crate::Result<()> {
-    let dir = crate::config::config_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join("settings.json"),
-        serde_json::to_string_pretty(settings)?,
-    )?;
     Ok(())
 }
 
@@ -377,8 +358,7 @@ fn read_install_info(dir: &Path) -> crate::Result<InstallInfo> {
 
 fn write_install_info(dir: &Path, info: &InstallInfo) -> crate::Result<()> {
     let path = dir.join(INSTALL_METADATA);
-    std::fs::write(&path, serde_json::to_string_pretty(info)?)?;
-    Ok(())
+    crate::settings::write_private_atomic(&path, &serde_json::to_string_pretty(info)?)
 }
 
 fn mark_last_update_check(dir: &Path, now: i64) -> crate::Result<()> {
@@ -875,6 +855,36 @@ mod tests {
         let base = TempDir::new().unwrap();
         let resolved = data_dir_from(Some(base.path().into())).unwrap();
         assert_eq!(resolved, base.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_and_enable_writes_are_private_and_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        disable("alpha").unwrap();
+
+        for path in [
+            plugin.root.join(INSTALL_METADATA),
+            env.config.path().join("settings.json"),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "private mode for {}", path.display());
+        }
+        // 同目录不留原子写入的临时文件。
+        for dir in [plugin.root.clone(), env.config.path().to_path_buf()] {
+            assert!(
+                std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+                "temp file left in {}",
+                dir.display()
+            );
+        }
+        assert_eq!(read_user_settings(&env).disabled_plugins, vec!["alpha"]);
     }
 
     #[test]
