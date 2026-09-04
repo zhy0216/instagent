@@ -180,6 +180,7 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
             Role::User => {
                 let mut texts = Vec::new();
                 let mut results = Vec::new();
+                let mut images = Vec::new();
                 for content in &message.content {
                     match content {
                         Content::Text(text) => texts.push(text.clone()),
@@ -193,14 +194,28 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                             "content": text,
                         })),
                         Content::ToolUse { .. } => {}
-                        // ponytail: 04 implements image parts（content 数组 + image_url data URL）
-                        Content::Image(_) => {}
+                        // goose convert_image 的 OpenAI 形状：data URL。
+                        Content::Image(img) => images.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", img.media_type, img.data),
+                            }
+                        })),
                     }
                 }
                 // 怪癖 3：tool 消息紧跟含 tool_calls 的 assistant 消息；
                 // 同一条 user 消息里混有文本时，文本放在 results 之后。
                 out.extend(results);
-                if !texts.is_empty() {
+                if !images.is_empty() {
+                    // OpenAI 的 tool 消息不能带图片：图片进 user 消息，
+                    // content 改用 parts 数组（文本部分在前，图片部分在后）。
+                    let mut parts: Vec<Value> = texts
+                        .into_iter()
+                        .map(|text| json!({"type": "text", "text": text}))
+                        .collect();
+                    parts.extend(images);
+                    out.push(json!({"role": "user", "content": parts}));
+                } else if !texts.is_empty() {
                     out.push(json!({"role": "user", "content": texts.join("\n")}));
                 }
             }
@@ -588,6 +603,88 @@ mod tests {
         assert_eq!(spec[2]["content"], "ok1");
         assert_eq!(spec[3]["tool_call_id"], "c2");
         assert_eq!(spec[4]["content"], "and one more thing");
+    }
+
+    // ---- 图片序列化（04） ----
+
+    #[test]
+    fn user_message_with_image_uses_content_parts_array() {
+        let messages = vec![
+            Message::user_text("look".into()),
+            Message::assistant(
+                vec![Content::ToolUse {
+                    id: "c1".into(),
+                    name: "read_image".into(),
+                    input: json!({"path": "x.png"}),
+                }],
+                None,
+            ),
+            Message {
+                role: Role::User,
+                content: vec![
+                    Content::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "Loaded image".into(),
+                        is_error: false,
+                    },
+                    Content::Text("what is this?".into()),
+                    Content::Image(crate::tools::ImageData {
+                        data: "iVBORw0KGgo=".into(),
+                        media_type: "image/png".into(),
+                    }),
+                ],
+                ts: 0,
+                usage: None,
+            },
+        ];
+        crate::message::validate(&messages).unwrap();
+        let spec = format_messages(&messages);
+        let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // 怪癖 3 在有图时不被破坏：tool 仍紧跟含 tool_calls 的 assistant。
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        assert_eq!(spec[2]["tool_call_id"], "c1");
+        let parts = spec[3]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(
+            parts[1],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}
+            })
+        );
+    }
+
+    #[test]
+    fn image_only_user_message_is_still_emitted() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![Content::Image(crate::tools::ImageData {
+                data: "R0lGOD".into(),
+                media_type: "image/gif".into(),
+            })],
+            ts: 0,
+            usage: None,
+        }];
+        let spec = format_messages(&messages);
+        assert_eq!(
+            spec,
+            vec![json!({
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/gif;base64,R0lGOD"}
+                }]
+            })]
+        );
+    }
+
+    #[test]
+    fn user_message_without_image_keeps_string_content() {
+        // 回归：无 Image 时行为逐字不变（quirk3_* 之外再钉死形状）。
+        let messages = vec![Message::user_text("plain".into())];
+        let spec = format_messages(&messages);
+        assert_eq!(spec, vec![json!({"role": "user", "content": "plain"})]);
     }
 
     // ---- 响应侧状态机 ----
