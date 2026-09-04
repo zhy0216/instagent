@@ -117,19 +117,14 @@ pub fn discover_with_bundled(
     Ok(set)
 }
 
-/// 纯合并：外部任一层已有同名 `bundled` 时不注入；启用判定与 `05`
-/// 一致（白名单模式须显式列出，黑名单模式须不在 disabled 里）。
+/// 纯合并：外部任一层已有同名 `bundled` 时不注入；启用判定与 `05` 共用
+/// [`plugin_enabled`]（白名单含显式 `[]` = 禁用全部，未表态才看 disabled）。
 fn with_bundled(mut set: PluginSet, bundled: Plugin, settings: &Settings) -> PluginSet {
     let name = &bundled.manifest.name;
     if set.get(name).is_some() {
         return set;
     }
-    let enabled = if settings.enabled_plugins.is_empty() {
-        !settings.disabled_plugins.contains(name)
-    } else {
-        settings.enabled_plugins.contains(name)
-    };
-    if enabled {
+    if crate::plugin::plugin_enabled(name, settings) {
         set.plugins.push(bundled);
         set.plugins
             .sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));

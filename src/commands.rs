@@ -1,11 +1,16 @@
 //! 插件斜杠命令（第三版 §2.8）：`dev.instagent/commands/*.md`，Claude Code
 //! 约定。frontmatter 取 `description` / `argument-hint`，正文 `$ARGUMENTS`
 //! 展开；无占位符且带参数时参数追加到末尾（Claude Code 行为）。
+//!
+//! 目录枚举与正文读取都带可见诊断与硬上限（R12、S18）：坏 symlink、无权限、
+//! 超长正文、解析失败、重名一律汇总成 [`SkippedCommand`]，不静默消失。
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::plugin::Plugin;
 use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
 
@@ -55,41 +60,104 @@ where
     }))
 }
 
+/// 单个命令文件正文的硬上限（S18）：超限不静默截断，记 skipped 诊断。
+const MAX_COMMAND_FILE_BYTES: u64 = 256 * 1024;
+
+/// 一个被跳过的命令文件：路径 + 原因（原因内含插件名与来源，R12）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedCommand {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// 发现启用插件的 `dev.instagent/commands/*.md`（插件名升序、文件名升序，
-/// 同名命令先到先得）。解析失败的文件跳过（warn），不中断加载。
+/// 同名命令先到先得）。坏目录、坏 symlink、无权限、超长正文、解析失败与重名
+/// 都汇总成可见诊断（[`collect_commands`] 返回、[`load_commands`] 逐条 warn），
+/// 不静默消失；解析失败不中断加载。
 pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<SlashCommand>> {
+    let (commands, skipped) = collect_commands(plugins);
+    for skipped in &skipped {
+        tracing::warn!("跳过 {}：{}", skipped.path.display(), skipped.reason);
+    }
+    Ok(commands)
+}
+
+/// [`load_commands`] 的诊断面：返回（命令列表，被跳过项）。装配层需要时可直接
+/// 用它把 `skipped` 并入启动 notes。
+pub fn collect_commands(plugins: &PluginSet) -> (Vec<SlashCommand>, Vec<SkippedCommand>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for plugin in plugins.iter() {
         let dir = plugin.root.join(NAMESPACE).join("commands");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            // 插件不带 commands 目录属正常（第三版 §2.1）。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                skipped.push(diagnostic(
+                    plugin,
+                    &dir,
+                    &format!("failed to read commands dir: {err}"),
+                ));
+                continue;
+            }
+            Ok(entries) => entries,
         };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file() && path.extension().is_some_and(|e| e == "md"))
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                skipped.push(diagnostic(
+                    plugin,
+                    &dir,
+                    "failed to read a dir entry of commands dir \
+                     (permission denied, changed during scan, or unreadable directory?)",
+                ));
+                continue;
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue; // 不匹配：非 Markdown，静默。
+            }
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => files.push(path),
+                // 指向目录 / 非文件的链接：不匹配，静默。
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => skipped.push(diagnostic(
+                    plugin,
+                    &path,
+                    &format!("broken symlink or vanished file: {err}"),
+                )),
+                Err(err) => skipped.push(diagnostic(
+                    plugin,
+                    &path,
+                    &format!("cannot stat command file: {err}"),
+                )),
+            }
+        }
         files.sort();
         for path in files {
             let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 continue;
             };
-            let text = match std::fs::read_to_string(&path) {
+            let text = match read_bounded(&path) {
                 Ok(text) => text,
-                Err(err) => {
-                    tracing::warn!("跳过 {}：读取失败 {err}", path.display());
+                Err(reason) => {
+                    skipped.push(diagnostic(plugin, &path, &reason));
                     continue;
                 }
             };
             let (frontmatter, template) = match parse_command_file(&text) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    tracing::warn!("跳过 {}：{err}", path.display());
+                    skipped.push(diagnostic(plugin, &path, &format!("{err:#}")));
                     continue;
                 }
             };
             if out.iter().any(|cmd: &SlashCommand| cmd.name == name) {
-                tracing::warn!("跳过 {}：命令 `/{name}` 重名，先到先得", path.display());
+                skipped.push(diagnostic(
+                    plugin,
+                    &path,
+                    &format!("command `/{name}` is duplicated, first one wins"),
+                ));
                 continue;
             }
             out.push(SlashCommand {
@@ -100,7 +168,45 @@ pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<SlashCommand>> {
             });
         }
     }
-    Ok(out)
+    (out, skipped)
+}
+
+/// 一条命令文件诊断：`插件名 (来源) [绝对路径]: 原因`。
+fn diagnostic(plugin: &Plugin, path: &Path, reason: &str) -> SkippedCommand {
+    SkippedCommand {
+        path: path.to_path_buf(),
+        reason: format!(
+            "plugin `{}` ({}: {}): {reason}",
+            plugin.manifest.name,
+            plugin.source.display_name(),
+            crate::plugin::located(path)
+        ),
+    }
+}
+
+/// 有界读取命令正文：metadata 预检 + `take(MAX + 1)` 兜住预检与读取之间的
+/// 增长竞态，超限给可诊断错误（不静默截断）。
+fn read_bounded(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let size = std::fs::metadata(path).map_err(|err| format!("cannot stat command file: {err}"))?;
+    if size.len() > MAX_COMMAND_FILE_BYTES {
+        return Err(format!(
+            "command file is {} bytes, over the {MAX_COMMAND_FILE_BYTES} byte limit",
+            size.len()
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .map_err(|err| format!("failed to open command file: {err}"))?
+        .take(MAX_COMMAND_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|err| format!("failed to read command file: {err}"))?;
+    if text.len() as u64 > MAX_COMMAND_FILE_BYTES {
+        return Err(format!(
+            "command file grew past the {MAX_COMMAND_FILE_BYTES} byte limit while reading"
+        ));
+    }
+    Ok(text)
 }
 
 /// 拆分 `---` frontmatter（缺失容忍：整篇是正文）。返回（元信息，正文）。
@@ -204,7 +310,18 @@ mod tests {
             plugins: vec![plugin(&a, "a"), plugin(&b, "b")],
             skipped: Vec::new(),
         };
-        let commands = load_commands(&set).unwrap();
+        let (commands, skipped) = collect_commands(&set);
+        let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
+        assert!(
+            skipped.iter().any(|s| s.reason.contains("duplicated")),
+            "重名要可见：{reasons:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.path.file_name().is_some_and(|f| f == "broken.md")),
+            "坏 YAML 要可见：{reasons:?}"
+        );
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"dup"), "{names:?}");
         assert_eq!(
@@ -232,5 +349,91 @@ mod tests {
             skipped: Vec::new(),
         };
         assert!(load_commands(&set).unwrap().is_empty());
+    }
+
+    /// R12 / S18：坏 symlink、超长正文都有带 path + 来源的可见诊断；
+    /// 非 Markdown 与指向目录的链接属"不匹配"，静默。
+    #[cfg(unix)]
+    #[test]
+    fn broken_and_oversized_command_files_are_reported() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        command_file(&a, "good.md", "fine body\n");
+        command_file(
+            &a,
+            "huge.md",
+            &"x".repeat(MAX_COMMAND_FILE_BYTES as usize + 1),
+        );
+        let commands_dir = a.join(NAMESPACE).join("commands");
+        symlink(
+            dir.path().join("nowhere.md"),
+            commands_dir.join("dangling.md"),
+        )
+        .unwrap();
+        std::fs::write(commands_dir.join("notes.txt"), "not a command").unwrap();
+        std::fs::create_dir(commands_dir.join("dir.md")).unwrap();
+        let set = PluginSet {
+            plugins: vec![plugin(&a, "a")],
+            skipped: Vec::new(),
+        };
+
+        let (commands, skipped) = collect_commands(&set);
+        assert_eq!(
+            commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
+        assert!(
+            skipped.iter().any(|s| {
+                s.path == commands_dir.join("huge.md") && s.reason.contains("over the")
+            }),
+            "超长正文必须可见：{reasons:?}"
+        );
+        assert!(
+            skipped.iter().any(|s| {
+                s.path == commands_dir.join("dangling.md") && s.reason.contains("broken symlink")
+            }),
+            "坏 symlink 必须可见：{reasons:?}"
+        );
+        assert_eq!(skipped.len(), 2, "不匹配的条目不该产生诊断：{reasons:?}");
+        // 诊断包含来源标签与解析后的绝对路径。
+        for skipped in &skipped {
+            assert!(skipped.reason.contains("plugin `a`"), "{skipped:?}");
+            assert!(
+                skipped
+                    .reason
+                    .contains(&crate::plugin::located(&skipped.path)),
+                "{skipped:?} 应含绝对路径"
+            );
+        }
+    }
+
+    /// commands 目录读不了（权限）要报，不能整插件静默消失。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_commands_dir_is_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let plugin = plugin(&a, "a");
+        let commands_dir = a.join(NAMESPACE).join("commands");
+        command_file(&a, "hidden.md", "body\n");
+        std::fs::set_permissions(&commands_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let set = PluginSet {
+            plugins: vec![plugin],
+            skipped: Vec::new(),
+        };
+        let (commands, skipped) = collect_commands(&set);
+        std::fs::set_permissions(&commands_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !commands.is_empty() {
+            return; // 以 root 运行时权限位不生效，跳过本用例。
+        }
+        assert!(
+            skipped.iter().any(|s| {
+                s.path == commands_dir && s.reason.contains("failed to read commands dir")
+            }),
+            "{skipped:?}"
+        );
     }
 }

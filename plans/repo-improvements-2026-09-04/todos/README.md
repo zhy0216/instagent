@@ -29,7 +29,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 | `12-cli-stream-and-e2e.md` | P1 | hard | stdout/stderr 契约、退出码、取消和 CLI/PTY 回归 |
 | `13-parallel-tools.md` | P1 | hard | 只读工具并行、冲突排序、图片/并发预算和取消 |
 | `done/14-manifest-schema.md` ✅ | P2 | medium | plugin manifest 版本、字段形状和跨字段校验 |
-| `15-discovery-diagnostics.md` | P2 | medium | 插件来源类型和目录枚举错误诊断 |
+| `done/15-discovery-diagnostics.md` ✅ | P2 | medium | 插件来源类型和目录枚举错误诊断 |
 | `16-docs-and-rustdoc.md` | P2 | easy | 当前工具数量、ADR/历史计划标记和 rustdoc 警告清理 |
 | `17-ci-release-metadata.md` | P2 | medium | 包元数据、toolchain 支持范围、audit/doc/release CI 门槛 |
 | `done/18-provider-converter.md` ✅ | P2 | medium | provider converter 的 source 注入、fixture 和 round-trip 校验 |
@@ -53,7 +53,7 @@ easy / medium 任务使用 flash，hard 任务使用 max。
 12. `12-cli-stream-and-e2e.md` — 依赖：06、07、10、11。
 13. `13-parallel-tools.md` — 依赖：04、05、06、09、10、11。
 14. `done/14-manifest-schema.md` ✅ — 依赖：01、08。完成。`plugin.json` 逐字段形状 + 跨字段校验（`version` 必填非空、非 SemVer 按 §5.4 只 warning；`author` 对象封闭；`keywords` 逐元素；`extensions` 命名空间反域名 + 值为对象，`dev.instagent.minKernel` 类型），未知顶层字段与非对象 `extensions` 按规范报告并忽略；读取 1 MiB 硬上限、解析错误只回显截断摘要；错误统一「来源文件 + 插件名 + 字段 + 建议值」。
-15. `15-discovery-diagnostics.md` — 依赖：03。
+15. `done/15-discovery-diagnostics.md` ✅ — 依赖：03。完成。`PluginSource` 拆出 `Cli` kind + `display_name()`，skipped/错误统一「来源 [绝对路径]: 原因」；目录枚举改为区分"不匹配"（散文件、无 `plugin.json` 的目录 → 静默）与"读取失败"（权限、IO、坏 symlink、逐条 entry 失败 → 汇总诊断），commands 侧同口径且有界读取（256 KiB）；`Settings::whitelist()` + 共享 `plugin_enabled()` 把 ADR 0003 D5 三态接到 discovery/bundled（显式 `[]` = 禁用全部），写回忠实表达三态。依赖：03。
 16. `16-docs-and-rustdoc.md` — 依赖：08、12、13、14。
 17. `17-ci-release-metadata.md` — 依赖：01、16。
 18. `done/18-provider-converter.md` ✅ — 完成。converter 改 `--source DIR`/`--fixture` 显式注入（不再硬编码 ~/yyds/goose）；产物按 08 的 ProviderDef/ModelDef 契约做 schema + round-trip 校验，契约外字段剔除、约定字段保留，坏 source/schema 非零退出带文件与字段诊断；新增最小 fixture 与 11 个可重复 python 测试，真实 goose 源重生成 groq/deepseek 与提交物逐字节一致。依赖：08。

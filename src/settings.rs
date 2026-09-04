@@ -31,13 +31,34 @@ pub enum SettingsLayer {
 }
 
 /// 三层合并后的 settings 形状（字段名按规范为 camelCase）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     /// 写了即白名单模式；没写则"除 `disabled_plugins` 外全启用"。
     /// 层内的三态（缺失 / `[]` / 非空，ADR 0003 D5）由 `merge_layers` 处理。
     pub enabled_plugins: Vec<String>,
     pub disabled_plugins: Vec<String>,
+    /// 合并终值是"显式空白名单"（ADR 0003 D5 的 `[]`，且没有更高层认领名字）：
+    /// `enabled_plugins` 为空但白名单模式仍成立，即禁用全部。消费端判模式用
+    /// [`Settings::whitelist`]，不要拿 `enabled_plugins.is_empty()` 猜——
+    /// 那样显式 `[]` 会退化成"全启用"。
+    #[serde(skip)]
+    pub enabled_locked: bool,
+}
+
+/// 手写序列化：未表态（`enabled_locked == false`）时空 `enabled_plugins` 写成
+/// 缺失键而不是 `[]`，否则 `plugin disable` 把白名单清空后会在下次读回时变成
+/// "禁用全部"（ADR 0003 D5 只在用户显式写 `[]` 时生效）。
+impl Serialize for Settings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(2))?;
+        if !self.enabled_plugins.is_empty() || self.enabled_locked {
+            map.serialize_entry("enabledPlugins", &self.enabled_plugins)?;
+        }
+        map.serialize_entry("disabledPlugins", &self.disabled_plugins)?;
+        map.end()
+    }
 }
 
 /// 单个文件里的形状：区分"字段缺失"（None）与"写了空数组"（Some(vec![])），
@@ -54,13 +75,17 @@ impl Settings {
         Ok(crate::config::config_dir()?.join("settings.json"))
     }
 
-    /// 读用户层 settings（文件不存在 = 默认值）。
+    /// 读用户层 settings（文件不存在 = 默认值）。走 `LayerFile` + 合并，
+    /// 单层也能表达 `enabledPlugins` 的三态（ADR 0003 D5）。
     pub fn load_user() -> crate::Result<Settings> {
-        Ok(match std::fs::read_to_string(Self::user_path()?) {
-            Ok(text) => serde_json::from_str(&text)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
-            Err(e) => return Err(e.into()),
-        })
+        Ok(merge_layers([read_layer(&Self::user_path()?)?, None, None]))
+    }
+
+    /// `enabledPlugins` 白名单视图（ADR 0003 D5 三态）：
+    /// `Some(names)` = 白名单模式（含显式 `[]` = 禁用全部）；
+    /// `None` = 该键从未表态，走 `disabled_plugins` 黑名单。
+    pub fn whitelist(&self) -> Option<&[String]> {
+        (!self.enabled_plugins.is_empty() || self.enabled_locked).then_some(&self.enabled_plugins)
     }
 
     /// 写回用户层。
@@ -164,8 +189,9 @@ fn read_layer(path: &Path) -> crate::Result<Option<LayerFile>> {
 /// 被高层提到过的名字（enabled/disabled 任一）不再被低层覆盖。
 /// `enabledPlugins` 三态（ADR 0003 D5）：`None` = 不表态，低层值延续；
 /// 非空 = 白名单；`Some([])` = 终值，此后低层不得再恢复任何 enabled 名字
-/// （高层已认领的 enabled 名字不受影响）。`disabledPlugins` 维持并集，
-/// `None` 与 `Some([])` 等价。
+/// （高层已认领的 enabled 名字不受影响）。终值在合并结果里记为
+/// [`Settings::enabled_locked`]，供消费端区分"没写"与"写了 `[]`"。
+/// `disabledPlugins` 维持并集，`None` 与 `Some([])` 等价。
 fn merge_layers(layers: [Option<LayerFile>; 3]) -> Settings {
     let mut merged = Settings::default();
     let mut claimed: HashSet<String> = HashSet::new();
@@ -185,6 +211,9 @@ fn merge_layers(layers: [Option<LayerFile>; 3]) -> Settings {
             claimed.extend(names.iter().cloned());
         }
     }
+    // 高层认领过名字时白名单非空，终值标志没有额外信息；只在"空终值"时置位，
+    // 让消费端能把显式 `[]`（禁用全部）与"从未表态"区分开。
+    merged.enabled_locked = enabled_locked && merged.enabled_plugins.is_empty();
     merged
 }
 
@@ -273,6 +302,7 @@ mod tests {
         let settings = Settings {
             enabled_plugins: vec!["x".into()],
             disabled_plugins: vec!["y".into()],
+            ..Settings::default()
         };
         for layer in [
             SettingsLayer::User,
@@ -408,6 +438,60 @@ mod tests {
         );
     }
 
+    /// 消费端判模式的唯一入口：三态在合并结果里都可表达。
+    #[test]
+    fn whitelist_accessor_exposes_all_three_states() {
+        let (_guard, user) = temp_user_dir();
+        let project = tempfile::tempdir().unwrap();
+        // 缺失 = 不表态（None，走黑名单）。
+        let settings = Settings::merged(project.path()).unwrap();
+        assert_eq!(settings.whitelist(), None);
+        // 非空 = 白名单。
+        write_json(
+            &user.path().join("settings.json"),
+            r#"{"enabledPlugins":["a"]}"#,
+        );
+        let settings = Settings::merged(project.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&["a".to_string()][..]));
+        // 显式 [] = 白名单且为空 = 禁用全部。
+        layer_file(
+            SettingsLayer::Local,
+            project.path(),
+            r#"{"enabledPlugins":[]}"#,
+        );
+        let settings = Settings::merged(project.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&[][..]));
+        assert!(settings.enabled_locked);
+    }
+
+    /// 写回忠实表达三态：没表态的空白名单不写键（否则 `plugin disable` 清空
+    /// 白名单后会被读成"禁用全部"），显式 `[]` 终值才写空数组。
+    #[test]
+    fn saving_preserves_enabled_tri_state() {
+        let (_guard, user) = temp_user_dir();
+        let settings = Settings {
+            disabled_plugins: vec!["a".into()],
+            ..Settings::default()
+        };
+        settings.save_user().unwrap();
+        assert_eq!(
+            read_json(user.path().join("settings.json"))["enabledPlugins"],
+            serde_json::Value::Null
+        );
+        assert_eq!(Settings::load_user().unwrap().whitelist(), None);
+
+        let settings = Settings {
+            enabled_locked: true,
+            ..Settings::default()
+        };
+        settings.save_user().unwrap();
+        assert_eq!(
+            read_json(user.path().join("settings.json"))["enabledPlugins"],
+            serde_json::json!([])
+        );
+        assert_eq!(Settings::load_user().unwrap().whitelist(), Some(&[][..]));
+    }
+
     #[cfg(unix)]
     #[test]
     fn saves_write_private_mode_and_leave_no_temp() {
@@ -417,6 +501,7 @@ mod tests {
         let settings = Settings {
             enabled_plugins: vec!["x".into()],
             disabled_plugins: vec!["y".into()],
+            ..Settings::default()
         };
         settings.save_user().unwrap();
         for layer in [SettingsLayer::Project, SettingsLayer::Local] {

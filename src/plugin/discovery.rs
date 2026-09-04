@@ -2,21 +2,28 @@
 //!
 //! 扫描顺序：`~/.agents/plugins/`（用户）→ `<project>/.agents/plugins/`（项目）→
 //! 配置 `plugins` 额外路径（`01`）→ 运行时 `--plugin PATH`。同名插件按层覆盖：
-//! Extra/CLI > 项目 > 用户（[`PluginSource`] 注释）；层内按扫描顺序先到先得。
-//! 额外路径与 CLI 参数自动识别：目录本身含 `plugin.json` 视为单个插件，
-//! 否则视为插件根目录逐个子目录扫描。manifest 校验失败的目录记录原因并跳过，
-//! 不中断整体发现。
+//! CLI > 配置额外路径 > 项目 > 用户（[`PluginSource`] 注释）；层内按扫描顺序
+//! 先到先得。额外路径与 CLI 参数自动识别：目录本身含 `plugin.json` 视为单个
+//! 插件，否则视为插件根目录逐个子目录扫描。manifest 校验失败的目录记录原因并
+//! 跳过，不中断整体发现。
 //!
-//! 启用判定用 `01` 三层合并后的 settings（优先级 local > project > user 已在
-//! 合并时体现）：`enabledPlugins` 非空即白名单模式，否则"除 `disabledPlugins`
-//! 外全启用"。合并形状 `Vec<String>` 不区分"显式写空数组"与"没写"，
-//! 显式空白名单因此等同于黑名单模式。
+//! 目录枚举统一走 `scan_path`，把"不匹配"（散文件、没有 `plugin.json` 的
+//! 目录）与真失败（逐条 IO 错误、坏 symlink、无权限）分开：前者静默跳过，
+//! 后者汇总成带来源与解析后绝对路径的 skipped 诊断（R12），装配层经
+//! [`PluginSet::skipped`] 提示给用户，绝不无声消失。
+//!
+//! 启用判定用 `01` 三层合并后的 settings，三态按 ADR 0003 D5 由
+//! [`Settings::whitelist`] 表达：缺失 = 不表态（`disabledPlugins` 黑名单）、
+//! 非空 = 白名单、显式 `[]` = 禁用全部。判定逻辑在 [`plugin_enabled`]，
+//! discovery 与 bundled 共用。
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::plugin::located;
 use crate::plugin::manifest::read_manifest;
+use crate::plugin::plugin_enabled;
 use crate::plugin::Plugin;
 use crate::plugin::PluginSource;
 use crate::settings::Settings;
@@ -26,7 +33,8 @@ use crate::settings::Settings;
 pub struct PluginSet {
     /// 按插件名升序。
     pub plugins: Vec<Plugin>,
-    /// manifest 校验（`04`）失败、被发现但跳过的目录及原因。
+    /// 目录枚举或 manifest 校验（`04`）失败、被发现但跳过的目录及原因
+    /// （第三版 §2.10 F1、R12）。`reason` 内含来源显示名与解析后的绝对路径。
     pub skipped: Vec<SkippedPlugin>,
 }
 
@@ -48,14 +56,31 @@ impl PluginSet {
     }
 }
 
-/// 同名覆盖的层序（比 [`PluginSource`] 更细：配置额外路径与 CLI 参数同为
-/// `Extra`，但 CLI 后扫描、优先覆盖）。
+/// 同名覆盖的层序（比 [`PluginSource`] 更细：配置额外路径与 CLI 参数覆盖力
+/// 同级但 CLI 后扫描、优先覆盖，来源 kind 仍各自独立，见 E8）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Layer {
     User = 0,
     Project = 1,
     Extra = 2,
     Cli = 3,
+}
+
+impl Layer {
+    fn source(self) -> PluginSource {
+        match self {
+            Layer::User => PluginSource::User,
+            Layer::Project => PluginSource::Project,
+            Layer::Extra => PluginSource::Extra,
+            Layer::Cli => PluginSource::Cli,
+        }
+    }
+
+    /// 用户显式声明的路径（配置 `plugins` / `--plugin`）：缺失要诊断，
+    /// 用户/项目根缺失才属正常（首次运行）。
+    fn is_explicit(self) -> bool {
+        matches!(self, Layer::Extra | Layer::Cli)
+    }
 }
 
 struct Candidate {
@@ -87,99 +112,189 @@ pub fn discover(
 
     scan_path(
         &agents_dir()?.join("plugins"),
-        PluginSource::User,
         Layer::User,
         &mut found,
         &mut skipped,
     );
     scan_path(
         &cwd.join(".agents").join("plugins"),
-        PluginSource::Project,
         Layer::Project,
         &mut found,
         &mut skipped,
     );
     for path in extra_paths {
-        scan_path(
-            path,
-            PluginSource::Extra,
-            Layer::Extra,
-            &mut found,
-            &mut skipped,
-        );
+        scan_path(path, Layer::Extra, &mut found, &mut skipped);
     }
     for path in cli_plugins {
-        scan_path(
-            path,
-            PluginSource::Extra,
-            Layer::Cli,
-            &mut found,
-            &mut skipped,
-        );
+        scan_path(path, Layer::Cli, &mut found, &mut skipped);
     }
 
-    let whitelist = !settings.enabled_plugins.is_empty();
     let plugins = found
         .into_values()
         .map(|candidate| candidate.plugin)
-        .filter(|plugin| {
-            let name = &plugin.manifest.name;
-            if whitelist {
-                settings.enabled_plugins.contains(name)
-            } else {
-                !settings.disabled_plugins.contains(name)
-            }
-        })
+        .filter(|plugin| plugin_enabled(&plugin.manifest.name, settings))
         .collect();
     Ok(PluginSet { plugins, skipped })
 }
 
 /// `path` 含 `plugin.json` 则按单个插件目录注册，否则作为插件根目录按名称
 /// 升序扫描其子目录（目录内先到先得，同名靠 [`Layer`] 覆盖）。
-/// 用户/项目扫描根不存在属正常（首次运行）；配置 `plugins` 与 `--plugin`
-/// 是用户显式声明的路径，缺失（被删、写错）记 skipped 警告并在启动提示里
-/// 给出（第三版 §5 P7"插件目录被删"），不中断发现。
+///
+/// 枚举失败一律汇总为 skipped 诊断（R12）：根目录读不了（权限、IO、不是
+/// 目录）、逐条 entry 读失败、坏 symlink、`plugin.json` 无法 stat 都要说话；
+/// 只有"确实不匹配"（散文件、没有 `plugin.json` 的普通目录、指向文件的链接）
+/// 静默。显式声明的路径（配置 / CLI）整条扫不到插件也记一条，覆盖目录被删、
+/// 写错、指错位置（第三版 §5 P7）。
 fn scan_path(
     path: &Path,
-    source: PluginSource,
     layer: Layer,
     found: &mut BTreeMap<String, Candidate>,
     skipped: &mut Vec<SkippedPlugin>,
 ) {
-    if path.join("plugin.json").is_file() {
-        register(path, source, layer, found, skipped);
-        return;
-    }
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if matches!(layer, Layer::Extra | Layer::Cli) {
-                skipped.push(SkippedPlugin {
-                    path: path.to_path_buf(),
-                    reason: "explicitly configured plugin path not found \
-                             (deleted, moved, or misspelled)"
-                        .to_string(),
-                });
+    let source = layer.source();
+    let mut problems: Vec<(PathBuf, String)> = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    match plugin_json_state(path) {
+        PluginJson::Present => candidates.push(path.to_path_buf()),
+        PluginJson::Unreadable(reason) => problems.push((path.to_path_buf(), reason)),
+        PluginJson::Absent => match list_child_dirs(path) {
+            Err(DirError::Missing) if !layer.is_explicit() => return,
+            Err(DirError::Missing) => {
+                let reason = if is_symlink(path) {
+                    "plugin path is a broken symlink (target missing or unreadable)"
+                } else {
+                    "plugin path not found (deleted, moved, or misspelled)"
+                };
+                problems.push((path.to_path_buf(), reason.to_string()));
             }
-            return;
+            Err(DirError::Failed(reason)) => problems.push((path.to_path_buf(), reason)),
+            Ok(ChildDirs { dirs, failures }) => {
+                problems.extend(failures);
+                candidates = dirs;
+            }
+        },
+    }
+    // 子目录里只留真正的插件目录；没有 `plugin.json` 属不匹配，读不到才诊断。
+    candidates.retain(|dir| match plugin_json_state(dir) {
+        PluginJson::Present => true,
+        PluginJson::Absent => false,
+        PluginJson::Unreadable(reason) => {
+            problems.push((dir.clone(), reason));
+            false
         }
-        Err(err) => {
-            skipped.push(SkippedPlugin {
-                path: path.to_path_buf(),
-                reason: format!("failed to read plugin root: {err}"),
-            });
-            return;
-        }
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    dirs.sort();
-    for dir in dirs {
+    });
+    if candidates.is_empty() && problems.is_empty() && layer.is_explicit() {
+        problems.push((
+            path.to_path_buf(),
+            "no plugin found here or in its child directories \
+             (plugin.json missing; empty or wrong directory?)"
+                .to_string(),
+        ));
+    }
+    for (at, reason) in problems {
+        skipped.push(SkippedPlugin {
+            path: at.clone(),
+            reason: format!("{} [{}]: {reason}", source.display_name(), located(&at)),
+        });
+    }
+    for dir in candidates {
         register(&dir, source, layer, found, skipped);
     }
+}
+
+/// 目录里 `plugin.json` 的状态：区分"没有"（不匹配）与"读不了"（权限 / IO）。
+enum PluginJson {
+    Present,
+    Absent,
+    Unreadable(String),
+}
+
+fn plugin_json_state(dir: &Path) -> PluginJson {
+    let manifest = dir.join("plugin.json");
+    match std::fs::metadata(&manifest) {
+        Ok(meta) if meta.is_file() => PluginJson::Present,
+        Ok(_) => PluginJson::Unreadable(format!("{} is not a regular file", manifest.display())),
+        // `NotADirectory`：`dir` 根本不是目录，交给根目录枚举去报真实原因。
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            PluginJson::Absent
+        }
+        Err(err) => PluginJson::Unreadable(format!("cannot stat {}: {err}", manifest.display())),
+    }
+}
+
+/// 根目录枚举的失败形状。
+enum DirError {
+    /// 目录不存在（含坏 symlink 的目标缺失）：层级决定是否算问题。
+    Missing,
+    /// 权限、不是目录、其它 IO 失败：任何层级都要诊断。
+    Failed(String),
+}
+
+struct ChildDirs {
+    dirs: Vec<PathBuf>,
+    failures: Vec<(PathBuf, String)>,
+}
+
+/// 统一枚举插件根目录的子目录（R12）：坏 symlink 与逐条读取失败进
+/// `failures`；散文件、指向文件的链接属不匹配，静默。返回按路径升序。
+fn list_child_dirs(path: &Path) -> Result<ChildDirs, DirError> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(DirError::Missing),
+        Err(err) => {
+            return Err(DirError::Failed(format!(
+                "failed to read plugin root: {err}"
+            )))
+        }
+    };
+    let mut dirs = Vec::new();
+    let mut failures = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            failures.push((
+                path.to_path_buf(),
+                "failed to read a dir entry of plugin root \
+                 (permission denied, changed during scan, or unreadable directory?)"
+                    .to_string(),
+            ));
+            continue;
+        };
+        let child = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            failures.push((
+                child.clone(),
+                "failed to stat dir entry (unreadable directory?)".to_string(),
+            ));
+            continue;
+        };
+        let is_dir = if file_type.is_symlink() {
+            match std::fs::metadata(&child) {
+                Ok(meta) => meta.is_dir(),
+                Err(err) => {
+                    failures.push((child, format!("broken symlink: {err}")));
+                    continue;
+                }
+            }
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
+            dirs.push(child);
+        }
+    }
+    dirs.sort();
+    Ok(ChildDirs { dirs, failures })
+}
+
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 fn register(
@@ -194,7 +309,7 @@ fn register(
         Err(err) => {
             skipped.push(SkippedPlugin {
                 path: dir.to_path_buf(),
-                reason: format!("{err:#}"),
+                reason: format!("{} [{}]: {err:#}", source.display_name(), located(dir)),
             });
             return;
         }
@@ -294,7 +409,7 @@ mod tests {
         assert_eq!(set.get("alpha").unwrap().source, PluginSource::User);
         assert_eq!(set.get("beta").unwrap().source, PluginSource::Project);
         assert_eq!(set.get("gamma").unwrap().source, PluginSource::Extra);
-        assert_eq!(set.get("delta").unwrap().source, PluginSource::Extra);
+        assert_eq!(set.get("delta").unwrap().source, PluginSource::Cli);
         assert_eq!(
             set.get("beta").unwrap().root,
             project_plugins(cwd.path()).join("beta")
@@ -358,7 +473,7 @@ mod tests {
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("plugin.json"), "{ not json").unwrap();
         let empty = user.join("not-a-plugin");
-        std::fs::create_dir_all(empty).unwrap();
+        std::fs::create_dir_all(empty.clone()).unwrap();
         // 根目录里的散文件不是插件候选，也不报错。
         std::fs::write(user.join("README.md"), "stray file").unwrap();
 
@@ -368,7 +483,10 @@ mod tests {
         let skipped: Vec<&Path> = set.skipped.iter().map(|s| s.path.as_path()).collect();
         assert!(skipped.contains(&&*no_schema), "{skipped:?}");
         assert!(skipped.contains(&&*broken), "{skipped:?}");
-        assert!(skipped.contains(&user.join("not-a-plugin").as_path()));
+        assert!(
+            !skipped.contains(&&*empty),
+            "没有 plugin.json 的普通目录属\"不匹配\"，不该报：{skipped:?}"
+        );
         assert!(set
             .skipped
             .iter()
@@ -377,6 +495,17 @@ mod tests {
             .skipped
             .iter()
             .any(|s| { s.path == broken && s.reason.contains("Failed to parse") }));
+        // 诊断同时给出来源与解析后的绝对路径（E8）。
+        for skipped in &set.skipped {
+            assert!(
+                skipped.reason.contains("user plugin dir"),
+                "{skipped:?} 应标明来源层"
+            );
+            assert!(
+                skipped.reason.contains(&located(&skipped.path)),
+                "{skipped:?} 应含解析后的绝对路径"
+            );
+        }
     }
 
     #[test]
@@ -388,6 +517,7 @@ mod tests {
         let settings = Settings {
             enabled_plugins: vec!["a".into()],
             disabled_plugins: vec!["a".into()], // 与白名单冲突时白名单说了算
+            ..Settings::default()
         };
         let set = discover(env.agents.path(), &settings, &[], &[]).unwrap();
         assert_eq!(names(&set), ["a"]);
@@ -404,6 +534,65 @@ mod tests {
             ..Settings::default()
         };
         let set = discover(env.agents.path(), &settings, &[], &[]).unwrap();
+        assert_eq!(names(&set), ["a"]);
+    }
+
+    /// ADR 0003 D5 消费端接线：显式 `[]` = 禁用全部，缺失 = 不表态延续低层。
+    #[test]
+    fn explicit_empty_whitelist_disables_everything() {
+        let config = TempDir::new().unwrap();
+        let env = isolated_agents();
+        std::env::set_var("INSTAGENT_CONFIG_DIR", config.path());
+        let user_settings = config.path().join("settings.json");
+        std::fs::write(&user_settings, r#"{"enabledPlugins":[]}"#).unwrap();
+        in_root(&user_plugins(&env), "a", "1.0.0");
+        in_root(&user_plugins(&env), "b", "1.0.0");
+
+        let cwd = TempDir::new().unwrap();
+        let settings = Settings::merged(cwd.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&[][..]));
+        let set = discover(cwd.path(), &settings, &[], &[]).unwrap();
+        assert!(
+            set.plugins.is_empty(),
+            "显式 [] 必须禁用全部：{:?}",
+            names(&set)
+        );
+
+        // 同一个键改成缺失：不表态 → 黑名单模式，全启用。
+        std::fs::write(&user_settings, r#"{"disabledPlugins":[]}"#).unwrap();
+        let settings = Settings::merged(cwd.path()).unwrap();
+        assert_eq!(settings.whitelist(), None);
+        let set = discover(cwd.path(), &settings, &[], &[]).unwrap();
+        assert_eq!(names(&set), ["a", "b"]);
+    }
+
+    /// 高层没写 `enabledPlugins` 时低层白名单延续（三态在消费端不回归）。
+    #[test]
+    fn missing_enabled_key_in_higher_layer_continues_whitelist() {
+        let config = TempDir::new().unwrap();
+        let env = isolated_agents();
+        std::env::set_var("INSTAGENT_CONFIG_DIR", config.path());
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"enabledPlugins":["a"]}"#,
+        )
+        .unwrap();
+        let cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".config").join("instagent")).unwrap();
+        std::fs::write(
+            cwd.path()
+                .join(".config")
+                .join("instagent")
+                .join("settings.json"),
+            r#"{"disabledPlugins":["zzz"]}"#,
+        )
+        .unwrap();
+        in_root(&user_plugins(&env), "a", "1.0.0");
+        in_root(&user_plugins(&env), "b", "1.0.0");
+
+        let settings = Settings::merged(cwd.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&["a".to_string()][..]));
+        let set = discover(cwd.path(), &settings, &[], &[]).unwrap();
         assert_eq!(names(&set), ["a"]);
     }
 
@@ -500,5 +689,175 @@ mod tests {
             .skipped
             .iter()
             .any(|s| s.path == gone.join("from-config")));
+    }
+
+    /// E8：CLI 显式路径的诊断有独立来源名，且带解析后的绝对路径（相对输入
+    /// 也一样），与配置 `Extra` 路径的文案可区分。
+    #[test]
+    fn cli_path_diagnostics_name_source_and_resolved_path() {
+        let _env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let cli = cwd.path().join("cli-plugin");
+        let extra = cwd.path().join("extra-plugin");
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            std::slice::from_ref(&extra),
+            std::slice::from_ref(&cli),
+        )
+        .unwrap();
+        let by_path = |want: &Path| -> String {
+            set.skipped
+                .iter()
+                .find(|s| s.path == want)
+                .unwrap_or_else(|| panic!("{} 应有诊断：{:?}", want.display(), set.skipped))
+                .reason
+                .clone()
+        };
+        let cli_reason = by_path(&cli);
+        let extra_reason = by_path(&extra);
+        assert!(cli_reason.contains("CLI --plugin path"), "{cli_reason}");
+        assert!(
+            extra_reason.contains("configured plugin path"),
+            "{extra_reason}"
+        );
+        assert!(
+            !cli_reason.contains("configured plugin path"),
+            "CLI 与配置路径必须可区分：{cli_reason}"
+        );
+        for (path, reason) in [(&cli, &cli_reason), (&extra, &extra_reason)] {
+            assert!(
+                reason.contains(&located(path)),
+                "{reason} 应含解析后的绝对路径"
+            );
+        }
+
+        // 相对路径输入也按绝对形态报出。
+        let rel = PathBuf::from("relative-missing-plugin");
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            &[],
+            std::slice::from_ref(&rel),
+        )
+        .unwrap();
+        let expected = std::path::absolute(&rel).unwrap();
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.reason.contains(&expected.display().to_string())),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    /// 显式路径存在但整条扫不到插件（空目录 / 只有散文件）也要可见；
+    /// 同样形状出现在非显式层（用户根）时不算问题。
+    #[test]
+    fn explicit_path_without_any_plugin_is_reported() {
+        let env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let empty = TempDir::new().unwrap();
+        std::fs::write(empty.path().join("notes.md"), "not a plugin").unwrap();
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            &[empty.path().to_path_buf()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(set.skipped.len(), 1, "{:?}", set.skipped);
+        assert!(set.skipped[0].reason.contains("no plugin found"));
+
+        std::fs::create_dir_all(user_plugins(&env)).unwrap();
+        let set = discover(cwd.path(), &Settings::default(), &[], &[]).unwrap();
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+    }
+
+    /// 重复来源：同一路径既在配置里又在 `--plugin` 里 → 只注册一次，
+    /// 由 CLI 层覆盖来源，不产生重复诊断。
+    #[test]
+    fn duplicate_explicit_sources_register_once() {
+        let _env = isolated_agents();
+        let cwd = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        in_root(root.path(), "dup", "1.0.0");
+        let path = root.path().to_path_buf();
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            &[path.clone(), path.clone()],
+            std::slice::from_ref(&path),
+        )
+        .unwrap();
+        assert_eq!(names(&set), ["dup"]);
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+        assert_eq!(set.get("dup").unwrap().source, PluginSource::Cli);
+    }
+
+    /// 根目录读不了（被普通文件占住 / 权限）不静默：任何层都要诊断。
+    #[test]
+    fn unreadable_scan_root_is_reported() {
+        let env = isolated_agents();
+        std::fs::write(env.agents.path().join("plugins"), b"not a dir").unwrap();
+        let cwd = TempDir::new().unwrap();
+        let set = discover(cwd.path(), &Settings::default(), &[], &[]).unwrap();
+        assert_eq!(set.skipped.len(), 1, "{:?}", set.skipped);
+        assert!(
+            set.skipped[0].reason.contains("failed to read plugin root"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    /// R12：权限错误与坏 symlink 属"读取失败"，必须出现在诊断里；
+    /// 指向真插件目录的 symlink 正常发现。
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_and_broken_symlinks_are_diagnosed() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = isolated_agents();
+        let user = user_plugins(&env);
+        in_root(&user, "good", "1.0.0");
+        let locked = user.join("locked");
+        write_plugin(&locked, "locked", "1.0.0");
+        symlink(user.join("nowhere"), user.join("dangling")).unwrap();
+        symlink(user.join("good"), user.join("linked")).unwrap();
+        let dangling_root = user.join("dangling-root");
+        symlink(user.join("nowhere2"), &dangling_root).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let cwd = TempDir::new().unwrap();
+        let set = discover(
+            cwd.path(),
+            &Settings::default(),
+            std::slice::from_ref(&dangling_root),
+            &[],
+        );
+        // TempDir 删除需要可写权限，先恢复。
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let set = set.unwrap();
+
+        assert_eq!(names(&set), ["good"], "指向插件目录的 symlink 应正常发现");
+        let reasons: Vec<&str> = set.skipped.iter().map(|s| s.reason.as_str()).collect();
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.path == locked && s.reason.contains("cannot stat")),
+            "无权限的插件目录必须报出来：{reasons:?}"
+        );
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.path == user.join("dangling") && s.reason.contains("broken symlink")),
+            "坏 symlink 必须报出来：{reasons:?}"
+        );
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.path == dangling_root && s.reason.contains("broken symlink")),
+            "配置路径本身是坏 symlink 时要说清：{reasons:?}"
+        );
     }
 }
