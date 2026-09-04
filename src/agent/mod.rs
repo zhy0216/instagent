@@ -8,22 +8,12 @@
 //! [`Agent::run_session_event`]，由 `18` 的会话生命周期调用。
 //! `hooks` 为 None 时行为与未接 hooks 完全一致。
 //!
-//! 工具并行执行（todo 13）：同一 assistant turn 内可证明独立的只读调用以
-//! 有界并发执行（上限 [`PARALLEL_TOOL_LIMIT`]）；写操作、顺序敏感与同资源
-//! 调用保持原顺序串行。能力元数据见 [`crate::tools::CallCapability`]：
-//! `read_only` 来自各来源声明，资源键由内核按已知工具语义分配。工具自动
-//! 执行、无交互审批（ADR 0002）；sandbox 是唯一强制隔离层（ADR 0003 D6），
-//! 并行不引入新的信任假设——只并行只读调用，冲突判定失败的方向永远是降级
-//! 为串行。hooks 不受影响：PreToolUse 仍在串行阶段按序执行，PostToolUse
-//! 在各任务内随结果触发。共享总预算与取消：并行任务共用同一 [`ToolCtx`]
-//! 与会话图片预算（[`SESSION_IMAGE_BUDGET`]）；取消时在途任务经
-//! `tokio::select!` 短路（子进程靠 `kill_on_drop` 回收）、未启动的单元补
-//! `Content::interrupted`，事件与结果仍按调用 id 一一对应，会话不变量不变。
-//!
-//! 事件通道消费契约（todo 11 / A2）：channel 只给 UI 看，调用方自行选择
-//! 消费方式——及时 drain（交互式 UI）、给足容量（近似 unbounded、事件不丢）、
-//! 或不消费（事件在 [`EMIT_GRACE`] 宽限后被丢弃并计数，见
-//! [`dropped_event_count`]）。loop 永不因接收端落后或断开而无限期卡住。
+//! 职责划分（todo 19 / E10）：本文件只含 loop 本体（`run_turn` 及其退出
+//! 路径）与 provider stream 折叠（`stream_assistant`）。工具执行（三段式
+//! 并行、图片预算、取消回收，契约见私有模块 `exec`）、事件契约与背压
+//! sink（[`event`]）、自动压缩（[`compact`]）、系统提示（[`prompt`]）
+//! 各自独立成单元。[`PARALLEL_TOOL_LIMIT`]、[`SESSION_IMAGE_BUDGET`]、
+//! [`EMIT_GRACE`]、[`dropped_event_count`] 经 re-export 保持原公开路径。
 //!
 //! 残缺 provider stream（todo 11 / A3）：`ToolUseEnd` 前 EOF 的 tool-use
 //! 保留已收集片段、按 malformed 提升（loop 给它补 is_error ToolResult，
@@ -35,18 +25,14 @@ pub mod compact;
 pub mod event;
 pub mod prompt;
 
+mod exec;
+
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
 
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -59,50 +45,18 @@ use crate::message::Content;
 use crate::message::Message;
 use crate::message::Role;
 use crate::message::Usage;
-use crate::message::INTERRUPTED_TEXT;
 use crate::provider::Provider;
 use crate::provider::Request;
 use crate::provider::StreamEvent;
 use crate::session::Session;
-use crate::tools::CallCapability;
 use crate::tools::Registry;
-use crate::tools::ToolCall;
-use crate::tools::ToolCtx;
-use crate::tools::ToolKind;
-use crate::tools::ToolOutput;
 use crate::ProviderError;
 
+pub use event::dropped_event_count;
 pub use event::Event;
-
-/// 事件通道背压宽限（A2）：channel 满时 `Agent::emit` 最多再等这么久，
-/// 之后丢弃事件并计数——turn 不为 UI 无限期等待。
-pub const EMIT_GRACE: Duration = Duration::from_millis(250);
-
-/// 并行执行并发上限（todo 13）：同一 turn 内最多同时执行这么多个工具调用。
-/// 模型单条消息的调用数天然有限，上限只防 IO / 子进程风暴。
-pub const PARALLEL_TOOL_LIMIT: usize = 4;
-
-/// 会话图片总字节预算（todo 13 / S15 最小行为）：同一会话全部
-/// `Content::Image` 解码后字节之和的上限；新图片会使总量超限时不再附上，
-/// 对应工具结果带可操作提示。请求侧兜底见
-/// [`crate::provider::openai::REQUEST_IMAGE_BUDGET`]；不引入 RM2 的
-/// blob/reference 存储，不引入新 decoder。
-pub const SESSION_IMAGE_BUDGET: u64 = 64 * 1024 * 1024;
-
-// ponytail: 进程级计数——instagent 单 agent 进程；若将来并发多 Agent 需要
-// 分开记账，再把计数挪进调用方自选的 sink。
-static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
-
-/// 进程启动以来因接收端断开 / 背压超宽限而被丢弃的事件总数（A2 消费契约的
-/// 计数面；drop 明细见 tracing debug）。
-pub fn dropped_event_count() -> u64 {
-    DROPPED_EVENTS.load(Ordering::Relaxed)
-}
-
-fn note_event_dropped(reason: &str) {
-    let total = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::debug!("{reason}，事件丢弃（累计 {total}）");
-}
+pub use event::EMIT_GRACE;
+pub use exec::PARALLEL_TOOL_LIMIT;
+pub use exec::SESSION_IMAGE_BUDGET;
 
 /// loop 的行为参数（从 `01` Config 装配而来）。
 #[derive(Debug, Clone)]
@@ -256,7 +210,7 @@ impl Agent {
                         compact::force(self, session, &events).await?;
                         continue;
                     }
-                    Self::emit(&events, Event::Error(e.to_string())).await;
+                    event::emit(&events, Event::Error(e.to_string())).await;
                     return Err(e);
                 }
             };
@@ -292,164 +246,6 @@ impl Agent {
             }
         }
         Ok(TurnResult::MaxTurns)
-    }
-
-    /// 三段式执行 tool call（todo 13）：
-    /// ① 串行决策——按序处理 malformed / 取消 / PreToolUse hook（语义与逐字
-    ///    同串行版一致，交互点与策略钩子不进并行阶段）；
-    /// ② 按能力元数据把待执行调用划成执行单元（[`execution_units`]）——
-    ///    同单元全为 ReadOnly 且资源键互不相同，Serial 调用各自独立成单元；
-    /// ③ 单元按原顺序串行执行，单元内调用以 [`PARALLEL_TOOL_LIMIT`] 有界并发。
-    /// 每个 call 产出一个 ToolResult，顺序与 calls 一致；图片块受会话预算
-    /// [`SESSION_IMAGE_BUDGET`] 约束。
-    async fn execute_calls(
-        &self,
-        session: &Session,
-        calls: &[ToolCall],
-        streamed: &AssistantStream,
-        cancel: &CancellationToken,
-        events: &mpsc::Sender<Event>,
-    ) -> Vec<Content> {
-        let ctx = ToolCtx {
-            cwd: session.header.cwd.clone(),
-            cancel: cancel.clone(),
-        };
-
-        // 阶段 1：串行决策。
-        let mut dispositions: Vec<Disposition> = Vec::with_capacity(calls.len());
-        for call in calls {
-            if let Some(detail) = streamed.malformed.get(&call.id) {
-                dispositions.push(Disposition::Finished(Content::tool_result(
-                    call,
-                    ToolOutput::err(format!(
-                        "tool input JSON is broken and the tool was not executed: {detail}"
-                    )),
-                )));
-                continue;
-            }
-            if streamed.cancelled || cancel.is_cancelled() {
-                dispositions.push(Disposition::Finished(Content::interrupted(call)));
-                continue;
-            }
-            // hook 触发点：PreToolUse 在调用之前；阻止 → is_error 结果，工具不执行。
-            if let Some(hooks) = &self.hooks {
-                let hook_ctx = hook_ctx(session, HookEvent::PreToolUse)
-                    .with_tool(call.name.clone(), Some(call.input.clone()));
-                if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
-                    let text = format!("blocked by PreToolUse hook: {reason}");
-                    Self::emit(
-                        events,
-                        Event::ToolDone {
-                            id: call.id.clone(),
-                            preview: text.clone(),
-                            is_error: true,
-                            elapsed_ms: 0,
-                        },
-                    )
-                    .await;
-                    dispositions.push(Disposition::Finished(Content::tool_result(
-                        call,
-                        ToolOutput::err(text),
-                    )));
-                    continue;
-                }
-            }
-            let cap = self.tools.capability(call).await;
-            dispositions.push(Disposition::Ready {
-                call: call.clone(),
-                cap,
-            });
-        }
-
-        // 阶段 2/3：单元串行、单元内并发；结果按原下标落槽。
-        let mut slots: Vec<Option<Vec<Content>>> = dispositions
-            .iter()
-            .map(|d| match d {
-                Disposition::Finished(content) => Some(vec![content.clone()]),
-                Disposition::Ready { .. } => None,
-            })
-            .collect();
-        let semaphore = Semaphore::new(PARALLEL_TOOL_LIMIT);
-        let image_used = AtomicU64::new(session_image_bytes(&session.messages));
-        for unit in execution_units(&dispositions) {
-            if cancel.is_cancelled() {
-                // 未启动的单元：补 interrupted（不变量：每个 ToolUse 恰一个答复）。
-                for &idx in &unit {
-                    if let Disposition::Ready { call, .. } = &dispositions[idx] {
-                        slots[idx] = Some(vec![Content::interrupted(call)]);
-                    }
-                }
-                continue;
-            }
-            let tasks = unit.iter().map(|&idx| {
-                let Disposition::Ready { call, .. } = &dispositions[idx] else {
-                    unreachable!("execution units only reference Ready dispositions");
-                };
-                async {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("semaphore is never closed");
-                    Self::emit(
-                        events,
-                        Event::ToolStart {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                        },
-                    )
-                    .await;
-                    let started = Instant::now();
-                    let mut output = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => ToolOutput::err(INTERRUPTED_TEXT.to_string()),
-                        out = self.tools.call(call, &ctx) => out,
-                    };
-                    // 图片预算（todo 13）：超限不附上，结果文本带可操作提示。
-                    let mut kept_image = None;
-                    if let Some(img) = output.image.take() {
-                        match reserve_image_bytes(
-                            &image_used,
-                            img.decoded_bytes(),
-                            SESSION_IMAGE_BUDGET,
-                        ) {
-                            Ok(()) => kept_image = Some(img),
-                            Err(note) => output.text.push_str(&note),
-                        }
-                    }
-                    Self::emit(
-                        events,
-                        Event::ToolDone {
-                            id: call.id.clone(),
-                            preview: preview_text(&output.text),
-                            is_error: output.is_error,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        },
-                    )
-                    .await;
-                    // hook 触发点：PostToolUse 观察事件，决策忽略。
-                    if let Some(hooks) = &self.hooks {
-                        let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
-                            .with_tool(call.name.clone(), Some(call.input.clone()))
-                            .with_tool_output(output.text.clone());
-                        let _ = hooks.run(&hook_ctx).await;
-                    }
-                    // 图片块与 ToolResult 进同一条 user 消息（结果在前）。
-                    let mut blocks = vec![Content::tool_result(call, output)];
-                    if let Some(img) = kept_image {
-                        blocks.push(Content::Image(img));
-                    }
-                    blocks
-                }
-            });
-            for (&idx, blocks) in unit.iter().zip(futures::future::join_all(tasks).await) {
-                slots[idx] = Some(blocks);
-            }
-        }
-        slots
-            .into_iter()
-            .flat_map(|slot| slot.expect("every call is answered exactly once (todo 13)"))
-            .collect()
     }
 
     /// hook 触发点：Stop。被阻止 → 注入提醒 user 消息并返回 true（本轮继续跑）；
@@ -549,7 +345,7 @@ impl Agent {
             match item? {
                 StreamEvent::TextDelta(delta) => {
                     if !delta.is_empty() {
-                        Self::emit(events, Event::TextDelta(delta.clone())).await;
+                        event::emit(events, Event::TextDelta(delta.clone())).await;
                         text.push_str(&delta);
                     }
                 }
@@ -580,7 +376,7 @@ impl Agent {
                 }
                 StreamEvent::Done { usage: u, .. } => {
                     usage = Some(u);
-                    Self::emit(events, Event::Usage(u)).await;
+                    event::emit(events, Event::Usage(u)).await;
                 }
             }
         }
@@ -613,7 +409,7 @@ impl Agent {
         flush_text(&mut blocks, &mut text);
         if let Some(truncated) = incomplete {
             // API 层由字段承载，事件层统一发 Event::Error（渲染侧可见）。
-            Self::emit(events, Event::Error(truncated.to_string())).await;
+            event::emit(events, Event::Error(truncated.to_string())).await;
         }
         Ok(AssistantStream {
             message: Message::assistant(blocks, usage),
@@ -621,25 +417,6 @@ impl Agent {
             cancelled,
             incomplete,
         })
-    }
-
-    /// 事件通道只给 UI 看（消费契约见模块头）：接收端断开不该弄死 loop；
-    /// channel 满最多等 [`EMIT_GRACE`]，之后丢弃并计数
-    /// （[`dropped_event_count`]），turn 永不因背压无限期卡住。
-    pub(crate) async fn emit(events: &mpsc::Sender<Event>, event: Event) {
-        let pending = match events.try_send(event) {
-            Ok(()) => return,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                note_event_dropped("event 接收端已断开");
-                return;
-            }
-            Err(mpsc::error::TrySendError::Full(event)) => event,
-        };
-        match tokio::time::timeout(EMIT_GRACE, events.send(pending)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => note_event_dropped("event 接收端在发送途中断开"),
-            Err(_) => note_event_dropped("event 通道在背压宽限后仍然满载"),
-        }
     }
 }
 
@@ -688,122 +465,17 @@ fn finish_turn(
     Ok(())
 }
 
-/// 阶段 1 对单个调用的处置（todo 13）：Finished 已有结果（malformed /
-/// 取消 / hook 阻止），Ready 等待阶段 2/3 执行。
-enum Disposition {
-    Ready { call: ToolCall, cap: CallCapability },
-    Finished(Content),
-}
-
-/// 执行单元划分（todo 13）：按原顺序扫描，Ready 调用仅当 ReadOnly 且资源键
-/// 与单元内其它调用互不相同时加入当前单元；Serial 调用各自独立成单元；
-/// Finished 不执行、不影响划分。单元按原顺序串行执行，单元内并行——
-/// 写操作、同资源冲突与依赖调用因此保持原顺序。
-fn execution_units(dispositions: &[Disposition]) -> Vec<Vec<usize>> {
-    let mut units: Vec<Vec<usize>> = Vec::new();
-    let mut batch: Vec<usize> = Vec::new();
-    let mut resources: HashSet<String> = HashSet::new();
-    for (idx, disposition) in dispositions.iter().enumerate() {
-        let Disposition::Ready { cap, .. } = disposition else {
-            continue;
-        };
-        match cap.kind {
-            ToolKind::Serial => {
-                flush_batch(&mut units, &mut batch, &mut resources);
-                units.push(vec![idx]);
-            }
-            ToolKind::ReadOnly => {
-                if let Some(resource) = &cap.resource {
-                    if resources.contains(resource) {
-                        flush_batch(&mut units, &mut batch, &mut resources);
-                    }
-                    resources.insert(resource.clone());
-                }
-                batch.push(idx);
-            }
-        }
-    }
-    flush_batch(&mut units, &mut batch, &mut resources);
-    units
-}
-
-fn flush_batch(
-    units: &mut Vec<Vec<usize>>,
-    batch: &mut Vec<usize>,
-    resources: &mut HashSet<String>,
-) {
-    if !batch.is_empty() {
-        units.push(std::mem::take(batch));
-        resources.clear();
-    }
-}
-
-/// 会话历史中全部图片块的解码字节合计（会话图片预算的基线）。
-fn session_image_bytes(messages: &[Message]) -> u64 {
-    messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .map(|block| match block {
-            Content::Image(image) => image.decoded_bytes(),
-            _ => 0,
-        })
-        .sum()
-}
-
-/// 原子地预留图片字节预算：接受则累计，超限返回可操作提示。CAS 防同 turn
-/// 的并行调用同时通过检查——超限必拒，不留竞争误差。
-fn reserve_image_bytes(used: &AtomicU64, bytes: u64, budget: u64) -> Result<(), String> {
-    let mut current = used.load(Ordering::SeqCst);
-    loop {
-        if current + bytes > budget {
-            return Err(image_budget_note(current, bytes, budget));
-        }
-        match used.compare_exchange(current, current + bytes, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return Ok(()),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-/// 被拒图片附在工具结果文本里的可操作提示（todo 13）。
-fn image_budget_note(used: u64, bytes: u64, budget: u64) -> String {
-    format!(
-        "\n\n[image not attached: session image budget of {} MiB exceeded (session already \
-         holds {used} image bytes, this image is {bytes} bytes). Finish the current analysis \
-         or start a new session before reading more images.]",
-        budget / (1024 * 1024)
-    )
-}
-
-/// ToolDone 预览：前 10 行 / 1KB（渲染细则归 `18`）。
-fn preview_text(text: &str) -> String {
-    const MAX_LINES: usize = 10;
-    const MAX_BYTES: usize = 1024;
-    let lines: Vec<&str> = text.lines().collect();
-    let mut truncated = lines.len() > MAX_LINES;
-    let mut preview = lines[..lines.len().min(MAX_LINES)].join("\n");
-    if preview.len() > MAX_BYTES {
-        let mut cut = MAX_BYTES;
-        while !preview.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        preview.truncate(cut);
-        truncated = true;
-    }
-    if truncated {
-        preview.push_str("\n[output truncated]");
-    }
-    preview
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::compact::COMPACTION_PROMPT;
+    use crate::message::INTERRUPTED_TEXT;
     use crate::message::SUMMARY_PREFIX;
     use crate::session::SessionHeader;
     use crate::tools::BuiltinTools;
     use crate::tools::ImageData;
+    use crate::tools::ToolCtx;
+    use crate::tools::ToolOutput;
     use crate::tools::ToolSource;
     use crate::tools::ToolSpec;
     use async_trait::async_trait;
@@ -813,6 +485,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[derive(Debug)]
     enum Scripted {
@@ -1363,20 +1036,6 @@ mod tests {
     async fn compaction_prompt_placeholder_is_replaced() {
         // COMPACTION_PROMPT 的占位符被替换（防 typo：常量和 replace 同名）。
         assert!(COMPACTION_PROMPT.contains(crate::agent::compact::MESSAGES_PLACEHOLDER));
-    }
-
-    #[test]
-    fn preview_cuts_long_output() {
-        let long = "line\n".repeat(50);
-        let preview = preview_text(&long);
-        assert_eq!(preview.lines().count(), 11); // 10 行 + 截断标记
-        assert!(preview.ends_with("[output truncated]"));
-
-        let big = "a".repeat(5000);
-        let preview = preview_text(&big);
-        assert!(preview.len() <= 1024 + "\n[output truncated]".len());
-
-        assert_eq!(preview_text("short"), "short");
     }
 
     #[tokio::test]
@@ -2064,54 +1723,6 @@ mod tests {
         assert_eq!(results[1].0, "t2", "即使串行也保持原调用顺序");
     }
 
-    #[test]
-    fn execution_units_group_independent_read_only_and_isolate_conflicts() {
-        let ready = |kind: ToolKind, resource: Option<&str>| Disposition::Ready {
-            call: ToolCall {
-                id: "t".to_string(),
-                name: "probe".to_string(),
-                input: serde_json::json!({}),
-            },
-            cap: CallCapability {
-                kind,
-                resource: resource.map(str::to_string),
-            },
-        };
-        let finished = || Disposition::Finished(Content::Text("done".to_string()));
-
-        // 独立只读（资源键互异 / 无资源键）→ 同一单元。
-        let d = vec![
-            ready(ToolKind::ReadOnly, Some("f1")),
-            ready(ToolKind::ReadOnly, Some("f2")),
-            ready(ToolKind::ReadOnly, None),
-        ];
-        assert_eq!(execution_units(&d), vec![vec![0, 1, 2]]);
-
-        // 同资源键冲突 → 按原顺序串行。
-        let d = vec![
-            ready(ToolKind::ReadOnly, Some("f1")),
-            ready(ToolKind::ReadOnly, Some("f1")),
-        ];
-        assert_eq!(execution_units(&d), vec![vec![0], vec![1]]);
-
-        // Serial（写 / 顺序敏感）独立成单元，两侧只读各自成组。
-        let d = vec![
-            ready(ToolKind::ReadOnly, None),
-            ready(ToolKind::Serial, None),
-            ready(ToolKind::ReadOnly, None),
-        ];
-        assert_eq!(execution_units(&d), vec![vec![0], vec![1], vec![2]]);
-
-        // Finished（malformed / 取消 / hook 阻止）不参与划分。
-        let d = vec![
-            finished(),
-            ready(ToolKind::ReadOnly, None),
-            finished(),
-            ready(ToolKind::ReadOnly, None),
-        ];
-        assert_eq!(execution_units(&d), vec![vec![1, 3]]);
-    }
-
     #[tokio::test]
     async fn cancel_reclaims_parallel_calls_and_keeps_invariants() {
         let dir = tempfile::tempdir().unwrap();
@@ -2220,45 +1831,6 @@ mod tests {
     }
 
     // ---- 会话图片预算（todo 13 / S15 最小行为） ----
-
-    #[test]
-    fn session_image_budget_rejects_with_actionable_note() {
-        let used = AtomicU64::new(0);
-        reserve_image_bytes(&used, 60, 100).unwrap();
-        assert_eq!(used.load(Ordering::SeqCst), 60);
-        let note = reserve_image_bytes(&used, 50, 100).unwrap_err();
-        assert!(note.contains("image budget"), "{note}");
-        assert!(note.contains("start a new session"), "可操作提示：{note}");
-        assert!(note.contains("60"), "{note}");
-        assert_eq!(used.load(Ordering::SeqCst), 60, "被拒图片不消耗预算");
-        reserve_image_bytes(&used, 40, 100).unwrap();
-        assert_eq!(used.load(Ordering::SeqCst), 100);
-    }
-
-    #[test]
-    fn session_image_bytes_sums_history_images() {
-        let messages = vec![
-            Message::user_text("hi".into()),
-            Message::assistant(vec![Content::Text("see".into())], None),
-            Message {
-                role: Role::User,
-                content: vec![
-                    Content::Image(ImageData {
-                        data: "Zm9v".into(),
-                        media_type: "image/png".into(),
-                    }),
-                    Content::Image(ImageData {
-                        data: "Zg==".into(),
-                        media_type: "image/png".into(),
-                    }),
-                ],
-                ts: 0,
-                usage: None,
-            },
-        ];
-        assert_eq!(session_image_bytes(&messages), 4); // 3 + 1 解码字节
-        assert_eq!(session_image_bytes(&messages[..2]), 0);
-    }
 
     /// 超过会话预算的单张图片：不附上，工具结果带可操作提示，turn 照常完成。
     #[tokio::test]

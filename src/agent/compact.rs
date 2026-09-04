@@ -126,7 +126,7 @@ pub async fn force(
         text.push_str(&tail);
     }
     session.rewrite(vec![Message::user_text(text)])?;
-    crate::agent::Agent::emit(
+    crate::agent::event::emit(
         events,
         Event::Compacted {
             before_tokens: before_tokens.unwrap_or(0),
