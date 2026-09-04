@@ -1,10 +1,12 @@
-//! 5 个内置工具：shell / read / write / edit / tree（第三版 §1；描述文本从
-//! goose `developer/mod.rs:108~186`（commit `4ad43df`）精简搬运，搬运注明出处）。
+//! 6 个内置工具：shell / read / write / edit / tree / read_image（第三版 §1；
+//! 描述文本从 goose `developer/mod.rs:108~186`（commit `4ad43df`）精简搬运，
+//! 搬运注明出处）。
 //!
 //! 以 [`BuiltinTools`]（id = `"builtin"`）注册进 Registry，与其他来源同构；
 //! 内置工具名不加前缀。
 
 pub mod fs;
+mod image;
 pub mod shell;
 pub mod tree;
 
@@ -68,6 +70,11 @@ struct TreeInput {
     path: String,
     #[serde(default)]
     depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadImageInput {
+    path: String,
 }
 
 fn spec(name: &str, description: &str, input_schema: Value, read_only: bool) -> ToolSpec {
@@ -173,10 +180,24 @@ impl ToolSource for BuiltinTools {
                 }),
                 true,
             ),
+            spec(
+                // 搬运改写 goose developer/mod.rs:173~174（只留本地路径，无 URL / crop）。
+                "read_image",
+                "Read an image from a local file path. Supports png, jpeg, gif, and webp up \
+                 to 20MB, and returns the image so you can see its content.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                    },
+                    "required": ["path"],
+                }),
+                true,
+            ),
         ]
     }
 
-    /// 按名字分发到 `shell::run` / `fs::*` / `tree::build_tree`。
+    /// 按名字分发到 `shell::run` / `fs::*` / `tree::build_tree` / `image::read_image`。
     async fn call(&self, name: &str, input: Value, ctx: &ToolCtx) -> ToolOutput {
         match name {
             "shell" => match serde_json::from_value::<ShellInput>(input) {
@@ -221,6 +242,10 @@ impl ToolSource for BuiltinTools {
                 }
                 Err(e) => ToolOutput::err(format!("Invalid input for tree: {e}")),
             },
+            "read_image" => match serde_json::from_value::<ReadImageInput>(input) {
+                Ok(args) => image::read_image(std::path::Path::new(&args.path), ctx).await,
+                Err(e) => ToolOutput::err(format!("Invalid input for read_image: {e}")),
+            },
             other => ToolOutput::err(format!("builtin: unknown tool `{other}`")),
         }
     }
@@ -242,16 +267,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_lists_five_tools_unprefixed() {
+    async fn builtin_lists_six_tools_unprefixed() {
         let specs = BuiltinTools::new(None).list().await;
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["shell", "read", "write", "edit", "tree"]);
+        assert_eq!(
+            names,
+            vec!["shell", "read", "write", "edit", "tree", "read_image"]
+        );
         let read_only: Vec<&str> = specs
             .iter()
             .filter(|s| s.read_only)
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(read_only, vec!["read", "tree"]);
+        assert_eq!(read_only, vec!["read", "tree", "read_image"]);
         for s in &specs {
             assert_eq!(s.input_schema["type"], "object");
         }
@@ -265,7 +293,7 @@ mod tests {
         let mut registry = Registry::new();
         registry.register(std::sync::Arc::new(BuiltinTools::new(None)));
         let specs = registry.list().await;
-        assert_eq!(specs.len(), 5);
+        assert_eq!(specs.len(), 6);
 
         let out = registry
             .call(

@@ -770,10 +770,10 @@ mod tests {
         assert_eq!(first_text(&session.messages[3]), "all done");
         assert_eq!(session.messages[3].usage.unwrap().input, 20);
 
-        // 会话文件同步落盘（header + 4 条）；请求带内置 5 工具。
+        // 会话文件同步落盘（header + 4 条）；请求带内置 6 工具。
         let raw = std::fs::read_to_string(&session.path).unwrap();
         assert_eq!(raw.lines().count(), 5);
-        assert_eq!(provider.seen_tool_counts().await, vec![5, 5]);
+        assert_eq!(provider.seen_tool_counts().await, vec![6, 6]);
 
         assert!(events
             .iter()
