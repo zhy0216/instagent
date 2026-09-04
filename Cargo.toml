@@ -27,6 +27,10 @@ path = "tests/fixtures/fake_proxy_server.rs"
 test = false
 doctest = false
 
+[profile.release]
+strip = "symbols"
+lto = "thin"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
