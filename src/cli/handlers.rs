@@ -34,7 +34,7 @@ pub async fn chat(
         cli_plugins: plugin,
     };
     let mut rt = assembly::build(&opts).await?;
-    print_notes(&rt.notes, &mut std::io::stdout());
+    print_notes(&rt.notes, &mut std::io::stderr());
 
     let mut session =
         Session::open_or_resume(resume.as_deref(), &cwd, &rt.provider_name, &rt.model)
@@ -59,7 +59,8 @@ pub async fn chat(
     result
 }
 
-/// `instagent run -t "..."`：无交互跑一条任务；打印最终回复和 usage。
+/// `instagent run -t "..."`：无交互跑一条任务。stdout 只有最终回答文本流；
+/// usage、session id、notes 等诊断走 stderr（ADR 0003 D4）。
 pub async fn run(
     task: String,
     cwd: Option<PathBuf>,
@@ -262,11 +263,19 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
             if targets.is_empty() {
                 writeln!(out, "(no git-sourced plugins to update)")?;
             }
+            let mut failures = Vec::new();
+            let mut diag = std::io::stderr();
             for target in targets {
                 match install::update(&target) {
                     Ok(()) => writeln!(out, "updated {target}")?,
-                    Err(err) => writeln!(out, "update {target} failed: {err:#}")?,
+                    Err(err) => {
+                        let _ = writeln!(diag, "error: update {target} failed: {err:#}");
+                        failures.push(target);
+                    }
                 }
+            }
+            if !failures.is_empty() {
+                anyhow::bail!("plugin update failed for: {}", failures.join(", "));
             }
         }
         PluginAction::Enable { name } => {

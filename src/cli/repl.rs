@@ -3,6 +3,9 @@
 //! Ctrl-C：第一次取消当前轮（cancel token），第二次退出；空闲时第一次
 //! 提示、第二次退出。斜杠命令：`/exit` `/clear` `/compact` `/tools`
 //! `/help` + `17` 的插件斜杠命令（动态展开进 prompt）。
+//!
+//! 输出契约（ADR 0003 D4）：stdout 只有模型回答文本流；横幅、斜杠命令
+//! 反馈、Ctrl-C 提示等一切诊断走 stderr。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -73,7 +76,7 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
     }
     let _ = editor.load_history(&history);
 
-    println!(
+    eprintln!(
         "instagent · provider {} · model {} · session {}\n(type /help, Ctrl-D or /exit to quit)",
         rt.provider_name, rt.model, session.header.id
     );
@@ -89,14 +92,14 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
             Err(ReadlineError::Interrupted) => {
                 idle_ctrl_c += 1;
                 if idle_ctrl_c >= 2 {
-                    println!();
+                    eprintln!();
                     break;
                 }
-                println!("(Ctrl-C again or /exit to quit)");
+                eprintln!("(Ctrl-C again or /exit to quit)");
                 continue;
             }
             Err(ReadlineError::Eof) => {
-                println!();
+                eprintln!();
                 break;
             }
             Err(err) => return Err(err).context("readline"),
@@ -116,14 +119,14 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
             Input::Help => print_help(&rt.slash_commands),
             Input::Clear => {
                 session.rewrite(Vec::new())?;
-                println!("(context cleared)");
+                eprintln!("(context cleared)");
             }
             Input::Compact => {
                 compact_now(rt, session).await?;
             }
             Input::Tools => {
                 for spec in rt.agent.tools.list().await {
-                    println!(
+                    eprintln!(
                         "{}{} — {}",
                         spec.name,
                         if spec.read_only { " (read-only)" } else { "" },
@@ -132,7 +135,7 @@ pub async fn chat_loop(rt: &mut Runtime, session: &mut Session) -> instagent::Re
                 }
             }
             Input::Unknown(name) => {
-                println!("unknown command /{name}; /help lists commands");
+                eprintln!("unknown command /{name}; /help lists commands");
             }
         }
     }
@@ -160,18 +163,20 @@ async fn run_turn(
 
     match result? {
         TurnResult::Done => {}
-        TurnResult::Interrupted => println!("(turn cancelled; Ctrl-C again to quit)"),
-        TurnResult::MaxTurns => println!("(max turns reached)"),
+        TurnResult::Interrupted => eprintln!("(turn cancelled; Ctrl-C again to quit)"),
+        TurnResult::MaxTurns => eprintln!("(max turns reached)"),
     }
     Ok(quit.load(Ordering::SeqCst))
 }
 
 pub(crate) async fn print_events(mut rx: mpsc::Receiver<instagent::agent::Event>) {
     let mut state = render::RenderState::default();
+    let mut out = std::io::stdout();
+    let mut diag = std::io::stderr();
     while let Some(event) = rx.recv().await {
-        render::render_event(&event, &mut state);
+        render::render_event(&event, &mut state, &mut out, &mut diag);
     }
-    render::finish_turn(&mut state);
+    render::finish_turn(&mut state, &mut out, &mut diag);
 }
 
 /// 轮内 Ctrl-C：第一次取消当前轮，第二次请求退出。
@@ -182,11 +187,11 @@ async fn watch_ctrl_c(cancel: CancellationToken, quit: Arc<AtomicBool>) {
         }
         if cancel.is_cancelled() {
             quit.store(true, Ordering::SeqCst);
-            println!("\n^C quitting");
+            eprintln!("\n^C quitting");
             return;
         }
         cancel.cancel();
-        println!("\n^C cancelling current turn (press Ctrl-C again to quit)");
+        eprintln!("\n^C cancelling current turn (press Ctrl-C again to quit)");
     }
 }
 
@@ -197,12 +202,12 @@ async fn compact_now(rt: &mut Runtime, session: &mut Session) -> instagent::Resu
     compact::force(&rt.agent, session, &tx).await?;
     drop(tx);
     let _ = printer.await;
-    println!("(compacted)");
+    eprintln!("(compacted)");
     Ok(())
 }
 
 fn print_help(plugin_commands: &[SlashCommand]) {
-    println!(
+    eprintln!(
         "/exit /quit  quit\n\
          /clear       drop conversation context\n\
          /compact     force compaction now\n\
@@ -212,11 +217,11 @@ fn print_help(plugin_commands: &[SlashCommand]) {
     if plugin_commands.is_empty() {
         return;
     }
-    println!("plugin commands:");
+    eprintln!("plugin commands:");
     for cmd in plugin_commands {
         let hint = cmd.argument_hint.as_deref().unwrap_or("");
         let desc = cmd.description.as_deref().map(one_line).unwrap_or_default();
-        println!("  /{} {hint}— {desc}", cmd.name);
+        eprintln!("  /{} {hint}— {desc}", cmd.name);
     }
 }
 

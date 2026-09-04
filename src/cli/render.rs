@@ -1,5 +1,13 @@
 //! 渲染（第二版 §2.11）：文本流式直接打印；工具调用打一行
 //! `▶ shell  ls -la`，完成后打预览和耗时；每轮末尾打 usage；不做 markdown。
+//!
+//! 输出契约（ADR 0003 D4）：**stdout 只输出模型最终回答文本流
+//! （TextDelta）**，工具事件（`▶` / `✓` / `✗` 行）、预览、usage、compaction
+//! 提示、错误与一切诊断统一走 **stderr**——`>file` / 管道消费方拿到纯答案。
+//! stdout 写失败（如 EPIPE）一律忽略、不改退出码；失败退出由 `main` 保证
+//! 非零退出码且 stderr 末行 `error: {message}`。
+//!
+//! 两个流都以 `&mut dyn Write` 注入，路由规则可纯逻辑断言（T5）。
 
 use std::io::Write;
 
@@ -16,19 +24,25 @@ pub struct RenderState {
     pub last_usage: Option<Usage>,
 }
 
-/// 渲染一条 loop 事件。
-pub fn render_event(event: &Event, state: &mut RenderState) {
+/// 渲染一条 loop 事件：`out` = 答案流（stdout），`diag` = 诊断流（stderr）。
+/// 两侧的写错误都忽略（D4：EPIPE 不改退出码）。
+pub fn render_event(
+    event: &Event,
+    state: &mut RenderState,
+    out: &mut dyn Write,
+    diag: &mut dyn Write,
+) {
     match event {
         Event::TextDelta(delta) => {
             if !delta.is_empty() {
                 state.text_open = true;
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
+                let _ = write!(out, "{delta}");
+                let _ = out.flush();
             }
         }
         Event::ToolStart { name, input, .. } => {
-            close_text(state);
-            println!("▶ {name}  {}", call_summary(name, input));
+            close_text(state, out);
+            let _ = writeln!(diag, "▶ {name}  {}", call_summary(name, input));
         }
         Event::ToolDone {
             preview,
@@ -37,9 +51,9 @@ pub fn render_event(event: &Event, state: &mut RenderState) {
             ..
         } => {
             let marker = if *is_error { "✗" } else { "✓" };
-            println!("  {marker} {elapsed_ms} ms");
+            let _ = writeln!(diag, "  {marker} {elapsed_ms} ms");
             for line in preview.lines() {
-                println!("  │ {line}");
+                let _ = writeln!(diag, "  │ {line}");
             }
         }
         Event::Usage(usage) => {
@@ -49,30 +63,32 @@ pub fn render_event(event: &Event, state: &mut RenderState) {
             before_tokens,
             after_tokens,
         } => {
-            close_text(state);
-            println!("· compacted {before_tokens} → {after_tokens} tokens");
+            close_text(state, out);
+            let _ = writeln!(diag, "· compacted {before_tokens} → {after_tokens} tokens");
         }
         Event::Error(text) => {
-            close_text(state);
-            println!("error: {text}");
+            close_text(state, out);
+            let _ = writeln!(diag, "error: {text}");
         }
     }
 }
 
-/// 一轮结束：补换行 + usage 行。
-pub fn finish_turn(state: &mut RenderState) {
-    close_text(state);
+/// 一轮结束：补换行（答案流）+ usage 行（诊断流）。
+pub fn finish_turn(state: &mut RenderState, out: &mut dyn Write, diag: &mut dyn Write) {
+    close_text(state, out);
     if let Some(usage) = state.last_usage.take() {
-        println!(
+        let _ = writeln!(
+            diag,
             "usage: in={} out={} cache_read={} cache_write={}",
             usage.input, usage.output, usage.cache_read, usage.cache_write
         );
     }
 }
 
-fn close_text(state: &mut RenderState) {
+/// 补答案流的收尾换行：文本块被工具事件/错误打断或整轮结束时调用。
+fn close_text(state: &mut RenderState, out: &mut dyn Write) {
     if state.text_open {
-        println!();
+        let _ = writeln!(out);
         state.text_open = false;
     }
 }
@@ -131,6 +147,7 @@ mod tests {
     #[test]
     fn usage_is_printed_once_per_turn() {
         let mut state = RenderState::default();
+        let (mut out, mut diag) = (Vec::new(), Vec::new());
         render_event(
             &Event::Usage(Usage {
                 input: 10,
@@ -139,6 +156,8 @@ mod tests {
                 cache_write: 0,
             }),
             &mut state,
+            &mut out,
+            &mut diag,
         );
         render_event(
             &Event::Usage(Usage {
@@ -148,7 +167,88 @@ mod tests {
                 cache_write: 0,
             }),
             &mut state,
+            &mut out,
+            &mut diag,
         );
         assert_eq!(state.last_usage.unwrap().input, 12);
+    }
+
+    // ---- ADR 0003 D4：stdout 只放答案文本，其余全走 stderr ----
+
+    fn rendered(events: &[Event]) -> (String, String) {
+        let mut state = RenderState::default();
+        let (mut out, mut diag) = (Vec::new(), Vec::new());
+        for event in events {
+            render_event(event, &mut state, &mut out, &mut diag);
+        }
+        finish_turn(&mut state, &mut out, &mut diag);
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(diag).unwrap(),
+        )
+    }
+
+    #[test]
+    fn text_deltas_go_to_answer_stream_only() {
+        let (out, diag) = &rendered(&[
+            Event::TextDelta("hello ".into()),
+            Event::TextDelta("world".into()),
+        ]);
+        assert_eq!(out, "hello world\n", "答案流以收尾换行结束");
+        assert!(diag.is_empty(), "纯文本轮诊断流必须为空: {diag:?}");
+    }
+
+    #[test]
+    fn tool_events_usage_compaction_error_go_to_diag_stream() {
+        let (out, diag) = &rendered(&[
+            Event::ToolStart {
+                id: "c1".into(),
+                name: "shell".into(),
+                input: json!({"command": "ls"}),
+            },
+            Event::ToolDone {
+                id: "c1".into(),
+                preview: "file.txt".into(),
+                is_error: false,
+                elapsed_ms: 7,
+            },
+            Event::Compacted {
+                before_tokens: 9,
+                after_tokens: 3,
+            },
+            Event::Usage(Usage {
+                input: 12,
+                output: 5,
+                cache_read: 1,
+                cache_write: 2,
+            }),
+            Event::Error("boom".into()),
+        ]);
+        assert!(out.is_empty(), "诊断事件不得污染答案流: {out:?}");
+        assert!(diag.contains("▶ shell  ls"), "{diag}");
+        assert!(diag.contains("✓ 7 ms"), "{diag}");
+        assert!(diag.contains("│ file.txt"), "{diag}");
+        assert!(diag.contains("· compacted 9 → 3 tokens"), "{diag}");
+        assert!(
+            diag.contains("usage: in=12 out=5 cache_read=1 cache_write=2"),
+            "{diag}"
+        );
+        assert!(diag.contains("error: boom"), "{diag}");
+    }
+
+    #[test]
+    fn text_block_is_closed_before_diag_lines() {
+        let (out, diag) = &rendered(&[
+            Event::TextDelta("partial".into()),
+            Event::ToolStart {
+                id: "c1".into(),
+                name: "shell".into(),
+                input: json!({}),
+            },
+            Event::TextDelta("more".into()),
+        ]);
+        assert_eq!(out, "partial\nmore\n", "每个文本块各补一次换行");
+        let tool_line = diag.lines().position(|l| l.starts_with('▶')).unwrap();
+        assert!(tool_line < diag.lines().count(), "{diag}");
     }
 }

@@ -6,6 +6,8 @@
 //! 开头检查 `TOKEN_PLAN_API_KEY`：缺失则打 skip 后返回，离线 `cargo test`
 //! 依旧全绿。断言只查随机标记词（MANGO_77 这类）与结构标记（`usage:`、
 //! `session `、`▶`），prompt 命令式写死，从不查自然语言措辞（防 flake）。
+//! 结构标记按 ADR 0003 D4 契约定位：答案文本在 stdout，`usage:` /
+//! `session ` / `▶` 等诊断全在 stderr。
 //!
 //! 用例表对应 `plans/live-e2e/plan.md`：a1/a2 run 全链路，b1/b2 会话管理，
 //! d1–d5 插件链路（command tool / hooks / skill / 斜杠命令，消费
@@ -168,7 +170,7 @@ const REPLY_OK_ONLY: &str = "只回复两个字母 OK，不要输出任何其他
 
 // ---- T2：核心链路 a1 / a2 / b1 / b2 / e1 ----
 
-/// a1：`run -t` 最简一轮——回复 + `usage:`（stdout）+ `session <id>`（stderr）。
+/// a1：`run -t` 最简一轮——回复（stdout）+ `usage:`（stderr）+ `session <id>`（stderr）。
 #[tokio::test]
 async fn live_a1_run_simple_reply() {
     if !has_key() {
@@ -181,8 +183,8 @@ async fn live_a1_run_simple_reply() {
     assert_ok(&out, "a1 run -t");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("OK"), "{stdout}");
-    assert!(stdout.contains("usage:"), "{stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "{stderr}");
     assert!(
         stderr.lines().any(|line| line.starts_with("session ")),
         "{stderr}"
@@ -200,10 +202,12 @@ async fn live_a2_run_shell_tool() {
 
     let out = output(sandbox.cmd(&["run", "-t", SHELL_ECHO_MANGO])).await;
     assert_ok(&out, "a2 run -t shell");
-    // `▶`/预览/回复都经 render.rs 打到 stdout（run 只有 session/notes 走 stderr）。
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("▶ shell"), "{stdout}");
-    assert!(stdout.contains("MANGO_77"), "{stdout}");
+    // D4：工具事件 `▶` / 预览走 stderr，最终回复（答案文本）走 stdout。
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("▶ shell"), "{stderr}");
+    // 标记词在工具预览（stderr）必现；回复（stdout）通常也复述，合查防 flake。
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
+    assert!(combined.contains("MANGO_77"), "{combined}");
 }
 
 /// b1：a2 产生会话后——`sessions list` / jsonl header / `sessions rm`。
@@ -292,8 +296,11 @@ async fn live_e1_env_model_override() {
     cmd.env("INSTAGENT_MODEL", live_model());
     let out = output(cmd).await;
     assert_ok(&out, "e1 INSTAGENT_MODEL 覆盖");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("usage:"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("usage:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ---- T3：插件链路 d1–d5（夹具 tests/fixtures/liveplug 由 01 产出）----
@@ -317,9 +324,11 @@ async fn live_d1_plugin_command_tool() {
     ]))
     .await;
     assert_ok(&out, "d1 command tool");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("▶ liveplug__echoer"), "{stdout}");
-    assert!(stdout.contains("MANGO_77"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("▶ liveplug__echoer"), "{stderr}");
+    // 标记词在工具预览（stderr）必现；回复（stdout）通常也复述，合查防 flake。
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
+    assert!(combined.contains("MANGO_77"), "{combined}");
 }
 
 /// d2：PreToolUse guard exit 2 阻止——模型收到 is_error 后继续完成不挂死。
@@ -341,9 +350,10 @@ async fn live_d2_plugin_hook_blocks_shell() {
     ]))
     .await;
     assert_ok(&out, "d2 hook block");
-    // 被阻止的调用不 emit ToolStart，只有 is_error 的 ToolDone 预览（§9.5）。
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("blocked by PreToolUse hook"), "{stdout}");
+    // 被阻止的调用不 emit ToolStart，只有 is_error 的 ToolDone 预览（§9.5）；
+    // D4 下预览走 stderr。
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("blocked by PreToolUse hook"), "{stderr}");
 }
 
 /// d3：hooks 载荷落盘——标记文件存在且 PostToolUse 载荷含 `tool_name`。

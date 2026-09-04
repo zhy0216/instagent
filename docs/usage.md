@@ -109,8 +109,14 @@ instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--plugin PATH ...]
 instagent run -t "..." [--cwd PATH] [-m MODEL] [--plugin PATH ...]
 ```
 
-无交互：新建一个会话，把 `-t` 内容作为唯一一条用户消息跑完，最终回复与
-`usage:` 打到 stdout，工具调用过程打到 stderr。
+无交互：新建一个会话，把 `-t` 内容作为唯一一条用户消息跑完。
+
+**输出契约**（[ADR 0003 D4](adr/0003-repo-boundaries-and-runtime-policies.md)）：
+stdout 只输出模型最终回答的流式文本，`>file` / 管道拿到的就是纯答案；
+工具事件（`▶` / `✓` / `✗` 行与预览）、`usage:` 行、`session <id>`、
+装配提示（`note: …`）与一切诊断统一走 stderr。运行失败 → 非零退出码，
+stderr 末行为 `error: <原因>`；stdout 写失败（如管道提前关闭的 EPIPE）
+不改退出码。`chat` 同契约：横幅、斜杠命令反馈、Ctrl-C 提示也在 stderr。
 
 ### `instagent sessions`
 
@@ -233,8 +239,9 @@ plugins:
 - 空闲提示符：第一次提示，第二次退出。
 - Ctrl-D：直接退出。
 
-**输出渲染**：流式文本逐字打印；工具调用显示 `▶ 工具名 …` + 参数预览与
-耗时；每轮末尾打 `usage:` 行（token 用量）。REPL 输入历史存在
+**输出渲染**：流式文本逐字打印到 stdout（答案流）；工具调用 `▶ 工具名 …`
++ 参数预览与耗时、每轮末尾的 `usage:` 行（token 用量）、横幅与斜杠命令
+反馈等诊断统一走 stderr（§3 输出契约）。REPL 输入历史存在
 `~/.config/instagent/history.txt`。
 
 ---
