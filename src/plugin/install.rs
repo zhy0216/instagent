@@ -148,6 +148,17 @@ fn user_plugins_dir() -> crate::Result<PathBuf> {
     Ok(agents_dir()?.join("plugins"))
 }
 
+/// 安装根下的内部状态目录，不是插件：`.replaced-*` 替换备份（`replace`）
+/// 与 `.tmp-install` staging（`staging`）。所有安装根扫描（list /
+/// auto-update / discovery）一律跳过，不把正在安装或待恢复的副本当成插件
+/// 发现、计数或更新（I02）。只按目录身份排除，绝不据此删除任何数据。
+pub(crate) fn is_install_internal_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.starts_with(replace::REPLACED_PREFIX) || name == staging::STAGING_DIR_NAME
+}
+
 /// clone / 复制 → 校验 → 写 `.install.json` → 放入用户目录。
 /// 同名插件重复 install 即覆盖更新。
 pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<Plugin> {
@@ -198,7 +209,7 @@ pub fn list(cwd: &Path) -> crate::Result<Vec<InstalledPlugin>> {
     };
     for entry in entries.flatten() {
         let dir = entry.path();
-        if !dir.is_dir() {
+        if !dir.is_dir() || is_install_internal_dir(&entry.file_name()) {
             continue;
         }
         let Ok(manifest) = read_manifest(&dir) else {
@@ -229,24 +240,32 @@ pub fn show(cwd: &Path, name: &str) -> crate::Result<InstalledPlugin> {
 }
 
 /// 启用：写回用户层 settings。黑名单模式下只是移出 `disabledPlugins`；
-/// 白名单模式下同时加入 `enabledPlugins`。
+/// 白名单模式（含显式 `[]` 终值）下同时加入 `enabledPlugins`——判模式走
+/// [`Settings::whitelist`]，不能用 `enabled_plugins.is_empty()`，否则
+/// `enabledPlugins: []` 后 `plugin enable` 永远写不进白名单（I01）。
 pub fn enable(name: &str) -> crate::Result<()> {
     ensure_installed(name)?;
     let mut settings = Settings::load_user()?;
     settings.disabled_plugins.retain(|p| p != name);
-    if !settings.enabled_plugins.is_empty() && !settings.enabled_plugins.contains(&name.to_string())
-    {
+    if settings.whitelist().is_some() && !settings.enabled_plugins.contains(&name.to_string()) {
         settings.enabled_plugins.push(name.to_string());
+        // 白名单转由非空集合表达，空集合标志清掉保持互斥。
+        settings.enabled_locked = false;
     }
     settings.save_user()
 }
 
-/// 禁用：移出 `enabledPlugins` 并同时记入 `disabledPlugins`——后者保证
-/// 白名单变空、退化为黑名单模式后依然是禁用态。
+/// 禁用：移出 `enabledPlugins` 并同时记入 `disabledPlugins`。移除最后一项
+/// 后白名单模式保留（I01）：空集合按显式 `[]` 写回，无关插件不会因模式
+/// 翻转成黑名单而复活；`disabledPlugins` 里的名字进一步防漂移。
 pub fn disable(name: &str) -> crate::Result<()> {
     ensure_installed(name)?;
     let mut settings = Settings::load_user()?;
+    let whitelist_mode = settings.whitelist().is_some();
     settings.enabled_plugins.retain(|p| p != name);
+    if whitelist_mode && settings.enabled_plugins.is_empty() {
+        settings.enabled_locked = true;
+    }
     if !settings.disabled_plugins.contains(&name.to_string()) {
         settings.disabled_plugins.push(name.to_string());
     }
@@ -494,6 +513,9 @@ mod staging {
     /// 崩溃进程遗留在 `.tmp-install` 下的 staging 孤儿超过这个时长即清理。
     pub(super) const STAGING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
+    /// staging 父目录名（安装根扫描的排除项之一，见 [`super::is_install_internal_dir`]）。
+    pub(super) const STAGING_DIR_NAME: &str = ".tmp-install";
+
     /// staging 目录：`<agents_dir>/.tmp-install/<uuid>`——放在用户插件根之外，
     /// 不会被 `05` 的发现流程扫到；同盘保证 rename 换入原子。
     pub(super) struct Staging {
@@ -503,7 +525,7 @@ mod staging {
 
     impl Staging {
         pub(super) fn new() -> crate::Result<Self> {
-            let parent = agents_dir()?.join(".tmp-install");
+            let parent = agents_dir()?.join(STAGING_DIR_NAME);
             std::fs::create_dir_all(&parent)?;
             cleanup_stale_staging(&parent, SystemTime::now());
             Ok(Self {
@@ -621,7 +643,6 @@ mod replace {
         write_install_info(&staging.path, info)?;
         let root = user_plugins_dir()?;
         std::fs::create_dir_all(&root)?;
-        cleanup_orphan_backups(&root);
         let dest = root.join(&manifest.name);
         replace_dir(&staging.path, &dest)?;
         staging.commit();
@@ -632,27 +653,11 @@ mod replace {
         })
     }
 
-    /// 清理策略：换入新版本前，扫掉插件根下遗留的 `.replaced-*` 孤儿备份
-    /// （上次替换 rename 成功后删备份失败、或回滚失败崩溃的产物）。
-    /// 回滚失败的错误信息会指明备份路径供手动恢复；下一次同插件 install 即回收点。
-    fn cleanup_orphan_backups(root: &Path) {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(REPLACED_PREFIX)
-            {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-
     /// 换入 dest：旧目录先挪去同目录备份，换入失败即回滚（goose 同款）。
-    /// 回滚也失败时绝不静默吞掉：错误指明可手动恢复的备份路径（孤儿备份的
-    /// 自动回收见 [`cleanup_orphan_backups`]）。
+    /// 只有本次换入成功后才删除本次创建的那一份备份；其它 `.replaced-*`
+    /// 备份（未知归属、并发安装、回滚失败的产物）一律保留——它们可能是
+    /// 某个旧版本仅剩的可恢复副本（I02），不按年龄或前缀做全局清理。
+    /// 回滚也失败时绝不静默吞掉：错误指明可手动恢复的备份路径。
     pub(super) fn replace_dir(source: &Path, dest: &Path) -> crate::Result<()> {
         let backup = if dest.exists() {
             let backup = dest.with_file_name(format!(
@@ -699,6 +704,7 @@ mod update {
 
     use super::acquire::fetch_git_commit;
     use super::acquire::remove_git_dir;
+    use super::is_install_internal_dir;
     use super::metadata::mark_last_update_check;
     use super::metadata::read_install_info;
     use super::replace::place;
@@ -732,6 +738,7 @@ mod update {
         };
         let mut dirs: Vec<std::path::PathBuf> = entries
             .flatten()
+            .filter(|entry| !is_install_internal_dir(&entry.file_name()))
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
             .collect();
@@ -816,6 +823,7 @@ mod tests {
     use super::acquire::redact_url;
     use super::acquire::GIT_OUTPUT_CAP_BYTES;
     use super::metadata::read_install_info;
+    use super::metadata::write_install_info;
     use super::replace::replace_dir;
     use super::replace::REPLACED_PREFIX;
     use super::staging::cleanup_stale_staging;
@@ -1294,19 +1302,162 @@ mod tests {
         );
     }
 
+    /// I02：别人的 / 未知归属的 `.replaced-*` 备份不是本次替换的产物，
+    /// 安装其它插件时必须原样保留（可能是某旧版本仅剩的可恢复副本）。
     #[test]
-    fn orphan_replaced_backups_are_swept_before_place() {
+    fn replaced_backups_survive_unrelated_installs() {
         let env = isolated();
         let root = env.agents.path().join("plugins");
-        let orphan = root.join(format!("{REPLACED_PREFIX}alpha-deadbeef"));
-        std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::write(orphan.join("stale"), b"stale").unwrap();
+        // lost 仅剩的唯一恢复备份。
+        let lost = root.join(format!("{REPLACED_PREFIX}lost-6f9b2c4e"));
+        std::fs::create_dir_all(&lost).unwrap();
+        std::fs::write(lost.join("recover-me"), b"sole copy").unwrap();
+        // 模拟另一个活动替换：beta 已挪走备份，新版本尚未换入。
+        let active = root.join(format!("{REPLACED_PREFIX}beta-1a2b3c4d"));
+        write_plugin(&active, "beta", "1.0.0");
 
-        let src = local_plugin(&env, "beta", "1.0.0");
+        let src = local_plugin(&env, "newplugin", "1.0.0");
         install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+
+        assert_eq!(
+            std::fs::read(lost.join("recover-me")).unwrap(),
+            b"sole copy",
+            "lost 的唯一恢复备份内容不得改变"
+        );
         assert!(
-            !orphan.exists(),
-            "orphan backup must be cleaned on next place"
+            active.join("plugin.json").is_file(),
+            "另一个活动替换的备份不得被删除"
+        );
+    }
+
+    /// I02：成功替换只清理本次拥有的备份；别的备份与失败回滚的备份保留。
+    #[test]
+    fn successful_replace_removes_only_its_own_backup() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        install(
+            &InstallSource::Path(src.clone()),
+            &InstallOptions::default(),
+        )
+        .unwrap();
+        let root = env.agents.path().join("plugins");
+        let foreign = root.join(format!("{REPLACED_PREFIX}other-deadbeef"));
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("keep"), b"keep").unwrap();
+
+        write_plugin(&src, "alpha", "2.0.0");
+        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(REPLACED_PREFIX))
+            .collect();
+        assert_eq!(
+            leftovers,
+            [format!("{REPLACED_PREFIX}other-deadbeef")],
+            "本次 replace 只应清掉自己的备份"
+        );
+        assert!(foreign.join("keep").is_file());
+    }
+
+    /// I02：`.replaced-*` 与 `.tmp-install` 不出现在 list / auto-update 里，
+    /// 待恢复副本不会被当成插件或更新对象。
+    #[test]
+    fn internal_dirs_stay_out_of_list_and_auto_update() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "2.0.0");
+        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let root = env.agents.path().join("plugins");
+        // 同名旧版本备份：带 auto-update 元数据，证明 auto_update 也不碰它。
+        let backup = root.join(format!("{REPLACED_PREFIX}alpha-cafebabe"));
+        write_plugin(&backup, "alpha", "1.0.0");
+        write_install_info(
+            &backup,
+            &InstallInfo {
+                source: "file:///nonexistent/repo".into(),
+                commit: Some("0000000".into()),
+                installed_at: 1,
+                last_update_check: None,
+                auto_update: true,
+            },
+        )
+        .unwrap();
+        // staging 内部目录。
+        let staging = root.join(".tmp-install").join("half");
+        write_plugin(&staging, "beta", "1.0.0");
+
+        let items = list(env.agents.path()).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.plugin.manifest.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"],
+            "备份 / staging 不得出现在 list"
+        );
+        assert_eq!(items[0].plugin.manifest.version, "2.0.0", "必须是活插件");
+        assert_eq!(items[0].plugin.root, root.join("alpha"));
+
+        // 备份若被扫到，会因 file:// 源不可达产生失败结果；空结果即排除生效。
+        let results =
+            auto_update_all(crate::message::now_ts() + AUTO_UPDATE_INTERVAL_SECS).unwrap();
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    /// I01：显式 `enabledPlugins: []` 后 enable 写入白名单，且只启用它。
+    #[test]
+    fn enable_under_explicit_empty_whitelist_enables_only_that_plugin() {
+        let env = isolated();
+        let cwd = env.agents.path();
+        for name in ["alpha", "beta"] {
+            let src = local_plugin(&env, name, "1.0.0");
+            install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        }
+        std::fs::write(
+            env.config.path().join("settings.json"),
+            r#"{"enabledPlugins":[]}"#,
+        )
+        .unwrap();
+
+        enable("alpha").unwrap();
+        let after = read_user_settings(&env);
+        assert_eq!(after.enabled_plugins, vec!["alpha".to_string()]);
+
+        let items = list(cwd).unwrap();
+        let enabled: Vec<&str> = items
+            .iter()
+            .filter(|item| item.enabled)
+            .map(|item| item.plugin.manifest.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["alpha"], "显式 [] 后 enable 仅启用该插件");
+    }
+
+    /// I01：白名单禁用最后一项后仍是白名单模式（显式 `[]` 写回），
+    /// 未列入的插件不因模式翻转而复活。
+    #[test]
+    fn disable_last_whitelisted_plugin_keeps_whitelist_mode() {
+        let env = isolated();
+        let cwd = env.agents.path();
+        for name in ["alpha", "beta"] {
+            let src = local_plugin(&env, name, "1.0.0");
+            install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        }
+        std::fs::write(
+            env.config.path().join("settings.json"),
+            r#"{"enabledPlugins":["alpha"]}"#,
+        )
+        .unwrap();
+
+        disable("alpha").unwrap();
+        let after = read_user_settings(&env);
+        assert_eq!(after.whitelist(), Some(&[][..]), "[] 必须显式写回");
+
+        let items = list(cwd).unwrap();
+        assert!(
+            items.iter().all(|item| !item.enabled),
+            "beta 不得因白名单清空而启用"
         );
     }
 

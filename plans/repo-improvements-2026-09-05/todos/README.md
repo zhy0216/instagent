@@ -9,7 +9,7 @@
 | 01-sse-stream-integrity.md | P1 | hard | max | UTF-8/SSE、正常终止与输入预算 |
 | 02-session-io-recovery.md | P1 | hard | max | 会话有界读取、恢复、成批追加与备份保护 |
 | 03-agent-turn-continuation.md | P1 | hard | max | 执行前校验、续轮、取消和摘要完整性 |
-| 04-plugin-settings-recovery.md | P1 | hard | max | 保留白名单模式和安装恢复备份 |
+| done/04-plugin-settings-recovery.md ✅ | P1 | hard | max | 保留白名单模式和安装恢复备份 |
 | 05-proxy-lifecycle.md | P1 | hard | max | 有限换端口重试、总期限和并发重启 |
 | 06-bundled-snapshots.md | P1 | hard | max | bundled 完整快照与并发物化 |
 | 07-tool-inventory-io.md | P1 | hard | max | 一致工具缓存、失败恢复与有界 MCP 日志 |
@@ -23,7 +23,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 1. [01-sse-stream-integrity.md](01-sse-stream-integrity.md) — 待执行。依赖：无。
 2. [02-session-io-recovery.md](02-session-io-recovery.md) — 待执行。依赖：无。
 3. [03-agent-turn-continuation.md](03-agent-turn-continuation.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery。
-4. [04-plugin-settings-recovery.md](04-plugin-settings-recovery.md) — 待执行。依赖：无。
+4. [done/04-plugin-settings-recovery.md](done/04-plugin-settings-recovery.md) ✅ — 完成。settings 三态（未表态 / 白名单 / 显式空白名单）在合并、serde 往返与 enable/disable 全入口保留：`[]` 后 enable 写入白名单、禁用最后一项保持白名单模式、低层白名单被高层清空后仍禁用其他名字；read_layer 1 MiB 有界读取，超限 / 坏 JSON / IO 错误均指向对应层文件且原文件不变；移除 `.replaced-*` 无条件清扫，成功替换只清自己的备份、失败仍回滚，list / auto-update / discovery 扫描排除 `.replaced-*` 与 `.tmp-install` 内部目录。依赖：无。
 5. [05-proxy-lifecycle.md](05-proxy-lifecycle.md) — 待执行。依赖：无。
 6. [06-bundled-snapshots.md](06-bundled-snapshots.md) — 待执行。依赖：无。
 7. [07-tool-inventory-io.md](07-tool-inventory-io.md) — 待执行。依赖：无。

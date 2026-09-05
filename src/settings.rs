@@ -5,19 +5,31 @@
 //! 同目录 `settings.local.json`（Local）。优先级 local > project > user：
 //! 同名插件以最高层出现的字段为准（enabled/disabled 互斥覆盖）。
 //! `enabledPlugins` 三态语义按 ADR 0003 D5：缺失 = 不表态、非空 = 白名单、
-//! `[]` = 显式空白名单终值（低层不得恢复任何 enabled 名字）；
+//! `[]` = 显式空白名单终值（低层不得恢复任何 enabled 名字）。合并、serde
+//! 往返与 enable/disable 全用同一判定：区分"未声明白名单"与"声明后剩余集合
+//! 为空"——后者仍是白名单模式（禁用全部），绝不退化成"全启用"（I01）。
 //! `disabledPlugins` 维持并集，缺失与 `[]` 等价。
-//! 所有写路径走 `write_private_atomic`（同目录临时文件 + fsync + rename，
-//! Unix mode 0600），崩溃或 rename 失败只会留下旧的完整文件或新的完整文件。
+//! 单层读取有字节预算（[`SETTINGS_FILE_MAX_BYTES`]）；超限 / 坏 JSON / IO
+//! 错误都带该层文件路径且不回显内容，原文件保持不变；只有 `NotFound` 按
+//! 该层无内容处理。所有写路径走 `write_private_atomic`（同目录临时文件 +
+//! fsync + rename，Unix mode 0600），崩溃或 rename 失败只会留下旧的完整
+//! 文件或新的完整文件。
 
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::bail;
+use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
+
+/// 单个 settings 文件的读取字节预算（方案默认：config/settings 1 MiB）。
+/// 超限直接报错并保留原文件，不做截断读取。
+const SETTINGS_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// settings 文件来源层，优先级 Local > Project > User。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,24 +43,27 @@ pub enum SettingsLayer {
 }
 
 /// 三层合并后的 settings 形状（字段名按规范为 camelCase）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+/// Serialize/Deserialize 均为手写，保证"未表态 / 白名单 / 显式空白名单"三态
+/// 在直接 serde 往返与 load/save 中都不漂移（I01）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// 写了即白名单模式；没写则"除 `disabled_plugins` 外全启用"。
     /// 层内的三态（缺失 / `[]` / 非空，ADR 0003 D5）由 `merge_layers` 处理。
     pub enabled_plugins: Vec<String>,
     pub disabled_plugins: Vec<String>,
-    /// 合并终值是"显式空白名单"（ADR 0003 D5 的 `[]`，且没有更高层认领名字）：
-    /// `enabled_plugins` 为空但白名单模式仍成立，即禁用全部。消费端判模式用
-    /// [`Settings::whitelist`]，不要拿 `enabled_plugins.is_empty()` 猜——
-    /// 那样显式 `[]` 会退化成"全启用"。
-    #[serde(skip)]
+    /// 合并终值是"白名单模式且剩余集合为空"（ADR 0003 D5）：某层显式写了
+    /// `[]`（终值，低层不得恢复名字），或低层声明的白名单被高层全部认领。
+    /// 两种情况下 `enabled_plugins` 为空但白名单模式仍成立，即禁用全部。
+    /// 消费端判模式用 [`Settings::whitelist`]，不要拿
+    /// `enabled_plugins.is_empty()` 猜——那样显式 `[]` 会退化成"全启用"。
+    /// 序列化形态由手写 Serialize/Deserialize 决定：本字段不落盘，随
+    /// `enabledPlugins` 键的缺失 / `[]` 形态往返。
     pub enabled_locked: bool,
 }
 
-/// 手写序列化：未表态（`enabled_locked == false`）时空 `enabled_plugins` 写成
-/// 缺失键而不是 `[]`，否则 `plugin disable` 把白名单清空后会在下次读回时变成
-/// "禁用全部"（ADR 0003 D5 只在用户显式写 `[]` 时生效）。
+/// 手写序列化（与手写 [`Deserialize`] 对称）：未表态（`enabled_locked ==
+/// false`）且 `enabled_plugins` 为空时写成缺失键而不是 `[]`——缺失键保留
+/// "不表态"（黑名单模式），`[]` 保留给"显式空白名单"（禁用全部）。
 impl Serialize for Settings {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
@@ -58,6 +73,25 @@ impl Serialize for Settings {
         }
         map.serialize_entry("disabledPlugins", &self.disabled_plugins)?;
         map.end()
+    }
+}
+
+/// 手写反序列化（与手写 [`Serialize`] 对称）：`enabledPlugins` 键缺失 = 不
+/// 表态；出现（含 `[]`）= 白名单模式，其中 `[]` 记 `enabled_locked` 表达
+/// "显式空白名单终值"。derive Deserialize 会把 `[]` 读回成不表态，
+/// "禁用全部"将在下次读回时漂移成"全启用"（I01）。
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let file = LayerFile::deserialize(deserializer)?;
+        let enabled_locked = file
+            .enabled_plugins
+            .as_deref()
+            .is_some_and(|names| names.is_empty());
+        Ok(Settings {
+            enabled_plugins: file.enabled_plugins.unwrap_or_default(),
+            disabled_plugins: file.disabled_plugins.unwrap_or_default(),
+            enabled_locked,
+        })
     }
 }
 
@@ -177,43 +211,79 @@ fn project_settings_path(cwd: &Path, layer: SettingsLayer) -> PathBuf {
     cwd.join(".config").join("instagent").join(file)
 }
 
+/// 读一层 settings 文件。只有 `NotFound` 按该层无内容处理（`None`）；
+/// IO 错误、超过 [`SETTINGS_FILE_MAX_BYTES`] 预算、非 UTF-8 与坏 JSON 都带
+/// 该层文件路径报出，且不回显文件内容（可能含密钥等敏感字段），原文件
+/// 保持不变（只读，从不截断或改写）。
 fn read_layer(path: &Path) -> crate::Result<Option<LayerFile>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read settings layer {}", path.display()))
+        }
+    };
+    let mut buf = Vec::new();
+    std::io::Read::take(&mut file, SETTINGS_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read settings layer {}", path.display()))?;
+    if buf.len() as u64 > SETTINGS_FILE_MAX_BYTES {
+        bail!(
+            "settings layer {} exceeds the {SETTINGS_FILE_MAX_BYTES}-byte read budget; \
+             the file was left unchanged, trim it and retry",
+            path.display()
+        );
     }
+    let text = String::from_utf8(buf).map_err(|_| {
+        anyhow::anyhow!(
+            "settings layer {} is not valid UTF-8; the file was left unchanged",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parse settings layer {}", path.display()))
+        .map(Some)
 }
 
 /// `layers` 按 [User, Project, Local] 排列；从最高层向最低层应用，
 /// 被高层提到过的名字（enabled/disabled 任一）不再被低层覆盖。
 /// `enabledPlugins` 三态（ADR 0003 D5）：`None` = 不表态，低层值延续；
 /// 非空 = 白名单；`Some([])` = 终值，此后低层不得再恢复任何 enabled 名字
-/// （高层已认领的 enabled 名字不受影响）。终值在合并结果里记为
-/// [`Settings::enabled_locked`]，供消费端区分"没写"与"写了 `[]`"。
+/// （高层已认领的 enabled 名字不受影响）。
+/// 白名单模式在合并后保留（I01）：只要某层声明过 `enabledPlugins`，即使
+/// 终值集合为空（显式 `[]`，或低层白名单被高层 disabled 全部认领），结果
+/// 仍是"白名单模式 + 空集合"（禁用全部），不退化成黑名单让未提及的插件
+/// 复活。消费端凭 [`Settings::enabled_locked`] 区分"没写"与"空集合"。
 /// `disabledPlugins` 维持并集，`None` 与 `Some([])` 等价。
 fn merge_layers(layers: [Option<LayerFile>; 3]) -> Settings {
     let mut merged = Settings::default();
     let mut claimed: HashSet<String> = HashSet::new();
+    let mut enabled_declared = false;
     let mut enabled_locked = false;
     for file in layers.iter().rev() {
         let Some(file) = file else { continue };
         match file.enabled_plugins.as_deref() {
-            Some([]) => enabled_locked = true,
-            Some(names) if !enabled_locked => {
-                push_unclaimed(&mut merged.enabled_plugins, names, &claimed);
-                claimed.extend(names.iter().cloned());
+            Some([]) => {
+                enabled_declared = true;
+                enabled_locked = true;
             }
-            _ => {}
+            Some(names) => {
+                enabled_declared = true;
+                if !enabled_locked {
+                    push_unclaimed(&mut merged.enabled_plugins, names, &claimed);
+                    claimed.extend(names.iter().cloned());
+                }
+            }
+            None => {}
         }
         if let Some(names) = file.disabled_plugins.as_deref() {
             push_unclaimed(&mut merged.disabled_plugins, names, &claimed);
             claimed.extend(names.iter().cloned());
         }
     }
-    // 高层认领过名字时白名单非空，终值标志没有额外信息；只在"空终值"时置位，
-    // 让消费端能把显式 `[]`（禁用全部）与"从未表态"区分开。
-    merged.enabled_locked = enabled_locked && merged.enabled_plugins.is_empty();
+    // 白名单模式只要某层表过态就成立：终值集合非空时模式自明；终值集合为
+    // 空时靠该标志把"禁用全部"与"从未表态（全启用）"区分开。
+    merged.enabled_locked = enabled_declared && merged.enabled_plugins.is_empty();
     merged
 }
 
@@ -490,6 +560,130 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(Settings::load_user().unwrap().whitelist(), Some(&[][..]));
+    }
+
+    /// I01：低层白名单被高层 disabled 全部认领后，终值仍是白名单模式
+    /// （空集合 = 禁用全部），未提及的名字不因翻转成黑名单而复活。
+    #[test]
+    fn whitelist_mode_survives_when_higher_disabled_claims_all_names() {
+        let (_guard, user) = temp_user_dir();
+        let project = tempfile::tempdir().unwrap();
+        write_json(
+            &user.path().join("settings.json"),
+            r#"{"enabledPlugins":["a"]}"#,
+        );
+        layer_file(
+            SettingsLayer::Project,
+            project.path(),
+            r#"{"disabledPlugins":["a"]}"#,
+        );
+        let settings = Settings::merged(project.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&[][..]));
+        assert!(settings.enabled_locked);
+        assert_eq!(settings.disabled_plugins, vec!["a".to_string()]);
+    }
+
+    /// I01：三态在直接 serde 往返中不漂移——缺失键 = 不表态，`[]` = 显式
+    /// 空白名单，非空 = 白名单；写回读回原样。
+    #[test]
+    fn serde_round_trip_preserves_enabled_tri_state() {
+        // 缺失键 = 不表态；序列化后不漂移成 `[]`。
+        let settings: Settings = serde_json::from_str(r#"{"disabledPlugins":["d"]}"#).unwrap();
+        assert_eq!(settings.whitelist(), None);
+        let value = serde_json::to_value(&settings).unwrap();
+        assert!(value.get("enabledPlugins").is_none(), "{value}");
+
+        // 显式 [] = 禁用全部终值；往返后仍是 `[]` 而非缺失键。
+        let settings: Settings = serde_json::from_str(r#"{"enabledPlugins":[]}"#).unwrap();
+        assert_eq!(settings.whitelist(), Some(&[][..]));
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["enabledPlugins"], serde_json::json!([]), "{value}");
+        let back: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(back, settings);
+
+        // 非空 = 白名单；往返后不变。
+        let settings: Settings = serde_json::from_str(r#"{"enabledPlugins":["a"]}"#).unwrap();
+        assert_eq!(settings.whitelist(), Some(&["a".to_string()][..]));
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(back, settings);
+    }
+
+    /// T2：user/project/local 任一层超出读取预算都指向对应层的文件，
+    /// 原文件保持不变；恰好等于预算的文件照常解析（上限前后都要测）。
+    #[test]
+    fn oversized_settings_layer_is_rejected_with_its_path() {
+        // `{"disabledPlugins":[""]}` 的固定开销是 24 字节，据此补齐到预算 +/-。
+        let pad = |extra: usize| {
+            format!(
+                r#"{{"disabledPlugins":["{}"]}}"#,
+                "a".repeat(SETTINGS_FILE_MAX_BYTES as usize - 24 + extra)
+            )
+        };
+        let content_over = pad(1);
+        assert_eq!(content_over.len() as u64, SETTINGS_FILE_MAX_BYTES + 1);
+        for layer in [
+            SettingsLayer::User,
+            SettingsLayer::Project,
+            SettingsLayer::Local,
+        ] {
+            let (_guard, user) = temp_user_dir();
+            let cwd = tempfile::tempdir().unwrap();
+            let path = match layer {
+                SettingsLayer::User => user.path().join("settings.json"),
+                other => project_settings_path(cwd.path(), other),
+            };
+            write_json(&path, &content_over);
+            let err = Settings::merged(cwd.path()).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&path.display().to_string()),
+                "{layer:?} 超限错误应指向 {}: {message}",
+                path.display()
+            );
+            assert!(message.contains("budget"), "{message}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content_over);
+        }
+
+        // 预算本身可取到：恰好等于上限的文件解析成功。
+        let (_guard, user) = temp_user_dir();
+        let cwd = tempfile::tempdir().unwrap();
+        let content_exact = pad(0);
+        assert_eq!(content_exact.len() as u64, SETTINGS_FILE_MAX_BYTES);
+        write_json(&user.path().join("settings.json"), &content_exact);
+        let settings = Settings::merged(cwd.path()).unwrap();
+        assert_eq!(settings.disabled_plugins.len(), 1);
+        assert_eq!(
+            settings.disabled_plugins[0].len() as u64,
+            SETTINGS_FILE_MAX_BYTES - 24
+        );
+    }
+
+    /// T2：任一层坏 JSON 都指向对应层的文件，原文件保持不变。
+    #[test]
+    fn broken_json_points_at_the_layer_file() {
+        for layer in [
+            SettingsLayer::User,
+            SettingsLayer::Project,
+            SettingsLayer::Local,
+        ] {
+            let (_guard, user) = temp_user_dir();
+            let cwd = tempfile::tempdir().unwrap();
+            let path = match layer {
+                SettingsLayer::User => user.path().join("settings.json"),
+                other => project_settings_path(cwd.path(), other),
+            };
+            write_json(&path, "{ not json");
+            let err = Settings::merged(cwd.path()).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("parse settings layer"), "{message}");
+            assert!(
+                message.contains(&path.display().to_string()),
+                "{layer:?} 坏 JSON 错误应指向 {}: {message}",
+                path.display()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        }
     }
 
     #[cfg(unix)]

@@ -242,7 +242,10 @@ struct ChildDirs {
 }
 
 /// 统一枚举插件根目录的子目录（R12）：坏 symlink 与逐条读取失败进
-/// `failures`；散文件、指向文件的链接属不匹配，静默。返回按路径升序。
+/// `failures`；散文件、指向文件的链接属不匹配，静默；安装内部状态目录
+/// （`.replaced-*` 备份 / `.tmp-install` staging，见
+/// [`crate::plugin::install::is_install_internal_dir`]）同样静默排除，不把
+/// 正在安装或待恢复的副本发现成插件（I02）。返回按路径升序。
 fn list_child_dirs(path: &Path) -> Result<ChildDirs, DirError> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
@@ -266,6 +269,9 @@ fn list_child_dirs(path: &Path) -> Result<ChildDirs, DirError> {
             continue;
         };
         let child = entry.path();
+        if crate::plugin::install::is_install_internal_dir(&entry.file_name()) {
+            continue;
+        }
         let Ok(file_type) = entry.file_type() else {
             failures.push((
                 child.clone(),
@@ -564,6 +570,66 @@ mod tests {
         assert_eq!(settings.whitelist(), None);
         let set = discover(cwd.path(), &settings, &[], &[]).unwrap();
         assert_eq!(names(&set), ["a", "b"]);
+    }
+
+    /// I01 消费端回归：用户层白名单仅 `a`、项目层禁用 `a` 时，合并终值
+    /// 保持白名单模式（空集合），`b` 不因模式翻转成黑名单而被发现。
+    #[test]
+    fn lower_whitelist_cleared_by_higher_disabled_still_disables_others() {
+        let config = TempDir::new().unwrap();
+        let env = isolated_agents();
+        std::env::set_var("INSTAGENT_CONFIG_DIR", config.path());
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"enabledPlugins":["a"]}"#,
+        )
+        .unwrap();
+        let cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".config").join("instagent")).unwrap();
+        std::fs::write(
+            cwd.path()
+                .join(".config")
+                .join("instagent")
+                .join("settings.json"),
+            r#"{"disabledPlugins":["a"]}"#,
+        )
+        .unwrap();
+        in_root(&user_plugins(&env), "a", "1.0.0");
+        in_root(&user_plugins(&env), "b", "1.0.0");
+
+        let settings = Settings::merged(cwd.path()).unwrap();
+        assert_eq!(settings.whitelist(), Some(&[][..]));
+        let set = discover(cwd.path(), &settings, &[], &[]).unwrap();
+        assert!(
+            set.plugins.is_empty(),
+            "白名单被高层清空后仍禁用其他名字：{:?}",
+            names(&set)
+        );
+    }
+
+    /// I02 消费端回归：安装根下的 `.replaced-*` 恢复副本与 `.tmp-install`
+    /// staging 不被发现（包括不出现在 skipped 诊断里）；同名活插件不被
+    /// 旧备份顶替。
+    #[test]
+    fn internal_replaced_and_staging_dirs_are_not_discovered() {
+        let env = isolated_agents();
+        let user = user_plugins(&env);
+        in_root(&user, "alpha", "2.0.0");
+        // 同名旧版本的恢复副本：排序上先于 `alpha`，若被扫描会顶替活插件。
+        write_plugin(&user.join(".replaced-alpha-0001"), "alpha", "1.0.0");
+        // 正在安装的 staging 副本。
+        write_plugin(
+            &user.join(".tmp-install").join("uuid-half"),
+            "beta",
+            "1.0.0",
+        );
+
+        let cwd = TempDir::new().unwrap();
+        let set = discover(cwd.path(), &Settings::default(), &[], &[]).unwrap();
+        assert_eq!(names(&set), ["alpha"]);
+        assert_eq!(set.get("alpha").unwrap().manifest.version, "2.0.0");
+        assert_eq!(set.get("alpha").unwrap().root, user.join("alpha"));
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
     }
 
     /// 高层没写 `enabledPlugins` 时低层白名单延续（三态在消费端不回归）。
