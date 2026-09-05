@@ -160,6 +160,41 @@ impl ServerHandler for FixtureServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // T2 洪泛模式：`MCP_FIXTURE_STDERR_FLOOD=1` 时在 stderr 写大量无换行内容 +
+    // 跨块 Unicode + 多行日志，验证客户端有界排空仍保持 initialize/list/call 健康。
+    // stderr 与 MCP 协议（stdin/stdout）分离，不干扰协议；写完即停，drain 到 EOF 结束。
+    if std::env::var("MCP_FIXTURE_STDERR_FLOOD").is_ok() {
+        tokio::spawn(async {
+            use tokio::io::AsyncWriteExt as _;
+            let mut err = tokio::io::stderr();
+            let chunk = vec![b'x'; 8192];
+            for _ in 0..32 {
+                // 256 KiB 无换行：旧 `lines()` 会整行缓存在内存。
+                if err.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            // 跨块 Unicode：逐字节写，强制在多字节序列中间切分。
+            let emoji = "中文🙂".as_bytes();
+            for _ in 0..200 {
+                for b in emoji {
+                    if err.write_all(&[*b]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if err.write_all(b"\n").await.is_err() {
+                return;
+            }
+            for i in 0..100 {
+                let line = format!("flood line {i}\n");
+                if err.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = err.flush().await;
+        });
+    }
     let transport = (tokio::io::stdin(), tokio::io::stdout());
     let server = serve_server(FixtureServer, transport).await?;
     let _reason = server.waiting().await?;

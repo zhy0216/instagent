@@ -472,3 +472,71 @@ async fn registry_routes_prefixed_names_end_to_end() {
 
     registry.shutdown().await;
 }
+
+// ---- 07 T2：无换行 stderr 洪泛仍健康，drain 到退出无残留 ----
+
+fn fixture_stdio_config_with_flood() -> McpServerConfig {
+    let mut config = fixture_stdio_config();
+    config
+        .env
+        .insert("MCP_FIXTURE_STDERR_FLOOD".to_string(), "1".to_string());
+    config
+}
+
+async fn connect_flood_fixture(plugin_root: &Path) -> McpSource {
+    std::os::unix::fs::symlink(FIXTURE_BIN, plugin_root.join("mcp-fixture-server")).unwrap();
+    let plugin = Plugin {
+        manifest: manifest(),
+        root: plugin_root.to_path_buf(),
+        source: PluginSource::User,
+    };
+    let server = fixture_stdio_config_with_flood();
+    McpSource::connect(&plugin, &server)
+        .await
+        .expect("connect flood fixture stdio server")
+}
+
+#[tokio::test]
+async fn stderr_flood_without_newlines_keeps_server_healthy() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let source = connect_flood_fixture(tmp.path()).await;
+    let pid = source.child_pid().expect("stdio child pid");
+    let ctx = ctx(tmp.path());
+
+    // 洪泛并发下 initialize 已成功（connect 即证明）；list/call 仍成功，不被 stderr 卡住。
+    let specs = tokio::time::timeout(Duration::from_secs(15), source.inventory())
+        .await
+        .expect("list must not hang on stderr flood")
+        .expect("flood must not fail inventory");
+    assert!(
+        specs.iter().any(|s| s.name == "fixture__echo"),
+        "洪泛时清单须完整: {specs:?}"
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        source.call("fixture__echo", json!({"text": "flooded"}), &ctx),
+    )
+    .await
+    .expect("call must not hang on stderr flood");
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("flooded"), "{}", output.text);
+
+    // 单条保留与窗口诊断有上限由 `mcp.rs` 单元测试覆盖（常量 8 KiB / 20 条）；
+    // 此处只断言超限不杀健康 server：调用仍成功。
+    // shutdown 结束 drain，无残留进程。
+    source.shutdown().await;
+    let gone = |pid: u32| {
+        !std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    for _ in 0..100 {
+        if gone(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("shutdown 后洪泛子进程 {pid} 仍存活，drain 未结束或 kill 未生效");
+}

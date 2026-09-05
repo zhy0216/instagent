@@ -46,8 +46,8 @@ use rmcp::transport::IntoTransport;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt as _;
-use tokio::io::BufReader;
+use std::time::Instant;
+use tokio::io::AsyncReadExt as _;
 use tokio::process::ChildStderr;
 use tokio::process::Command;
 
@@ -316,21 +316,212 @@ fn declared_env(plugin: &Plugin) -> Vec<String> {
 }
 
 /// stderr 持续接日志（防止管道写满卡死 server），子进程退出后自然结束。
-fn pipe_stderr_to_logs(id: &str, stderr: ChildStderr) {
-    let id = id.to_string();
-    let mut lines = BufReader::new(stderr).lines();
-    tokio::spawn(async move {
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => tracing::warn!("MCP {id} stderr: {line}"),
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!("MCP {id} stderr read ended: {e}");
+/// 有界增量解码：固定块读取、跨块 UTF-8 不损坏；单行至多保留
+/// [`STDERR_MAX_LINE_BYTES`] 头部并附截断说明，剩余字节仍持续排空；
+/// 采样窗口内至多 [`STDERR_MAX_LOGS_PER_WINDOW`] 条诊断，超限计数汇总。
+/// 超限只丢日志，不杀仍健康的共享 MCP server（v1 transport/载荷内部预算见 roadmap RM04，本次不碰）。
+pub const STDERR_MAX_LINE_BYTES: usize = 8 * 1024;
+/// 采样窗口内最多产出的 stderr 诊断条数。
+pub const STDERR_MAX_LOGS_PER_WINDOW: usize = 20;
+/// 采样窗口长度。
+pub const STDERR_LOG_WINDOW: Duration = Duration::from_secs(10);
+/// 单次读取块大小。
+const STDERR_READ_CHUNK_BYTES: usize = 8192;
+
+/// 增量 UTF-8 解码器：跨块缓冲末尾不完整序列，避免切分损坏合法字符；
+/// 真坏尾在 `finish` 时按 lossy 出 replacement（与 subprocess 的解码同形，本文件内最小实现）。
+#[derive(Default)]
+struct StderrUtf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl StderrUtf8Decoder {
+    fn push(&mut self, chunk: &[u8]) -> String {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(chunk);
+        let mut out = String::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            match std::str::from_utf8(&bytes[offset..]) {
+                Ok(valid) => {
+                    out.push_str(valid);
                     break;
+                }
+                Err(err) => {
+                    let valid_upto = offset + err.valid_up_to();
+                    out.push_str(&String::from_utf8_lossy(&bytes[offset..valid_upto]));
+                    match err.error_len() {
+                        Some(len) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            offset = valid_upto + len;
+                        }
+                        None => {
+                            self.pending.extend_from_slice(&bytes[valid_upto..]);
+                            break;
+                        }
+                    }
                 }
             }
         }
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
+    }
+}
+
+/// 采样窗口限速器：窗口内至多 `max_logs` 条，超限计数；`now` 由调用方传入，
+/// 测试可注入时间，不用 sleep。
+#[derive(Debug)]
+struct StderrRateLimiter {
+    window_start: Instant,
+    window: Duration,
+    max_logs: usize,
+    emitted: usize,
+    suppressed_lines: usize,
+    suppressed_bytes: u64,
+}
+
+impl StderrRateLimiter {
+    fn new(now: Instant, window: Duration, max_logs: usize) -> Self {
+        Self {
+            window_start: now,
+            window,
+            max_logs,
+            emitted: 0,
+            suppressed_lines: 0,
+            suppressed_bytes: 0,
+        }
+    }
+
+    /// 窗口到期则轮转并返回上一窗口的汇总（调用方应先打这条再打当前行）。
+    fn rollover_if_due(&mut self, now: Instant) -> Option<String> {
+        if now.duration_since(self.window_start) < self.window {
+            return None;
+        }
+        let summary = self.take_summary();
+        self.window_start = now;
+        self.emitted = 0;
+        summary
+    }
+
+    /// 本行是否应该打出；false 时计入抑制计数。`line_bytes` 为本行观测总字节。
+    fn should_emit(&mut self, line_bytes: u64) -> bool {
+        if self.emitted < self.max_logs {
+            self.emitted += 1;
+            true
+        } else {
+            self.suppressed_lines += 1;
+            self.suppressed_bytes += line_bytes;
+            false
+        }
+    }
+
+    fn take_summary(&mut self) -> Option<String> {
+        if self.suppressed_lines == 0 {
+            return None;
+        }
+        let summary = format!(
+            "suppressed {} stderr line(s) ({} bytes) in sampling window (rate-limited)",
+            self.suppressed_lines, self.suppressed_bytes
+        );
+        self.suppressed_lines = 0;
+        self.suppressed_bytes = 0;
+        Some(summary)
+    }
+}
+
+/// 单行截断渲染：保留头部至多 [`STDERR_MAX_LINE_BYTES`]（吸附字符边界）并附说明。
+fn render_truncated_line(kept: &str, total_bytes: usize) -> String {
+    format!(
+        "{kept}…[line truncated: kept {} of {total_bytes} bytes]",
+        kept.len()
+    )
+}
+
+fn pipe_stderr_to_logs(id: &str, stderr: ChildStderr) {
+    let id = id.to_string();
+    tokio::spawn(async move {
+        drain_stderr_to_logs(&id, stderr).await;
     });
+}
+
+fn emit_stderr_line(id: &str, limiter: &mut StderrRateLimiter, kept: &str, discarded: usize) {
+    let line = kept.trim_end_matches('\r');
+    let total = line.len() + discarded;
+    let now = Instant::now();
+    if let Some(summary) = limiter.rollover_if_due(now) {
+        tracing::warn!("MCP {id} stderr: {summary}");
+    }
+    if discarded > 0 {
+        let rendered = render_truncated_line(line, total);
+        if limiter.should_emit(total as u64) {
+            tracing::warn!("MCP {id} stderr: {rendered}");
+        }
+    } else if limiter.should_emit(total as u64) {
+        tracing::warn!("MCP {id} stderr: {line}");
+    }
+}
+
+fn feed_stderr_text(
+    text: &str,
+    id: &str,
+    limiter: &mut StderrRateLimiter,
+    kept: &mut String,
+    discarded: &mut usize,
+) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            emit_stderr_line(id, limiter, kept, *discarded);
+            kept.clear();
+            *discarded = 0;
+        } else if *discarded > 0 {
+            *discarded += ch.len_utf8();
+        } else if kept.len() + ch.len_utf8() <= STDERR_MAX_LINE_BYTES {
+            kept.push(ch);
+        } else {
+            // 本行首次越限：头部已满，余下记丢弃并持续排空。
+            *discarded += ch.len_utf8();
+        }
+    }
+}
+
+async fn drain_stderr_to_logs(id: &str, mut stderr: ChildStderr) {
+    let mut decoder = StderrUtf8Decoder::default();
+    let mut limiter = StderrRateLimiter::new(
+        Instant::now(),
+        STDERR_LOG_WINDOW,
+        STDERR_MAX_LOGS_PER_WINDOW,
+    );
+    // 当前行保留头部（<= 上限）+ 丢弃计数；超限后持续排空到换行/EOF。
+    let mut kept = String::new();
+    let mut discarded: usize = 0;
+    let mut chunk = [0u8; STDERR_READ_CHUNK_BYTES];
+
+    loop {
+        let n = match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!("MCP {id} stderr read ended: {e}");
+                break;
+            }
+        };
+        let text = decoder.push(&chunk[..n]);
+        feed_stderr_text(&text, id, &mut limiter, &mut kept, &mut discarded);
+    }
+    let tail = decoder.finish();
+    if !tail.is_empty() {
+        feed_stderr_text(&tail, id, &mut limiter, &mut kept, &mut discarded);
+    }
+    if !kept.is_empty() || discarded > 0 {
+        emit_stderr_line(id, &mut limiter, &kept, discarded);
+    }
+    if let Some(summary) = limiter.take_summary() {
+        tracing::warn!("MCP {id} stderr: {summary}");
+    }
 }
 
 /// 任何 IntoTransport 统一走 serve_client（legacy initialize 握手），
@@ -669,5 +860,73 @@ mod tests {
         assert_eq!(note.chars().count(), MAX_NOTE_CHARS + 1); // 上限 + 省略号
         assert!(note.ends_with('…'));
         assert_eq!(bounded_note("short"), "short");
+    }
+
+    #[test]
+    fn stderr_decoder_reassembles_split_unicode_without_corruption() {
+        let text = "中文🙂 mixed héllo 日本";
+        let bytes = text.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut decoder = StderrUtf8Decoder::default();
+            let mut out = decoder.push(&bytes[..cut]);
+            out.push_str(&decoder.push(&bytes[cut..]));
+            out.push_str(&decoder.finish());
+            assert_eq!(out, text, "cut at byte {cut}");
+        }
+        // 逐字节喂入 equally 不损坏。
+        let mut decoder = StderrUtf8Decoder::default();
+        let mut out = String::new();
+        for i in 0..bytes.len() {
+            out.push_str(&decoder.push(&bytes[i..i + 1]));
+        }
+        out.push_str(&decoder.finish());
+        assert_eq!(out, text);
+        assert!(!out.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    #[test]
+    fn stderr_truncated_line_keeps_bounded_head_with_note() {
+        assert_eq!(STDERR_MAX_LINE_BYTES, 8 * 1024);
+        let huge = "y".repeat(STDERR_MAX_LINE_BYTES + 100);
+        // 模拟 feed 的封顶逻辑：头部 <= 上限，余下记丢弃。
+        let mut kept = String::new();
+        let mut discarded = 0usize;
+        for ch in huge.chars() {
+            if discarded > 0 {
+                discarded += ch.len_utf8();
+            } else if kept.len() + ch.len_utf8() <= STDERR_MAX_LINE_BYTES {
+                kept.push(ch);
+            } else {
+                discarded += ch.len_utf8();
+            }
+        }
+        assert_eq!(kept.len(), STDERR_MAX_LINE_BYTES);
+        assert_eq!(discarded, 100);
+        let rendered = render_truncated_line(&kept, kept.len() + discarded);
+        assert!(rendered.len() < huge.len() + 100, "截断后必须有界");
+        assert!(rendered.contains("line truncated"), "{rendered}");
+        assert!(rendered.contains(&format!("of {} bytes", kept.len() + discarded)));
+    }
+
+    #[test]
+    fn stderr_rate_limiter_caps_window_with_injected_time() {
+        let start = Instant::now();
+        let mut limiter =
+            StderrRateLimiter::new(start, Duration::from_secs(10), STDERR_MAX_LOGS_PER_WINDOW);
+        // 同一窗口内突发 100 行：只放行上限条。
+        let mut emitted = 0;
+        for _ in 0..100 {
+            if limiter.should_emit(10) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, STDERR_MAX_LOGS_PER_WINDOW);
+        let summary = limiter.take_summary().expect("超限须有汇总");
+        assert!(summary.contains("80"), "{summary}");
+        assert!(summary.contains("rate-limited"), "{summary}");
+        // 注入时间推进到下一窗口：轮转后可继续打出并先吐上一窗口汇总（此处已取走则无）。
+        let later = start + Duration::from_secs(11);
+        assert!(limiter.rollover_if_due(later).is_none());
+        assert!(limiter.should_emit(10));
     }
 }

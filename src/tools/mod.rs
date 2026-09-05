@@ -16,9 +16,14 @@ pub mod mcp;
 pub mod skills;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -161,21 +166,64 @@ struct Route {
 }
 
 /// 双向映射表：visible → route，(source, real) → visible。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Routes {
     forward: HashMap<String, Route>,
+}
+
+/// 失败来源的重试状态：下一次重试时机有界退避（note 在快照 errors 里可见）。
+#[derive(Debug, Clone)]
+struct FailureState {
+    next_retry: Instant,
+    attempts: u32,
+}
+
+/// specs/routes/list_errors 同一快照原子发布；代次防止旧枚举覆盖新一代。
+#[derive(Clone, Default)]
+struct Snapshot {
+    specs: Vec<ToolSpec>,
+    routes: Routes,
+    errors: Vec<String>,
+    failures: HashMap<String, FailureState>,
+}
+
+#[derive(Default)]
+struct State {
+    snapshot: Option<Snapshot>,
+    generation: u64,
+}
+
+/// 失败来源重试基线 5s、上限 60s：失败后窗口内复用缓存（健康来源直接命中），
+/// 到期后下一次 list 只触发一次合并刷新；连续失败指数退避，避免每轮无上限网络风暴。
+const RETRY_BASE: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+fn retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(4);
+    RETRY_BASE.saturating_mul(1 << shift).min(RETRY_MAX)
 }
 
 /// 汇总多个来源，按模型可见名路由（名字映射表在实现里，双向且会话内稳定）。
 /// 工具清单与 route 缓存（`10`）：首次 [`Self::list`] 枚举各来源后缓存，
 /// 后续每轮直接命中，不再重复网络枚举；[`Self::invalidate`]（连接 / 配置变化、
 /// 缓存外调用名未命中时的自动重建）令缓存作废。
-#[derive(Default)]
 pub struct Registry {
     pub sources: Vec<Arc<dyn ToolSource>>,
-    routes: Mutex<Routes>,
-    cached_specs: Mutex<Option<Vec<ToolSpec>>>,
-    list_errors: Mutex<Vec<String>>,
+    state: Mutex<State>,
+    /// 异步刷新单飞：同时只允许一个在途枚举，其余合并等待同一快照。
+    refresh: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            state: Mutex::new(State::default()),
+            refresh: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Registry {
@@ -190,42 +238,115 @@ impl Registry {
 
     /// 令工具清单缓存作废（下一次 [`Self::list`] 重新枚举）。连接或配置变化
     /// 时由装配层调用；会话内新建的 Registry 天然不会命中旧清单。
+    /// 递增代次：在途旧枚举完成后不得覆盖新一代快照。
     pub fn invalidate(&self) {
-        *self.cached_specs.lock().expect("registry cache lock") = None;
-        *self.routes.lock().expect("registry routes lock") = Routes::default();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.state.lock().expect("registry state lock");
+        state.generation = self.generation.load(Ordering::SeqCst);
+        state.snapshot = None;
     }
 
     /// 最近一次枚举中各来源上报的失败 note（超时 / 断连等，note 自带来源
-    /// id）。清单被缓存时 note 一并冻结，随下一次重新枚举刷新。
+    /// id）与同源重复工具去重诊断。清单被缓存时 note 一并冻结，随下一次重新枚举刷新。
     pub fn list_errors(&self) -> Vec<String> {
-        self.list_errors
+        self.state
             .lock()
-            .expect("registry notes lock")
-            .clone()
+            .expect("registry state lock")
+            .snapshot
+            .as_ref()
+            .map(|s| s.errors.clone())
+            .unwrap_or_default()
+    }
+
+    /// 测试/诊断支持：把失败来源的下次重试时机拨到已到期，使下一次
+    /// [`Self::list`] 触发合并刷新（私有时钟状态的可注入控制，不用 sleep）。
+    pub fn force_retry_due(&self) {
+        let mut state = self.state.lock().expect("registry state lock");
+        if let Some(snapshot) = state.snapshot.as_mut() {
+            let now = Instant::now();
+            for failure in snapshot.failures.values_mut() {
+                failure.next_retry = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+            }
+        }
+    }
+
+    fn cached_if_fresh(&self) -> Option<Vec<ToolSpec>> {
+        let state = self.state.lock().expect("registry state lock");
+        let snapshot = state.snapshot.as_ref()?;
+        if Self::retry_due_at(snapshot, Instant::now()) {
+            return None;
+        }
+        Some(snapshot.specs.clone())
+    }
+
+    fn retry_due_at(snapshot: &Snapshot, now: Instant) -> bool {
+        snapshot
+            .failures
+            .values()
+            .any(|failure| now >= failure.next_retry)
     }
 
     /// 汇总各来源 spec，解决同名冲突（后来者加插件名前缀），再套
     /// [`model_visible_name`] 生成模型可见名，刷新双向映射表并缓存结果。
     /// 来源经 [`ToolSource::inventory`] 上报的失败不进清单、不缓存成"空工具"，
-    /// 收进 [`Self::list_errors`] 并写 warning。
+    /// 收进 [`Self::list_errors`] 并写 warning；失败来源记有界重试时机，到期前
+    /// 复用缓存（健康来源直接命中），到期后下一次 list 合并刷新一次。
+    /// specs/routes/list_errors 同一快照原子发布；并发 list 只允许一个在途枚举。
     pub async fn list(&self) -> Vec<ToolSpec> {
-        if let Some(cached) = self
-            .cached_specs
-            .lock()
-            .expect("registry cache lock")
-            .clone()
-        {
+        if let Some(cached) = self.cached_if_fresh() {
             return cached;
         }
-        let specs = self.enumerate().await;
-        *self.cached_specs.lock().expect("registry cache lock") = Some(specs.clone());
-        specs
+        let _guard = self.refresh.lock().await;
+        if let Some(cached) = self.cached_if_fresh() {
+            return cached;
+        }
+        loop {
+            let (start_gen, prev) = {
+                let state = self.state.lock().expect("registry state lock");
+                let prev = state
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.failures.clone())
+                    .unwrap_or_default();
+                (state.generation, prev)
+            };
+            let (specs, routes, errors, failures) = self.enumerate(&prev).await;
+            {
+                let mut state = self.state.lock().expect("registry state lock");
+                if state.generation != start_gen {
+                    // 旧枚举跨越了 invalidate：丢弃，不覆盖新一代；新一代尚无快照则再刷一次。
+                    if let Some(snapshot) = state.snapshot.as_ref() {
+                        if !Self::retry_due_at(snapshot, Instant::now()) {
+                            return snapshot.specs.clone();
+                        }
+                    }
+                    continue;
+                }
+                let snapshot = Snapshot {
+                    specs: specs.clone(),
+                    routes,
+                    errors,
+                    failures,
+                };
+                state.snapshot = Some(snapshot);
+                return specs;
+            }
+        }
     }
 
-    async fn enumerate(&self) -> Vec<ToolSpec> {
+    async fn enumerate(
+        &self,
+        prev: &HashMap<String, FailureState>,
+    ) -> (
+        Vec<ToolSpec>,
+        Routes,
+        Vec<String>,
+        HashMap<String, FailureState>,
+    ) {
         let mut specs = Vec::new();
         let mut routes = Routes::default();
         let mut errors = Vec::new();
+        let mut failures = HashMap::new();
 
         for (idx, source) in self.sources.iter().enumerate() {
             let prefix = conflict_prefix(source.id());
@@ -234,10 +355,33 @@ impl Registry {
                 Err(note) => {
                     tracing::warn!("{note}");
                     errors.push(note);
+                    let attempts = prev
+                        .get(source.id())
+                        .map(|f| f.attempts)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    failures.insert(
+                        source.id().to_string(),
+                        FailureState {
+                            next_retry: Instant::now() + retry_delay(attempts),
+                            attempts,
+                        },
+                    );
                     continue;
                 }
             };
+            let mut seen_in_source = HashSet::new();
             for spec in listed {
+                if !seen_in_source.insert(spec.name.clone()) {
+                    let note = format!(
+                        "tool source `{}` returned duplicate tool `{}`; kept first",
+                        source.id(),
+                        spec.name
+                    );
+                    tracing::warn!("{note}");
+                    errors.push(note);
+                    continue;
+                }
                 let mut candidate = spec.name.clone();
                 let mut retry = 0usize;
                 let visible = loop {
@@ -269,9 +413,7 @@ impl Registry {
             }
         }
 
-        *self.routes.lock().expect("registry routes lock") = routes;
-        *self.list_errors.lock().expect("registry notes lock") = errors;
-        specs
+        (specs, routes, errors, failures)
     }
 
     /// 按映射表路由回真实 (source, name)；未命中时先重建一次映射再试。
@@ -313,8 +455,14 @@ impl Registry {
     }
 
     fn lookup_cached(&self, visible: &str) -> Option<Route> {
-        let routes = self.routes.lock().expect("registry routes lock");
-        routes.forward.get(visible).cloned()
+        let state = self.state.lock().expect("registry state lock");
+        state
+            .snapshot
+            .as_ref()?
+            .routes
+            .forward
+            .get(visible)
+            .cloned()
     }
 
     pub async fn shutdown(&self) {

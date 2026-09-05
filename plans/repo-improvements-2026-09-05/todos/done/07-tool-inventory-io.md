@@ -43,3 +43,11 @@ cargo test
 ```
 
 一个本地 commit。保留 Registry::list/call/capability/invalidate 的外部调用方式，默认诊断可见性由 08 的 CLI 配置落地。
+
+## 完成记录
+
+状态：完成。只改 `src/tools/mod.rs`、`src/tools/mcp.rs`、`tests/mcp_e2e.rs`、`tests/fixtures/mcp_stdio_server.rs`，新增 `tests/tool_inventory.rs`；未动 `Cargo.toml`/`Cargo.lock`/`src/lib.rs`，未新增 tokio feature。
+
+关键行为：Registry 以 `Snapshot{specs,routes,errors,failures}` 同一快照原子发布，`tokio::sync::Mutex` 单飞合并并发 list，`invalidate` 经 `AtomicU64` 递增代次并清空快照、旧枚举跨代次丢弃；健康无失败时直接命中缓存，失败来源记 `next_retry`（基线 5s、上限 60s 指数退避，到期前复用缓存、到期后合并刷新一次），`force_retry_due` 为私有时钟的可注入控制；同源重复实名去重保留首份并记 `duplicate … kept first` 诊断。MCP stderr 改固定 8 KiB 块增量 UTF-8 解码，单行至多保留 8 KiB 头部并附截断说明、余下持续排空，采样窗口 10s 内至多 20 条、超限计数汇总；超限只丢日志，不杀共享 server（rmcp 内部载荷/headers/SSE 仍为 roadmap RM04，本次不碰）。
+
+验收证据：T1 由 `tests/tool_inventory.rs` 4 例覆盖——`concurrent_lists_merge_into_single_refresh`（10 并发经 Barrier 同起，枚举==1、再查仍命中）、`invalidate_during_enumeration_discards_stale_snapshot`（Notify 门控首轮枚举、在途改名+invalidate、旧结果丢弃后得新清单且可见名路由到对应来源）、`failed_source_recovers_after_retry_due_while_healthy_stays`（失败→窗口内零重枚举→拨到期后一次刷新恢复、错误清空）、`duplicate_tool_names_are_deduped_without_failing_source`（重复只留一份、可调用、健康源可用、错误含 duplicate 诊断）；T2 由 `mcp.rs` 3 单元测试（跨块中文/emoji 全切分点重组、无半字符，单行 8 KiB 封顶+说明，限速器注入时间 100 突发只放 20 条+汇总）与 `mcp_e2e::stderr_flood_without_newlines_keeps_server_healthy`（256 KiB 无换行+逐字节 Unicode+100 行洪泛下 initialize/list/call 成功、shutdown 后 `kill -0` 轮询确认无残留）覆盖；既有 `mcp_e2e` 14 例与 `tools` 单元保持。
