@@ -1,0 +1,7 @@
+data: {"id":"chatcmpl-compat","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-compat","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_c","type":"function","function":{"name":"shell","arguments":"{\"command\": \"ls\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-compat","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":9}}
+
+: end (comment carries no event; terminated so the file ends with a non-blank line)

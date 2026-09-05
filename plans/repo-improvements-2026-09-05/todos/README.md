@@ -20,7 +20,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 
 ## 文件
 
-1. [01-sse-stream-integrity.md](01-sse-stream-integrity.md) — 待执行。依赖：无。
+1. [01-sse-stream-integrity.md](done/01-sse-stream-integrity.md) — 已完成，已归档。依赖：无。
 2. [done/02-session-io-recovery.md](done/02-session-io-recovery.md) ✅ — 完成。有界字节读取（header 64KiB/单行 96MiB/总量 256MiB），错误只带路径/行号/约束；坏正文保留合法前缀并物理修复，缺换行尾规范化后可追加，超预算原文件不动；新增 `Session::append_batch`（签名与语义见归档文件完成记录），非法零落盘、IO 失败回退旧长度+旧内存、symlink 双向拒绝；tmp 任一失败清理，备份创建即 0600、精确归属、每会话 5 份。依赖：无。
 3. [03-agent-turn-continuation.md](03-agent-turn-continuation.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery。
 4. [done/04-plugin-settings-recovery.md](done/04-plugin-settings-recovery.md) ✅ — 完成。settings 三态（未表态 / 白名单 / 显式空白名单）在合并、serde 往返与 enable/disable 全入口保留：`[]` 后 enable 写入白名单、禁用最后一项保持白名单模式、低层白名单被高层清空后仍禁用其他名字；read_layer 1 MiB 有界读取，超限 / 坏 JSON / IO 错误均指向对应层文件且原文件不变；移除 `.replaced-*` 无条件清扫，成功替换只清自己的备份、失败仍回滚，list / auto-update / discovery 扫描排除 `.replaced-*` 与 `.tmp-install` 内部目录。依赖：无。

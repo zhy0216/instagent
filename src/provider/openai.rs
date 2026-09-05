@@ -19,9 +19,10 @@
 //!    flush 时兜底）。
 //!
 //! 流式组装说明：`StreamEvent::ToolUseDelta` 不带 id，并行 tool_calls 的
-//! arguments 又会按 index 交错到达，所以 tool 事件在流结束（`[DONE]` /
-//! 断流）时按 index 升序整组 flush（Start→Delta→End），文本 delta 即时透传。
-//! 构造入参 = provider JSON 定义，供 `10` registry 调用。
+//! arguments 又会按 index 交错到达，所以 tool 事件在正常结束（`[DONE]` /
+//! 非空 finish_reason 的 EOF）时按 index 升序整组 flush（Start→Delta→End），
+//! 文本 delta 即时透传；无任何完成信息的 EOF 按断流报错，不 flush 待发工具
+//! （完整参数也不自动执行）。构造入参 = provider JSON 定义，供 `10` registry 调用。
 //!
 //! 图片请求预算（todo 13 / S15 最小行为）：每次请求对历史图片先去重
 //! （相同内容只内嵌首次出现），解码字节总和仍超 [`REQUEST_IMAGE_BUDGET`]
@@ -410,17 +411,36 @@ fn format_tools(tools: &[ToolSpec]) -> crate::Result<Vec<Value>> {
 // [`crate::provider::shared::sse_to_stream_events`]）
 // ---------------------------------------------------------------------------
 
+/// 单响应文本累计预算（字节）：即时透传的 TextDelta 同样有界，超限以错误
+/// 终止流，给出有界、无原始载荷的诊断（plan P03：响应文本独立有限预算；
+/// 取与累计工具参数同量级，远低于会话单消息预算）。
+pub const MAX_RESPONSE_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 单响应累计工具参数预算（字节）：`delta.tool_calls[].function.arguments`
+/// 跨 index 求和，超限以错误终止流，不静默截成另一份有效 JSON
+/// （plan 预算默认 8 MiB，P03）。
+pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024 * 1024;
+
+/// 单响应工具调用数上限（按 `index` 去重计数）：超限以错误终止流
+/// （plan 预算默认 256，P03）。
+pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 256;
+
 /// openai 引擎流状态：共享 [`StreamState`] + usage 累积
 /// （tool_calls 按 `delta.tool_calls[].index` 累积，第二版 §6 风险 1）。
 #[derive(Debug, Default)]
 struct OpenAiStreamState {
     st: StreamState,
     usage: Usage,
+    /// 已透传的响应文本字节数（受 [`MAX_RESPONSE_TEXT_BYTES`] 约束）。
+    text_bytes: usize,
+    /// 已累积的工具参数字节数（受 [`MAX_TOOL_ARGUMENTS_BYTES`] 约束）。
+    args_bytes: usize,
 }
 
 impl OpenAiStreamState {
     /// 单个流式 chunk：文本即时出 TextDelta，tool_calls 按 index 累积，
     /// usage / finish_reason 记录到最后（`Done` 在收尾钩子统一发）。
+    /// 文本与参数超预算直接返回有界错误（不截断不断言有效 JSON）。
     fn apply_chunk(&mut self, chunk: &Value) -> Result<(), ProviderError> {
         if let Some(err) = stream_error_from_chunk(chunk) {
             return Err(err);
@@ -446,13 +466,19 @@ impl OpenAiStreamState {
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
+                if self.text_bytes.saturating_add(text.len()) > MAX_RESPONSE_TEXT_BYTES {
+                    return Err(ProviderError::Transport(format!(
+                        "response text exceeds budget of {MAX_RESPONSE_TEXT_BYTES} bytes; terminating stream"
+                    )));
+                }
+                self.text_bytes += text.len();
                 self.st
                     .out
                     .push_back(Ok(StreamEvent::TextDelta(text.to_string())));
             }
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            accumulate_tool_calls(&mut self.st.tools, calls);
+            accumulate_tool_calls(&mut self.st.tools, &mut self.args_bytes, calls)?;
         }
         Ok(())
     }
@@ -469,8 +495,8 @@ impl StreamEngine for OpenAiStreamState {
 
     fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
         if is_done(ev) {
-            self.finalize();
-            return Ok(());
+            self.st.done = true;
+            return self.finalize();
         }
         match parse_chunk(ev)? {
             Some(chunk) => self.apply_chunk(&chunk),
@@ -478,10 +504,19 @@ impl StreamEngine for OpenAiStreamState {
         }
     }
 
-    /// `[DONE]` / 断流收尾：tool 事件按 index 升序整组 flush，再发 `Done`。
-    fn finalize(&mut self) {
+    /// `[DONE]` / EOF 收尾：有完成信息（`[DONE]` 或非空 finish_reason）时
+    /// tool 事件按 index 升序整组 flush，再发 `Done`（usage 保留，只发一次）；
+    /// 无任何完成信息的 EOF 报断流错误，不 flush 待发工具（完整参数也不因
+    /// EOF 自动执行），不发 `Done`。
+    fn finalize(&mut self) -> Result<(), ProviderError> {
         if self.st.ended {
-            return;
+            return Ok(());
+        }
+        if self.st.stop.is_none() && !self.st.done {
+            return Err(ProviderError::Transport(
+                "stream ended without completion signal ([DONE] or finish_reason); terminating stream"
+                    .into(),
+            ));
         }
         self.st.ended = true;
         let stop_reason = match self.st.stop.as_deref() {
@@ -505,6 +540,7 @@ impl StreamEngine for OpenAiStreamState {
             usage: self.usage,
             stop_reason,
         }));
+        Ok(())
     }
 }
 
@@ -520,13 +556,25 @@ fn sse_to_stream_events(
 
 /// SSE delta parser：`delta.tool_calls[]` 按 `index` 累积进待发工具表
 /// （第二版 §6 风险 1）。`index` 缺省时退化为数组内位置；id / name 取首个
-/// 非空值，arguments 增量拼接（可能缺省 / null）。
-fn accumulate_tool_calls(tools: &mut BTreeMap<i64, PendingCall>, calls: &[Value]) {
+/// 非空值，arguments 增量拼接（可能缺省 / null）。调用数与累计参数受
+/// [`MAX_TOOL_CALLS_PER_RESPONSE`] / [`MAX_TOOL_ARGUMENTS_BYTES`] 约束：
+/// 超限返回有界、无载荷的错误并终止流，不静默丢弃增量（否则会拼出另一份
+/// 有效 JSON）。
+fn accumulate_tool_calls(
+    tools: &mut BTreeMap<i64, PendingCall>,
+    args_bytes: &mut usize,
+    calls: &[Value],
+) -> Result<(), ProviderError> {
     for (position, call) in calls.iter().enumerate() {
         let index = call
             .get("index")
             .and_then(Value::as_i64)
             .unwrap_or(position as i64);
+        if !tools.contains_key(&index) && tools.len() >= MAX_TOOL_CALLS_PER_RESPONSE {
+            return Err(ProviderError::Transport(format!(
+                "tool call count exceeds budget of {MAX_TOOL_CALLS_PER_RESPONSE}; terminating stream"
+            )));
+        }
         let pending = tools.entry(index).or_default();
         if let Some(id) = call.get("id").and_then(Value::as_str) {
             if !id.is_empty() && pending.id.is_empty() {
@@ -542,10 +590,18 @@ fn accumulate_tool_calls(tools: &mut BTreeMap<i64, PendingCall>, calls: &[Value]
             }
         }
         // arguments 可能缺省 / null（goose 的 delta 测试覆盖过）。
+        // 先查预算再拼接：超限不缓冲、不截断，直接错误终止。
         if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+            if args_bytes.saturating_add(args.len()) > MAX_TOOL_ARGUMENTS_BYTES {
+                return Err(ProviderError::Transport(format!(
+                    "tool arguments exceed cumulative budget of {MAX_TOOL_ARGUMENTS_BYTES} bytes; terminating stream"
+                )));
+            }
+            *args_bytes += args.len();
             pending.arguments.push_str(args);
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -581,13 +637,18 @@ fn map_stop_reason(reason: Option<&str>) -> StopReason {
 
 /// usage 映射（goose get_usage 同构）：prompt→input、completion→output、
 /// `prompt_tokens_details.cached_tokens`→cache_read、
-/// `cache_creation_input_tokens`→cache_write。
+/// `cache_creation_input_tokens`→cache_write。u64→u32 用饱和转换：
+/// 极大 usage 取 `u32::MAX`，不得回绕成小值绕过压缩阈值（P04）。
 fn usage_from_chunk(chunk: &Value) -> Option<Usage> {
     let usage = chunk.get("usage")?;
     if !usage.is_object() {
         return None;
     }
-    let token = |v: Option<&Value>| v.and_then(Value::as_u64).unwrap_or(0) as u32;
+    let token = |v: Option<&Value>| {
+        v.and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    };
     Some(Usage {
         input: token(usage.get("prompt_tokens")),
         output: token(usage.get("completion_tokens")),
@@ -1104,6 +1165,236 @@ mod tests {
         );
     }
 
+    // ---- T2 · 完成/断流区分与资源边界 ----
+
+    /// 原始 SSE 文本 → 含 Err 的完整产出（错误本身是最后一个元素；错误即终止）。
+    async fn run_sse_results(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut parser = SseParser::default();
+        let events = parser.feed(text).expect("用例 SSE 字节合法");
+        let input: BoxStream<'static, crate::Result<SseEvent>> =
+            fstream::iter(events.into_iter().map(Ok)).boxed();
+        let mut stream = sse_to_stream_events(input);
+        let mut out = Vec::new();
+        while let Some(ev) = stream.next().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fixture_finish_reason_without_done_is_compatible() {
+        // fixture 末尾以已终止的 `: end` 注释行收尾而非空行：注释不产生事件，
+        // 且避免新文件以空行结尾触发 `git diff --check`。
+        let (sse, expected) = fixture_pair("finish_no_done");
+        let got: Vec<Value> = run_sse(&sse).await.iter().map(event_to_json).collect();
+        assert_eq!(Value::Array(got), expected);
+    }
+
+    #[tokio::test]
+    async fn eof_text_without_completion_is_truncated_error() {
+        let out = run_sse_results(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+        )
+        .await;
+        // 无 finish_reason、无 [DONE]：单个断流错误，无 TextDelta 透传之外的事件、无 Done。
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].as_ref().unwrap(),
+            &StreamEvent::TextDelta("partial".into())
+        );
+        assert!(
+            matches!(&out[1], Err(ProviderError::Transport(m)) if m.contains("completion signal")),
+            "{:?}",
+            out[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_complete_tool_args_without_completion_never_executes() {
+        // 参数已是完整 JSON，但无 finish_reason、无 [DONE]：不得 flush 成可执行调用。
+        let delta = serde_json::to_string(&json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "c1",
+                    "function": {"name": "shell", "arguments": "{\"command\": \"ls\"}"}
+                }]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let out = run_sse_results(&format!("data: {delta}\n\n")).await;
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0], Err(ProviderError::Transport(m)) if m.contains("completion signal")),
+            "{:?}",
+            out[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn done_without_finish_reason_flushes_and_keeps_usage() {
+        // [DONE] 本身是完成信号：待发工具照常 flush，有效终止后的 usage 保留。
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = run_sse(sse).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("hi".into()),
+                StreamEvent::Done {
+                    usage: Usage {
+                        input: 7,
+                        output: 3,
+                        ..Default::default()
+                    },
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn double_done_emits_done_once() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = run_sse(sse).await;
+        // TextDelta + Done；第二个 [DONE] 不再产生 Done，EOF 也不再补发。
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[1], StreamEvent::Done { .. }));
+    }
+
+    #[test]
+    fn usage_huge_values_saturate_without_wrapping() {
+        // 旧 `as u32` 会把 2^32 回绕成 0（绕过压缩阈值）；现在饱和到 u32::MAX。
+        let chunk = json!({"usage": {
+            "prompt_tokens": 4294967296u64,
+            "completion_tokens": 1099511627776u64,
+            "prompt_tokens_details": {"cached_tokens": 18446744073709551615u64},
+            "cache_creation_input_tokens": 1u64,
+        }});
+        let usage = usage_from_chunk(&chunk).expect("usage object");
+        assert_eq!(usage.input, u32::MAX);
+        assert_eq!(usage.output, u32::MAX);
+        assert_eq!(usage.cache_read, u32::MAX);
+        assert_eq!(usage.cache_write, 1);
+    }
+
+    /// 单个 tool delta 事件骨架（不同 index，用于调用数边界）。
+    fn tool_delta_event(index: i64) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"id\":\"c{index}\",\"function\":{{\"name\":\"t\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_call_count_at_budget_succeeds_and_over_fails() {
+        // 恰好 256 个不同 index：按 index 升序 flush + Done。
+        let mut sse: String = (0..MAX_TOOL_CALLS_PER_RESPONSE as i64)
+            .map(tool_delta_event)
+            .collect();
+        sse.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let events = run_sse(&sse).await;
+        assert_eq!(events.len(), MAX_TOOL_CALLS_PER_RESPONSE * 3 + 1);
+        assert!(
+            matches!(&events[0], StreamEvent::ToolUseStart { id, .. } if id == "c0"),
+            "{:?}",
+            events[0]
+        );
+        assert!(matches!(events[events.len() - 1], StreamEvent::Done { .. }));
+
+        // 第 257 个不同 index：错误终止，诊断有界、无 Done、不拼截断 JSON。
+        let mut sse: String = (0..=MAX_TOOL_CALLS_PER_RESPONSE as i64)
+            .map(tool_delta_event)
+            .collect();
+        sse.push_str("data: [DONE]\n\n");
+        let out = run_sse_results(&sse).await;
+        assert_eq!(out.len(), 1);
+        let Err(ProviderError::Transport(msg)) = &out[0] else {
+            panic!("expected Transport, got {:?}", out[0]);
+        };
+        assert!(msg.contains("budget"), "{msg}");
+        assert!(msg.len() < 200, "{msg}");
+    }
+
+    #[tokio::test]
+    async fn cumulative_tool_arguments_at_budget_succeeds_and_over_fails() {
+        // 每事件 512 KiB 参数（< 1 MiB 单事件预算）；16 块恰好 8 MiB：成功。
+        let big = "a".repeat(512 * 1024);
+        let body = serde_json::to_string(&json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "c0",
+                    "function": {"name": "t", "arguments": big}
+                }]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let mut sse: String = (0..16).map(|_| format!("data: {body}\n\n")).collect();
+        sse.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let events = run_sse(&sse).await;
+        assert!(matches!(events[events.len() - 1], StreamEvent::Done { .. }));
+
+        // 再多 1 字节即超限：单个错误终止，无 Done，诊断不带原始载荷。
+        let small = serde_json::to_string(&json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "c0",
+                    "function": {"name": "t", "arguments": "b"}
+                }]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        sse = (0..16).map(|_| format!("data: {body}\n\n")).collect();
+        sse.push_str(&format!("data: {small}\n\ndata: [DONE]\n\n"));
+        let out = run_sse_results(&sse).await;
+        assert_eq!(out.len(), 1);
+        let Err(ProviderError::Transport(msg)) = &out[0] else {
+            panic!("expected Transport, got {:?}", out[0]);
+        };
+        assert!(msg.contains("budget"), "{msg}");
+        assert!(msg.len() < 200, "{msg}");
+        assert!(!msg.contains("aaaa"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn response_text_over_budget_fails_without_truncated_done() {
+        // 每事件 900 KiB 文本（< 1 MiB 单事件预算）；10 块约 8.8 MiB：超限。
+        let body = serde_json::to_string(&json!({
+            "choices": [{
+                "delta": {"content": "t".repeat(900 * 1024)},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let sse: String = (0..10).map(|_| format!("data: {body}\n\n")).collect();
+        let out = run_sse_results(&format!("{sse}data: [DONE]\n\n")).await;
+        // 前 9 块已透传 TextDelta，第 10 块触发预算错误；无 Done、无截断 JSON。
+        assert_eq!(out.len(), 10);
+        assert!(
+            out.iter()
+                .all(|r| !matches!(r, Ok(StreamEvent::Done { .. }))),
+            "{out:?}"
+        );
+        let Some(Err(ProviderError::Transport(msg))) = out.last() else {
+            panic!("expected trailing Transport, got {:?}", out.last());
+        };
+        assert!(msg.contains("budget"), "{msg}");
+        assert!(msg.len() < 200, "{msg}");
+        assert!(!msg.contains("tttt"), "{msg}");
+    }
+
     #[tokio::test]
     async fn in_stream_error_frame_surfaces_as_transport_error() {
         let sse = concat!(
@@ -1112,7 +1403,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut parser = SseParser::default();
-        let events = parser.feed(sse);
+        let events = parser.feed(sse).expect("用例 SSE 字节合法");
         let input: BoxStream<'static, crate::Result<SseEvent>> =
             fstream::iter(events.into_iter().map(Ok)).boxed();
         let mut stream = sse_to_stream_events(input);
@@ -1131,7 +1422,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_chunk_fails_the_stream() {
         let mut parser = SseParser::default();
-        let events = parser.feed("data: {not json}\n\n");
+        let events = parser
+            .feed("data: {not json}\n\n")
+            .expect("用例 SSE 字节合法");
         let input: BoxStream<'static, crate::Result<SseEvent>> =
             fstream::iter(events.into_iter().map(Ok)).boxed();
         let mut stream = sse_to_stream_events(input);
@@ -1554,7 +1847,7 @@ mod tests {
             "y".repeat(2000)
         );
         let mut parser = SseParser::default();
-        let events = parser.feed(&sse);
+        let events = parser.feed(&sse).expect("用例 SSE 字节合法");
         let input: BoxStream<'static, crate::Result<SseEvent>> =
             fstream::iter(events.into_iter().map(Ok)).boxed();
         let mut stream = sse_to_stream_events(input);

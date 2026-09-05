@@ -161,8 +161,10 @@ pub fn require_base_url(def: &ProviderDef) -> Result<&str, ProviderError> {
 pub struct StreamState {
     pub out: VecDeque<Result<StreamEvent, ProviderError>>,
     pub tools: BTreeMap<i64, PendingCall>,
-    /// 记录到的终止原因（openai `finish_reason`）。
+    /// 记录到的终止原因（openai `finish_reason`；空串不算，由引擎过滤）。
     pub stop: Option<String>,
+    /// 已见到 `[DONE]` 终止标记。
+    pub done: bool,
     pub ended: bool,
 }
 
@@ -173,8 +175,11 @@ pub trait StreamEngine: Send {
     fn ended(&mut self) -> &mut bool;
     /// 处理一条 SSE 事件；`Err` 以该错误终止流。
     fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError>;
-    /// `[DONE]` / 断流收尾。
-    fn finalize(&mut self);
+    /// `[DONE]` / EOF 收尾：`Ok` = 有完成信息（`[DONE]` 或非空
+    /// finish_reason），已整组 flush 并发出 Done（实现须自行置 ended：
+    /// `[DONE]` 通常经 `apply` 触发本钩子）；`Err` = EOF 但无任何完成
+    /// 信息，按断流报错，不得把待发工具 flush 成可执行调用。
+    fn finalize(&mut self) -> Result<(), ProviderError>;
 }
 
 /// 空 data 跳过 + JSON parse；畸形块 → `Transport("malformed SSE chunk …")`。
@@ -195,7 +200,9 @@ pub fn parse_chunk(ev: &SseEvent) -> Result<Option<Value>, ProviderError> {
 }
 
 /// 共享 SSE → StreamEvent 驱动器：弹队列 → 查 ended → 取 SSE → 引擎 apply；
-/// 传输错误 / 畸形帧以错误终止流，断流（无终止标记）也走 `finalize`。
+/// 传输错误 / 畸形帧以错误终止流；EOF 调引擎 `finalize` 区分「正常完成」
+/// （`[DONE]` 已见或非空 finish_reason 已收）与「断流」（无任何完成信息 →
+/// 结构化错误，待发工具不成为可执行调用）。
 pub fn sse_to_stream_events<E: StreamEngine + 'static>(
     engine: E,
     events: BoxStream<'static, crate::Result<SseEvent>>,
@@ -223,12 +230,178 @@ pub fn sse_to_stream_events<E: StreamEngine + 'static>(
                     d.engine.out().push_back(Err(to_provider_error(err)));
                     *d.engine.ended() = true;
                 }
-                // 断流（无终止标记）也要收尾，否则 loop 永远等不到 Done。
-                None => d.engine.finalize(),
+                // EOF 收尾：finalize 返回 Err = 断流（无完成信息），
+                // 把错误交给消费者；正常完成时引擎已自行置 ended。
+                None => {
+                    if let Err(err) = d.engine.finalize() {
+                        d.engine.out().push_back(Err(err));
+                    }
+                    *d.engine.ended() = true;
+                }
             }
         }
     })
     .boxed()
+}
+
+// ---------------------------------------------------------------------------
+// 驱动器终止语义测试（T2）：[DONE]、finish_reason EOF、断流三分支。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Usage;
+    use crate::provider::http::is_done;
+    use crate::provider::StopReason;
+    use futures::stream as fstream;
+    use futures::StreamExt;
+
+    /// 测试引擎：`data: tool` 记一个待发工具，`data: finish` 记非空
+    /// finish_reason；finalize 与 openai 引擎同构——有完成信息才
+    /// flush + Done，否则报断流。
+    #[derive(Default)]
+    struct MockEngine {
+        st: StreamState,
+    }
+
+    impl StreamEngine for MockEngine {
+        fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>> {
+            &mut self.st.out
+        }
+
+        fn ended(&mut self) -> &mut bool {
+            &mut self.st.ended
+        }
+
+        fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
+            if is_done(ev) {
+                self.st.done = true;
+                return self.finalize();
+            }
+            match ev.data.as_str() {
+                "tool" => {
+                    self.st.tools.insert(
+                        0,
+                        PendingCall {
+                            id: "id".into(),
+                            name: "t".into(),
+                            arguments: "{}".into(),
+                        },
+                    );
+                }
+                "finish" => self.st.stop = Some("stop".into()),
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<(), ProviderError> {
+            if self.st.ended {
+                return Ok(());
+            }
+            if self.st.stop.is_none() && !self.st.done {
+                return Err(ProviderError::Transport(
+                    "stream ended without completion signal".into(),
+                ));
+            }
+            self.st.ended = true;
+            for (_, call) in std::mem::take(&mut self.st.tools) {
+                self.st.out.push_back(Ok(StreamEvent::ToolUseStart {
+                    id: call.id,
+                    name: call.name,
+                }));
+                self.st
+                    .out
+                    .push_back(Ok(StreamEvent::ToolUseDelta(call.arguments)));
+                self.st.out.push_back(Ok(StreamEvent::ToolUseEnd));
+            }
+            self.st.out.push_back(Ok(StreamEvent::Done {
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            }));
+            Ok(())
+        }
+    }
+
+    fn events(datas: &[&str]) -> BoxStream<'static, crate::Result<SseEvent>> {
+        fstream::iter(
+            datas
+                .iter()
+                .map(|d| {
+                    Ok(SseEvent {
+                        event: None,
+                        data: (*d).to_string(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .boxed()
+    }
+
+    async fn drive(datas: &[&str]) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut stream = sse_to_stream_events(MockEngine::default(), events(datas));
+        let mut out = Vec::new();
+        while let Some(ev) = stream.next().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn done_marker_finalizes_once_and_later_events_ignored() {
+        let out = drive(&["tool", "[DONE]", "tool"]).await;
+        // flush（Start/Delta/End）+ Done；`[DONE]` 后的帧不再消费，Done 只一次。
+        assert_eq!(out.len(), 4);
+        assert!(matches!(out[3], Ok(StreamEvent::Done { .. })));
+        let dones = out
+            .iter()
+            .filter(|r| matches!(r, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(dones, 1);
+    }
+
+    #[tokio::test]
+    async fn eof_without_completion_errors_and_withholds_pending_tools() {
+        let out = drive(&["tool"]).await;
+        // 断流：单个错误，待发工具不 flush、无 Done。
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0], Err(ProviderError::Transport(m)) if m.contains("completion")),
+            "{:?}",
+            out[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_with_finish_reason_is_compatible() {
+        let out = drive(&["tool", "finish"]).await;
+        assert_eq!(out.len(), 4);
+        assert!(matches!(out[3], Ok(StreamEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn transport_error_ends_stream_without_finalize() {
+        let items: Vec<crate::Result<SseEvent>> = vec![
+            Ok(SseEvent {
+                event: None,
+                data: "tool".into(),
+            }),
+            Err(anyhow::Error::new(ProviderError::Transport("boom".into()))),
+        ];
+        let mut stream = sse_to_stream_events(MockEngine::default(), fstream::iter(items).boxed());
+        let mut out = Vec::new();
+        while let Some(ev) = stream.next().await {
+            out.push(ev);
+        }
+        // 传输错误直接冒泡：不 flush、不 finalize。
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0], Err(ProviderError::Transport(m)) if m == "boom"),
+            "{:?}",
+            out[0]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +548,7 @@ pub mod testutil {
         ) -> BoxStream<'static, Result<StreamEvent, ProviderError>>,
     {
         let mut parser = SseParser::default();
-        let events = parser.feed(text);
+        let events = parser.feed(text).expect("fixture SSE 字节合法");
         assert!(parser.buffer.trim().is_empty(), "fixture 必须以空行结尾");
         let input: BoxStream<'static, crate::Result<SseEvent>> =
             fstream::iter(events.into_iter().map(Ok)).boxed();

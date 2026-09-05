@@ -1,6 +1,10 @@
 //! HTTP / SSE / 重试层（第二版 §2.3 http.rs）。
 //!
-//! SSE 按空行切事件、取 `data:` 行、`[DONE]` 结束（hand-roll，不引 eventsource 库）；
+//! SSE 按字节增量解析：跨块保留未完成 UTF-8 字节与未结束行，行结束符
+//! LF / CRLF / CR、开头 BOM、多行 `data:`、`:` 注释按
+//! [WHATWG event stream 解析规则](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)；
+//! `[DONE]` 结束属于本项目 provider 策略，不是通用 SSE 规范
+//! （hand-roll，不引 eventsource 库）。
 //! 重试参数见下方常量（goose `goose-provider-types/src/retry.rs:8~11`）；
 //! `Retry-After` 与 body 的 `retry_after_seconds` 优先且封顶
 //! （移植 goose `goose-providers/src/http_status.rs:47~83`，出处另见 commit message）。
@@ -61,6 +65,10 @@ fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
     delay.min(policy.cap)
 }
 
+/// 单条 SSE 事件的字节预算（进行中事件的字段内容累计）：超限以错误终止流，
+/// 给出有界、不含载荷的诊断，不静默截断成另一份数据（plan 预算默认 1 MiB，P03）。
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
 /// 一条 SSE 事件（`event:` 行可缺省，`data:` 行聚合）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -68,50 +76,158 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// 增量解析器：跨网络块缓冲，按空行切事件。
-#[derive(Debug, Default)]
+/// 增量解析器：按字节跨网络块缓冲，按空行切事件。
+///
+/// 未完成 UTF-8 序列（≤3 字节）与未结束行保留到下一块；行结束符
+/// LF / CRLF / CR、开头 U+FEFF BOM、多行 `data:`、`:` 注释按 WHATWG
+/// event stream 解析规则。进行中事件受 [`MAX_SSE_EVENT_BYTES`] 约束，
+/// 超限返回 `Err`；EOF 时未结束事件不派发（留在缓冲区随解析器丢弃）。
+#[derive(Debug)]
 pub struct SseParser {
+    /// 上一块结尾未完成的 UTF-8 字节（1..=3 字节），等下一块拼齐。
+    pending_utf8: Vec<u8>,
+    /// 上一块以 CR 结尾：下一块若以 LF 开头，属同一 CRLF 行结束。
+    after_cr: bool,
+    /// 流起始位置：开头的 U+FEFF BOM 忽略。
+    at_start: bool,
+    /// 当前未结束行（受事件预算约束）。
     pub buffer: String,
+    /// 进行中事件的 `data:` 行。
+    data_lines: Vec<String>,
+    /// 进行中事件的 `event:` 字段（最后一次出现生效）。
+    event_name: Option<String>,
+    /// 进行中事件已累计的内容字节数。
+    event_bytes: usize,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self {
+            pending_utf8: Vec::new(),
+            after_cr: false,
+            at_start: true,
+            buffer: String::new(),
+            data_lines: Vec::new(),
+            event_name: None,
+            event_bytes: 0,
+        }
+    }
 }
 
 impl SseParser {
-    /// 喂入一个网络块，吐出其中完整的事件；不完整块留在缓冲区。
-    pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
-        self.buffer.push_str(chunk);
-        if self.buffer.contains('\r') {
-            self.buffer = self.buffer.replace("\r\n", "\n");
-        }
+    /// 喂入一个网络块（文本入口，等价于对字节调 [`SseParser::feed_bytes`]），
+    /// 吐出其中完整的事件；不完整事件留在缓冲区。超事件预算返回 `Err`。
+    pub fn feed(&mut self, chunk: &str) -> Result<Vec<SseEvent>, ProviderError> {
+        self.feed_bytes(chunk.as_bytes())
+    }
+
+    /// 喂入一个网络块（字节入口）：未完成 UTF-8 序列保留到下一块，
+    /// 多字节字符跨块切分不产生替换字符。
+    pub fn feed_bytes(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, ProviderError> {
+        let text = self.decode(chunk);
         let mut events = Vec::new();
-        while let Some(idx) = self.buffer.find("\n\n") {
-            let block = self.buffer[..idx].to_owned();
-            self.buffer.drain(..idx + 2);
-            if let Some(ev) = parse_event_block(&block) {
-                events.push(ev);
+        for c in text.chars() {
+            self.consume(c, &mut events)?;
+        }
+        Ok(events)
+    }
+
+    /// UTF-8 增量解码：只解码最长合法前缀，结尾不完整序列保留到下一块；
+    /// 中间出现非法字节时整块按 lossy 降级（与旧 `from_utf8_lossy` 行为兼容）。
+    fn decode(&mut self, chunk: &[u8]) -> String {
+        let bytes: Vec<u8> = if self.pending_utf8.is_empty() {
+            chunk.to_vec()
+        } else {
+            let mut pending = std::mem::take(&mut self.pending_utf8);
+            pending.extend_from_slice(chunk);
+            pending
+        };
+        match std::str::from_utf8(&bytes) {
+            Ok(_) => String::from_utf8(bytes).expect("刚通过 UTF-8 校验"),
+            Err(err) => match err.error_len() {
+                // 结尾是未完成序列：解码合法前缀，尾部字节留到下一块。
+                None => {
+                    let valid = err.valid_up_to();
+                    self.pending_utf8 = bytes[valid..].to_vec();
+                    String::from_utf8_lossy(&bytes[..valid]).into_owned()
+                }
+                // 中间有非法字节：整块 lossy 降级。
+                Some(_) => String::from_utf8_lossy(&bytes).into_owned(),
+            },
+        }
+    }
+
+    fn consume(&mut self, c: char, events: &mut Vec<SseEvent>) -> Result<(), ProviderError> {
+        if self.at_start {
+            self.at_start = false;
+            if c == '\u{FEFF}' {
+                return Ok(());
             }
         }
-        events
+        match c {
+            '\r' => {
+                self.after_cr = true;
+                self.finish_line(events);
+            }
+            '\n' => {
+                if self.after_cr {
+                    // CRLF 配对的 LF：行已在 CR 处结束。
+                    self.after_cr = false;
+                } else {
+                    self.finish_line(events);
+                }
+            }
+            _ => {
+                self.after_cr = false;
+                self.event_bytes += c.len_utf8();
+                if self.event_bytes > MAX_SSE_EVENT_BYTES {
+                    return Err(ProviderError::Transport(format!(
+                        "SSE event exceeds byte budget of {MAX_SSE_EVENT_BYTES}; terminating stream"
+                    )));
+                }
+                self.buffer.push(c);
+            }
+        }
+        Ok(())
     }
-}
 
-/// 解析单个事件块：`data:` 行按 `\n` 聚合，`event:` 取最后一次，
-/// 其余字段（`id:` / `retry:` / `:` 注释）忽略。全空块返回 None。
-fn parse_event_block(block: &str) -> Option<SseEvent> {
-    let mut event = None;
-    let mut data_lines: Vec<&str> = Vec::new();
-    for line in block.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-        } else if let Some(rest) = line.strip_prefix("event:") {
-            event = Some(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
+    /// 一行结束：空行派发进行中事件，`:` 注释丢弃，`data:` / `event:`
+    /// 累积（`event:` 最后一次生效），其余字段（`id:` / `retry:`）忽略。
+    /// 无冒号行按 WHATWG 视为字段名 = 整行、值为空。
+    fn finish_line(&mut self, events: &mut Vec<SseEvent>) {
+        let line = std::mem::take(&mut self.buffer);
+        if line.is_empty() {
+            self.dispatch(events);
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = match line.find(':') {
+            Some(i) => (
+                &line[..i],
+                line[i + 1..].strip_prefix(' ').unwrap_or(&line[i + 1..]),
+            ),
+            None => (line.as_str(), ""),
+        };
+        match field {
+            "data" => self.data_lines.push(value.to_string()),
+            "event" => self.event_name = Some(value.to_string()),
+            _ => {}
         }
     }
-    if data_lines.is_empty() && event.is_none() {
-        return None;
+
+    /// 空行派发：`data:` 行按 `\n` 聚合；无 data 且无 event 的空块不派发。
+    fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
+        self.event_bytes = 0;
+        if self.data_lines.is_empty() && self.event_name.is_none() {
+            return;
+        }
+        events.push(SseEvent {
+            event: self.event_name.take(),
+            data: self.data_lines.drain(..).collect::<Vec<_>>().join("\n"),
+        });
     }
-    Some(SseEvent {
-        event,
-        data: data_lines.join("\n"),
-    })
 }
 
 /// `data: [DONE]` 结束标记。
@@ -230,20 +346,21 @@ fn parse_body_json(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or(Value::Null)
 }
 
-/// 字节流 → SSE 事件流：跨块喂 [`SseParser`]，传输错误以
-/// [`ProviderError::Transport`] 作为最后一个元素冒泡。
+/// 字节流 → SSE 事件流：按字节跨块喂 [`SseParser`]（未完成 UTF-8 / 未结束行
+/// 跨块保留），传输错误与预算错误以 [`ProviderError`] 作为最后一个元素冒泡；
+/// EOF 时 parser 中未结束的事件不派发。
 fn event_stream(resp: reqwest::Response) -> BoxStream<'static, crate::Result<SseEvent>> {
     struct State {
-        chunks: BoxStream<'static, crate::Result<String>>,
+        chunks: BoxStream<'static, crate::Result<Vec<u8>>>,
         parser: SseParser,
         pending: VecDeque<SseEvent>,
         finished: bool,
     }
-    let chunks: BoxStream<'static, crate::Result<String>> = resp
+    let chunks: BoxStream<'static, crate::Result<Vec<u8>>> = resp
         .bytes_stream()
         .map(|chunk| {
             chunk
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map(|bytes| bytes.to_vec())
                 .map_err(|e| anyhow::Error::new(ProviderError::Transport(e.to_string())))
         })
         .boxed();
@@ -262,7 +379,13 @@ fn event_stream(resp: reqwest::Response) -> BoxStream<'static, crate::Result<Sse
                 return None;
             }
             match st.chunks.next().await {
-                Some(Ok(text)) => st.pending.extend(st.parser.feed(&text)),
+                Some(Ok(bytes)) => match st.parser.feed_bytes(&bytes) {
+                    Ok(events) => st.pending.extend(events),
+                    Err(err) => {
+                        st.finished = true;
+                        return Some((Err(err.into()), st));
+                    }
+                },
                 Some(Err(e)) => {
                     st.finished = true;
                     return Some((Err(e), st));
@@ -412,52 +535,142 @@ mod tests {
 
     // ---- SSE 解析 ----
 
+    fn ev(event: Option<&str>, data: &str) -> SseEvent {
+        SseEvent {
+            event: event.map(str::to_string),
+            data: data.to_string(),
+        }
+    }
+
     #[test]
     fn sse_parses_multiple_events_and_splits_across_chunks() {
         let mut parser = SseParser::default();
-        let mut events = parser.feed("data: {\"a\":1}\n\ndata: {\"b\"");
-        assert_eq!(
-            events,
-            vec![SseEvent {
-                event: None,
-                data: "{\"a\":1}".into()
-            }]
-        );
-        events.extend(parser.feed(":2}\n\nevent: ping\ndata: {}\n\n"));
+        let mut events = parser.feed("data: {\"a\":1}\n\ndata: {\"b\"").unwrap();
+        assert_eq!(events, vec![ev(None, "{\"a\":1}")]);
+        events.extend(parser.feed(":2}\n\nevent: ping\ndata: {}\n\n").unwrap());
         assert_eq!(
             events,
             vec![
-                SseEvent {
-                    event: None,
-                    data: "{\"a\":1}".into()
-                },
-                SseEvent {
-                    event: None,
-                    data: "{\"b\":2}".into()
-                },
-                SseEvent {
-                    event: Some("ping".into()),
-                    data: "{}".into()
-                },
+                ev(None, "{\"a\":1}"),
+                ev(None, "{\"b\":2}"),
+                ev(Some("ping"), "{}")
             ]
         );
-        // 残留：不完整的最后一个块不吐出。
+        // 残留：不完整的最后一个块不吐出，留在未结束行缓冲。
         let mut tail = SseParser::default();
-        assert!(tail.feed("data: partial").is_empty());
+        assert!(tail.feed("data: partial").unwrap().is_empty());
         assert_eq!(tail.buffer, "data: partial");
     }
 
     #[test]
     fn sse_multi_line_data_and_crlf_and_comments() {
         let mut parser = SseParser::default();
-        let events = parser.feed(": keepalive\r\ndata: line1\r\ndata: line2\r\n\r\n");
+        let events = parser
+            .feed(": keepalive\r\ndata: line1\r\ndata: line2\r\n\r\n")
+            .unwrap();
+        assert_eq!(events, vec![ev(None, "line1\nline2")]);
+    }
+
+    #[test]
+    fn sse_multibyte_chars_identical_at_every_byte_split_point() {
+        // 中文 / emoji / BOM / CRLF：在每个字节切分点分两块喂，产物与整块一致。
+        let body = "\u{FEFF}data: 中文🙂\r\ndata: 继续\r\n\r\nevent: ping\r\ndata: [DONE]\r\n\r\n";
+        let mut whole = SseParser::default();
+        let expected = whole.feed(body).unwrap();
         assert_eq!(
-            events,
-            vec![SseEvent {
-                event: None,
-                data: "line1\nline2".into()
-            }]
+            expected,
+            vec![ev(None, "中文🙂\n继续"), ev(Some("ping"), "[DONE]")]
         );
+        let bytes = body.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut parser = SseParser::default();
+            let mut events = parser.feed_bytes(&bytes[..split]).unwrap();
+            events.extend(parser.feed_bytes(&bytes[split..]).unwrap());
+            assert_eq!(events, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn sse_cr_only_line_endings_and_cr_lf_split_across_chunks() {
+        // 纯 CR 行结束符（WHATWG）：CR 即一行。
+        let mut parser = SseParser::default();
+        let events = parser.feed("data: a\rdata: b\r\rdata: c\n\n").unwrap();
+        assert_eq!(events, vec![ev(None, "a\nb"), ev(None, "c")]);
+        // CR 在前块结尾、LF 在后块开头：同一 CRLF 行结束，不产生空行。
+        let mut parser = SseParser::default();
+        let mut events = parser.feed("data: x\r").unwrap();
+        assert!(events.is_empty());
+        events.extend(parser.feed("\ndata: y\r\n\r\n").unwrap());
+        assert_eq!(events, vec![ev(None, "x\ny")]);
+        // CR 后块开头不是 LF：两个独立行。
+        let mut parser = SseParser::default();
+        let mut events = parser.feed("data: x\r").unwrap();
+        events.extend(parser.feed("data: y\r\n\r\n").unwrap());
+        assert_eq!(events, vec![ev(None, "x\ny")]);
+    }
+
+    #[test]
+    fn sse_leading_bom_ignored_only_at_stream_start() {
+        let mut parser = SseParser::default();
+        let events = parser.feed("\u{FEFF}data: hi\n\n").unwrap();
+        assert_eq!(events, vec![ev(None, "hi")]);
+        // BOM 字节跨块切开同样被忽略。
+        let bytes = "\u{FEFF}data: hi\n\n".as_bytes();
+        for split in 1..=3 {
+            let mut parser = SseParser::default();
+            let mut events = parser.feed_bytes(&bytes[..split]).unwrap();
+            events.extend(parser.feed_bytes(&bytes[split..]).unwrap());
+            assert_eq!(events, vec![ev(None, "hi")], "BOM split at {split}");
+        }
+        // 流中间的 BOM 不是 BOM：该行不再是 data 字段（忽略）。
+        let mut parser = SseParser::default();
+        let events = parser.feed("data: a\n\n\u{FEFF}data: b\n\n").unwrap();
+        assert_eq!(events, vec![ev(None, "a")]);
+    }
+
+    #[test]
+    fn sse_invalid_utf8_falls_back_to_lossy_like_before() {
+        let mut parser = SseParser::default();
+        let events = parser.feed_bytes(b"data: a\xFFb\n\n").unwrap();
+        assert_eq!(events, vec![ev(None, "a\u{FFFD}b")]);
+    }
+
+    #[test]
+    fn sse_incomplete_event_at_eof_is_not_dispatched() {
+        let mut parser = SseParser::default();
+        let events = parser.feed("data: done\n\ndata: partial").unwrap();
+        assert_eq!(events, vec![ev(None, "done")]);
+        // EOF（解析器被丢弃）：partial 永不派发，未结束行留在缓冲区。
+        assert_eq!(parser.buffer, "data: partial");
+    }
+
+    #[test]
+    fn sse_single_event_budget_enforced_on_unterminated_input() {
+        // 无换行大输入：累计到预算内不报错（缓冲），再超 1 字节即错误终止。
+        let mut parser = SseParser::default();
+        let fill = "x".repeat(MAX_SSE_EVENT_BYTES - 6); // "data: " 前缀占 6 字节
+        assert!(parser.feed(&format!("data: {fill}")).unwrap().is_empty());
+        let err = parser.feed("y").unwrap_err();
+        let ProviderError::Transport(msg) = err else {
+            panic!("expected Transport, got {err:?}");
+        };
+        assert!(msg.contains("budget"), "{msg}");
+        // 诊断有界且不含原始载荷。
+        assert!(msg.len() < 200, "{msg}");
+        assert!(!msg.contains("xxx"), "{msg}");
+        // 恰好到预算的事件仍可完整派发。
+        let mut parser = SseParser::default();
+        let events = parser.feed(&format!("data: {fill}\n\n")).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data.len(), MAX_SSE_EVENT_BYTES - 6);
+    }
+
+    #[test]
+    fn sse_no_colon_data_field_appends_empty_line() {
+        // WHATWG：无冒号行按字段名=整行、值空处理；`data` 追加空行。
+        let mut parser = SseParser::default();
+        let events = parser.feed("data\ndata: b\n\n").unwrap();
+        assert_eq!(events, vec![ev(None, "\nb")]);
     }
 
     #[test]
@@ -738,5 +951,63 @@ mod tests {
         assert!(message.chars().count() <= ERROR_SUMMARY_CHARS, "{message}");
         assert!(message.contains("sk-[redacted]"), "{message}");
         assert!(!message.contains("sk-topsecretkey99"), "{message}");
+    }
+
+    // ---- 本地 HTTP 字节分块（多字节字符强制切在块边界） ----
+
+    /// 裸 TCP fixture server：200 SSE 响应，body 在指定字节处拆成两段、
+    /// 间隔发送，强制客户端跨块观察（不依赖网络包恰好如何合并）。
+    async fn serve_sse_in_two_parts(part1: &[u8], part2: &[u8]) -> std::net::SocketAddr {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let part1 = part1.to_vec();
+        let part2 = part2.to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.set_nodelay(true).unwrap();
+            // 读到请求头结束再响应（请求内容不参与校验）。
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 512];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                part1.len() + part2.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&part1).await.unwrap();
+            sock.flush().await.unwrap();
+            // 间隔保证两段分别到达客户端（分块是测试意图，非掩盖失败）。
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sock.write_all(&part2).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn post_sse_reassembles_multibyte_split_across_network_chunks() {
+        // BOM + CRLF + 中文/emoji；切分点选在「中」的 UTF-8 首字节之后。
+        let body = "\u{FEFF}data: {\"t\":\"中文🙂\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let bytes = body.as_bytes();
+        let split = body.find('中').unwrap() + 1; // E4 | B8 AD
+        let addr = serve_sse_in_two_parts(&bytes[..split], &bytes[split..]).await;
+
+        let mut stream = test_client()
+            .post_sse(
+                &format!("http://{addr}/sse"),
+                &BTreeMap::new(),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let events = collect_until_done(&mut stream).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, "{\"t\":\"中文🙂\"}");
+        assert!(is_done(&events[1]));
     }
 }
