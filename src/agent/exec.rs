@@ -34,9 +34,11 @@ use crate::hooks::HookDecision;
 use crate::hooks::HookEvent;
 use crate::message::Content;
 use crate::message::Message;
+use crate::message::Role;
 use crate::message::INTERRUPTED_TEXT;
 use crate::session::Session;
 use crate::tools::CallCapability;
+use crate::tools::ImageData;
 use crate::tools::ToolCall;
 use crate::tools::ToolCtx;
 use crate::tools::ToolKind;
@@ -92,10 +94,21 @@ impl Agent {
                 continue;
             }
             // hook 触发点：PreToolUse 在调用之前；阻止 → is_error 结果，工具不执行。
+            // 等待受 token 约束：取消则 drop hook future（子进程经 kill_on_drop
+            // 回收），该调用记 interrupted，后续调用走上面的取消分支。
             if let Some(hooks) = &self.hooks {
                 let hook_ctx = hook_ctx(session, HookEvent::PreToolUse)
                     .with_tool(call.name.clone(), Some(call.input.clone()));
-                if let HookDecision::Block(reason) = hooks.run(&hook_ctx).await {
+                let decision = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    decision = hooks.run(&hook_ctx) => Some(decision),
+                };
+                let Some(decision) = decision else {
+                    dispositions.push(Disposition::Finished(Content::interrupted(call)));
+                    continue;
+                };
+                if let HookDecision::Block(reason) = decision {
                     let text = format!("blocked by PreToolUse hook: {reason}");
                     event::emit(
                         events,
@@ -114,7 +127,16 @@ impl Agent {
                     continue;
                 }
             }
-            let cap = self.tools.capability(call).await;
+            // 工具 inventory（`capability` 内做 `list` 枚举）等待受 token 约束：
+            // 取消则 drop 等待 future，该调用记 interrupted。
+            let cap = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    dispositions.push(Disposition::Finished(Content::interrupted(call)));
+                    continue;
+                }
+                cap = self.tools.capability(call) => cap,
+            };
             dispositions.push(Disposition::Ready {
                 call: call.clone(),
                 cap,
@@ -166,6 +188,8 @@ impl Agent {
                         out = self.tools.call(call, &ctx) => out,
                     };
                     // 图片预算（todo 13）：超限不附上，结果文本带可操作提示。
+                    // 图片校验（A01）：先过消息校验核心再进入结果；坏图片丢弃并
+                    // 转成可诊断的错误结果，不让 session 落盘失败、毒化下一轮。
                     let mut kept_image = None;
                     if let Some(img) = output.image.take() {
                         match reserve_image_bytes(
@@ -173,7 +197,18 @@ impl Agent {
                             img.decoded_bytes(),
                             SESSION_IMAGE_BUDGET,
                         ) {
-                            Ok(()) => kept_image = Some(img),
+                            Ok(()) => match image_validation_note(call, &img) {
+                                None => kept_image = Some(img),
+                                Some(note) => {
+                                    output.text.push_str(
+                                        "\n\n[image omitted: tool image output failed \
+                                         validation and was not attached: ",
+                                    );
+                                    output.text.push_str(&note);
+                                    output.text.push(']');
+                                    output.is_error = true;
+                                }
+                            },
                             Err(note) => output.text.push_str(&note),
                         }
                     }
@@ -187,12 +222,18 @@ impl Agent {
                         },
                     )
                     .await;
-                    // hook 触发点：PostToolUse 观察事件，决策忽略。
+                    // hook 触发点：PostToolUse 观察事件，决策忽略。等待受 token
+                    // 约束：取消则 drop hook future（子进程经 kill_on_drop 回收），
+                    // 结果照常落盘（工具已执行完）。
                     if let Some(hooks) = &self.hooks {
                         let hook_ctx = hook_ctx(session, HookEvent::PostToolUse)
                             .with_tool(call.name.clone(), Some(call.input.clone()))
                             .with_tool_output(output.text.clone());
-                        let _ = hooks.run(&hook_ctx).await;
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {}
+                            _ = hooks.run(&hook_ctx) => {}
+                        }
                     }
                     // 图片块与 ToolResult 进同一条 user 消息（结果在前）。
                     let mut blocks = vec![Content::tool_result(call, output)];
@@ -273,6 +314,40 @@ fn session_image_bytes(messages: &[Message]) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// 工具图片进入结果前的校验（A01）：用既有消息校验核心在最小合成历史上
+/// 验证该图片，复用 mime / canonical base64 / 尺寸约束，不回显图片数据。
+/// 返回 `None` = 合法可附上；`Some(note)` = 脱敏诊断，调用方丢弃图片并把
+/// note 写进错误 ToolResult（不让坏图片毒化会话落盘）。
+fn image_validation_note(call: &ToolCall, image: &ImageData) -> Option<String> {
+    let probe = vec![
+        Message::user_text("probe".to_string()),
+        Message::assistant(
+            vec![Content::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            }],
+            None,
+        ),
+        Message {
+            role: Role::User,
+            content: vec![
+                Content::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: "probe".to_string(),
+                    is_error: false,
+                },
+                Content::Image(image.clone()),
+            ],
+            ts: 0,
+            usage: None,
+        },
+    ];
+    crate::message::validate(&probe)
+        .err()
+        .map(|err| format!("{err:#}"))
 }
 
 /// 原子地预留图片字节预算：接受则累计，超限返回可操作提示。CAS 防同 turn

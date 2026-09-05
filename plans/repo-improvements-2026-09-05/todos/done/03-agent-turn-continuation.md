@@ -53,3 +53,43 @@ cargo test
 ```
 
 一个本地 commit。完成记录注明 compact 的可取消 API；CLI 接线和 CLI e2e 留给 08，不改 CLI 或事件枚举。
+
+## 完成记录（2026-09-05）
+
+实现：`src/agent/mod.rs`、`src/agent/exec.rs`、`src/agent/compact.rs` + 新增
+`tests/agent_continuation.rs`（21 项库行为测试）。
+
+- T1：`run_turn` 在 PreToolUse/ToolStart/`execute_calls` 前用
+  `message::validate_for_append` 同一核心校验 assistant 与历史（重复/历史复用
+  ID、空 ID/name、错位块），非法零副作用错出（不跑 hook、不执行工具、不落盘，
+  附 `Event::Error`）；malformed JSON 照旧走 ToolResult 流程。工具图片先经合成
+  最小历史的校验核心探针（复用 mime/canonical base64/尺寸约束，不回显数据），
+  坏图丢弃并转成带脱敏诊断的错误结果。`finish_turn` 改批量 `append_batch`。
+- T2：`prepare_input`——末尾 assistant 正常 append，末尾 user（摘要/未回答输入/
+  ToolResult/nudge）把新文本作新 Text 块并入原 content 后原子 rewrite，顺序保留；
+  预取消在 hook/写文件前直接 `Interrupted`（零写入零 hook），修正旧"预取消
+  touches nothing"用例的错误预期（1 条 user → 0 条 + 仅 header 落盘）。
+- T3：inventory（`stream_assistant` 的 `list`、`capability`）、UserPromptSubmit/
+  Pre/Post/Stop hooks、`maybe/force` 压缩的等待全部进 `select!` 受 token 约束，
+  取消即 drop 等待 future（hook/工具子进程经既有进程组 + `kill_on_drop` 回收）；
+  `summarize` 只接受非空且收到 Done 的输出，空/缺 Done/提供方错误返回 `Err`
+  且不 rewrite，取消按 no-op（`Ok(None)`）处理、不误报截断。overflow 仅重试一次、
+  只读并发上限、`STOP_BLOCK_LIMIT` 语义不变（由 `src/agent` 内既有单测锁定）。
+
+供 08 使用的可取消 API（`crate::agent::compact`，旧 `maybe`/`force` 为永不取消的
+兼容包装，签名不变，`cli/repl.rs` 的 `/compact` 调用不受影响）：
+
+```rust
+pub async fn maybe_cancelable(agent: &Agent, session: &mut Session, events: &mpsc::Sender<Event>, cancel: &CancellationToken) -> crate::Result<bool>
+pub async fn force_cancelable(agent: &Agent, session: &mut Session, events: &mpsc::Sender<Event>, cancel: &CancellationToken) -> crate::Result<bool> // true = 发生了 rewrite
+```
+
+`force_cancelable` 取消/无可压缩历史返回 `Ok(false)`（不改会话、不发事件），
+摘要失败返回 `Err`（同样不改会话）；调用方凭返回值或 token 区分 no-op 与成功。
+
+校验：`cargo test agent`（lib agent 41 项）、`cargo fmt --check`、
+`cargo clippy --all-targets -- -D warnings`、
+`env -u TOKEN_PLAN_API_KEY cargo test` 全绿（lib 451、agent_continuation 21、
+cli_e2e 15、live_e2e 10 skip、mcp_e2e 14、provider_proxy 15、session_recovery 9；
+预置 `TOKEN_PLAN_API_KEY` 时 live 走真实网络超时，系环境限制）。CLI 接线和
+CLI e2e 留给 08；未实施 RM05 有状态 hook 调度重构。

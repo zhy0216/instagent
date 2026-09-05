@@ -9,6 +9,7 @@
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::event::Event;
 use crate::agent::prompt;
@@ -80,10 +81,42 @@ pub fn should_compact(usage: &Usage, context_limit: u32, threshold: f32) -> bool
 }
 
 /// 每轮开头的条件压缩；发生则返回 true 并发 Event::Compacted。
+///
+/// 兼容包装（取消语义见 [`maybe_cancelable`]）：用永不取消的 token 调用，
+/// 行为与旧 `maybe` 一致。`08` 接线 CLI 取消时请用 [`maybe_cancelable`]。
 pub async fn maybe(
     agent: &Agent,
     session: &mut Session,
     events: &mpsc::Sender<Event>,
+) -> crate::Result<bool> {
+    maybe_cancelable(agent, session, events, &CancellationToken::new()).await
+}
+
+/// ContextOverflow / `/compact` 的强制压缩。
+///
+/// 兼容包装（取消语义见 [`force_cancelable`]）：用永不取消的 token 调用，
+/// 行为与旧 `force` 一致（摘要空/缺 Done 照样报错、不改会话）。
+/// `08` 接线 CLI 取消时请用 [`force_cancelable`]。
+pub async fn force(
+    agent: &Agent,
+    session: &mut Session,
+    events: &mpsc::Sender<Event>,
+) -> crate::Result<()> {
+    force_cancelable(agent, session, events, &CancellationToken::new())
+        .await
+        .map(|_| ())
+}
+
+/// 可取消的条件压缩（供 `08` 接线 CLI 取消）：
+/// - 取消时不改会话、不发事件，返回 `Ok(false)`；调用方应随后检查 token
+///   并按 `Interrupted` 收尾（`run_turn` 已如此处理）；
+/// - 阈值未命中返回 `Ok(false)`；发生压缩返回 `Ok(true)`；
+/// - 摘要失败（提供方错误 / 缺 Done / 空文本）返回 `Err`，同样不改会话。
+pub async fn maybe_cancelable(
+    agent: &Agent,
+    session: &mut Session,
+    events: &mpsc::Sender<Event>,
+    cancel: &CancellationToken,
 ) -> crate::Result<bool> {
     let Some(usage) = last_usage_needing_compaction(session) else {
         return Ok(false);
@@ -95,18 +128,23 @@ pub async fn maybe(
     ) {
         return Ok(false);
     }
-    force(agent, session, events).await?;
-    Ok(true)
+    force_cancelable(agent, session, events, cancel).await
 }
 
-/// ContextOverflow / `/compact` 的强制压缩。
-pub async fn force(
+/// 可取消的强制压缩（供 `08` 接线 CLI 取消），返回是否发生了 `rewrite`：
+/// - 取消时不改会话、不发事件，返回 `Ok(false)`；调用方用返回值或 token
+///   区分"取消的 no-op"与"成功的压缩"（`run_turn` 在调用后检查 token）；
+/// - 摘要成功后才 `rewrite`（`Ok(true)`）：`summarize` 只接受非空且协议完成
+///   （收到 Done）的输出，空/断流/取消一律不替换历史；
+/// - 取消是调用方动作，不报"provider 截断"，不发 `Event::Error`。
+pub async fn force_cancelable(
     agent: &Agent,
     session: &mut Session,
     events: &mpsc::Sender<Event>,
-) -> crate::Result<()> {
+    cancel: &CancellationToken,
+) -> crate::Result<bool> {
     let Some((head, tail)) = split_head_tail(session) else {
-        return Ok(());
+        return Ok(false);
     };
     let before_tokens = head.iter().rev().find_map(|message| match message {
         Message {
@@ -118,7 +156,10 @@ pub async fn force(
     });
 
     let history = format_history(&head);
-    let (summary, usage) = summarize(agent, session, &history).await?;
+    // 取消 → Ok(false) 做 no-op（调用方看返回值/token）；失败 → Err 且不改会话。
+    let Some((summary, usage)) = summarize(agent, session, &history, cancel).await? else {
+        return Ok(false);
+    };
 
     let mut text = format!("{SUMMARY_PREFIX}\n{summary}");
     if let Some(tail) = tail {
@@ -135,7 +176,7 @@ pub async fn force(
         },
     )
     .await;
-    Ok(())
+    Ok(true)
 }
 
 /// 需要摘要的历史 + 末尾未回答的 user 文本（合并保留用）。
@@ -232,11 +273,17 @@ fn truncate_tool_result(content: &str) -> String {
 }
 
 /// 发一次不带 tools 的摘要请求，折叠成完整文本。
+///
+/// - `Ok(Some)`：收到 Done 且文本非空，调用方可 rewrite；
+/// - `Ok(None)`：等待中被取消，调用方按 no-op 处理（不 rewrite、不报截断）；
+/// - `Err`：提供方错误 / Done 前结束 / 空摘要，一律不 rewrite（A04：无内容或
+///   异常摘要不得覆盖历史；取消不误报成 provider 截断）。
 async fn summarize(
     agent: &Agent,
     session: &Session,
     history: &str,
-) -> crate::Result<(String, Usage)> {
+    cancel: &CancellationToken,
+) -> crate::Result<Option<(String, Usage)>> {
     let user = Message::user_text(COMPACTION_PROMPT.replace(MESSAGES_PLACEHOLDER, history));
     let ctx = PromptContext {
         tools: &[],
@@ -254,20 +301,38 @@ async fn summarize(
         max_tokens: agent.cfg.max_tokens,
         temperature: None,
     };
-    let mut stream = agent.provider.stream(request).await?;
+    let mut stream = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        stream = agent.provider.stream(request) => stream?,
+    };
     let mut text = String::new();
     let mut usage = Usage::default();
-    while let Some(event) = stream.next().await {
+    let mut done = false;
+    while let Some(event) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        event = stream.next() => event,
+    } {
         match event? {
             StreamEvent::TextDelta(delta) => text.push_str(&delta),
-            StreamEvent::Done { usage: u, .. } => usage = u,
+            StreamEvent::Done { usage: u, .. } => {
+                usage = u;
+                done = true;
+            }
             _ => {}
         }
     }
-    if text.trim().is_empty() {
-        text.push_str("(no summary produced)");
+    if cancel.is_cancelled() {
+        return Ok(None);
     }
-    Ok((text, usage))
+    if !done {
+        anyhow::bail!("summarization stream ended without Done; keeping the original session");
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("summarization returned empty text; keeping the original session");
+    }
+    Ok(Some((text, usage)))
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 | --- | --- | --- | --- | --- |
 | 01-sse-stream-integrity.md | P1 | hard | max | UTF-8/SSE、正常终止与输入预算 |
 | done/02-session-io-recovery.md ✅ | P1 | hard | max | 会话有界读取、恢复、成批追加与备份保护 |
-| 03-agent-turn-continuation.md | P1 | hard | max | 执行前校验、续轮、取消和摘要完整性 |
+| done/03-agent-turn-continuation.md ✅ | P1 | hard | max | 执行前校验、续轮、取消和摘要完整性 |
 | done/04-plugin-settings-recovery.md ✅ | P1 | hard | max | 保留白名单模式和安装恢复备份 |
 | done/05-proxy-lifecycle.md ✅ | P1 | hard | max | 有限换端口重试、总期限和并发重启 |
 | `done/06-bundled-snapshots.md` ✅ | P1 | hard | max | bundled 完整快照与并发物化 |
@@ -22,7 +22,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 
 1. [01-sse-stream-integrity.md](done/01-sse-stream-integrity.md) — 已完成，已归档。依赖：无。
 2. [done/02-session-io-recovery.md](done/02-session-io-recovery.md) ✅ — 完成。有界字节读取（header 64KiB/单行 96MiB/总量 256MiB），错误只带路径/行号/约束；坏正文保留合法前缀并物理修复，缺换行尾规范化后可追加，超预算原文件不动；新增 `Session::append_batch`（签名与语义见归档文件完成记录），非法零落盘、IO 失败回退旧长度+旧内存、symlink 双向拒绝；tmp 任一失败清理，备份创建即 0600、精确归属、每会话 5 份。依赖：无。
-3. [03-agent-turn-continuation.md](03-agent-turn-continuation.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery。
+3. [done/03-agent-turn-continuation.md](done/03-agent-turn-continuation.md) ✅ — 完成。run_turn 副作用前用消息校验核心拒非法 assistant（复用/空 ID·name 零工具零 hook，历史可校验可继续），malformed 照旧流程；坏图经核心探针转脱敏错误结果；`finish_turn` 批量追加。末尾 user 合并续轮（摘要/旧输入/ToolResult/Image 保序），预取消零写入零 hook。inventory/四 hook/maybe·force 等待可取消（drop 回收子进程），摘要仅非空+Done 才 rewrite。新增 `compact::maybe_cancelable`/`force_cancelable`（`-> Result<bool>`，true=rewrite）供 08 接线，旧 `maybe`/`force` 为兼容包装；overflow 单重试、只读并发上限、`STOP_BLOCK_LIMIT` 保留。依赖：01-sse-stream-integrity、02-session-io-recovery。
 4. [done/04-plugin-settings-recovery.md](done/04-plugin-settings-recovery.md) ✅ — 完成。settings 三态（未表态 / 白名单 / 显式空白名单）在合并、serde 往返与 enable/disable 全入口保留：`[]` 后 enable 写入白名单、禁用最后一项保持白名单模式、低层白名单被高层清空后仍禁用其他名字；read_layer 1 MiB 有界读取，超限 / 坏 JSON / IO 错误均指向对应层文件且原文件不变；移除 `.replaced-*` 无条件清扫，成功替换只清自己的备份、失败仍回滚，list / auto-update / discovery 扫描排除 `.replaced-*` 与 `.tmp-install` 内部目录。依赖：无。
 5. [done/05-proxy-lifecycle.md](done/05-proxy-lifecycle.md) ✅ — 完成。launch 共享总就绪期限（受检时间运算，极大 timeout 报 too large；探针/sleep 取 min(上限, 剩余期限）），就绪前退出换端口重试至多额外 2 次（共 3 attempts，错误保留 provider/命令/尝试数/退出状态），spawn 失败与配置无效立即失败；restart 经 tokio 锁串行 + 代次识别合并并发重启，全程不持 std Mutex guard await，被取消候选经 drop 回收，单调用至多一次 HTTP 重试保留；stderr 保持 null、无无限缓冲。并发采样（当前构建 tests/provider_proxy 二进制 --test-threads 4，timeout 120s）：3 波 × 8 进程 = 24 run 全部通过（0 失败，360 次测试执行）；采样不证明 TOCTOU 已消除，原子端口交接属 roadmap RM06，供 09 更新 release 文档。依赖：无。
 6. `done/06-bundled-snapshots.md` ✅ — 完成。`materialize_at` 改为以 `<base>/bundled/` 为缓存父目录的完整不可变快照：身份 `v1-<fnv1a64>`（全部内嵌文件"路径+内容"的 FNV-1a 64，非密码学承诺，不凭 manifest.version 判有效）；私有 `.staging-*` 临时目录写满并逐字节读回核验后原子 rename 发布，`Plugin.root` 指向快照；损坏（缺失/多余/被改/半份）整体替换——先 `.retired-*` 移走再换入，绝不原地覆盖在读目录；并发发布同一快照经 fast-path 复验 + rename 竞争复用已核验目录，败者清理自己的临时目录；失败只回收本次 `.staging-*`/`.retired-*`，旧布局/未知目录保留在盘上不参与运行时发现。新增 8 个测试：逐字节集合一致、旧布局不加载（registry 只见 5 个内嵌 provider）、重复加载不重写（mtime 不变）、半份/额外/篡改 JSON 均整体重建、8 线程并发单快照无残留、3 子进程（进程组 + kill_on_drop）+ 父线程跨进程竞态、注入写/发布失败后旧快照可读且无 tmp 遗留。lib 403 通过。依赖：无。

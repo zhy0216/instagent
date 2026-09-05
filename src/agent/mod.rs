@@ -185,19 +185,38 @@ impl Agent {
         cancel: CancellationToken,
         events: mpsc::Sender<Event>,
     ) -> crate::Result<TurnResult> {
+        // T2：预取消在任何 hook 或写入前直接退出（零写入、零 hook）。
+        if cancel.is_cancelled() {
+            return Ok(TurnResult::Interrupted);
+        }
         // hook 触发点（`17` §2.7）：UserPromptSubmit 不可阻止，决策忽略。
+        // T3：等待受 token 约束，取消则 drop hook future（子进程经
+        // kill_on_drop 回收），零写入直接返回。
         if let Some(hooks) = &self.hooks {
             let ctx = hook_ctx(session, HookEvent::UserPromptSubmit).with_message(text.clone());
-            let _ = hooks.run(&ctx).await;
+            let ran = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => false,
+                _ = hooks.run(&ctx) => true,
+            };
+            if !ran {
+                return Ok(TurnResult::Interrupted);
+            }
         }
-        session.append(Message::user_text(text))?;
+        // T2：末尾 assistant 正常 append；末尾 user 把新文本并入原 content
+        // 后原子 rewrite（保留摘要/旧输入/ToolResult/Image 顺序）。
+        prepare_input(session, text)?;
         let mut overflow_retried = false;
         let mut stop_blocks = 0u32;
         for _ in 0..self.cfg.max_turns {
             if cancel.is_cancelled() {
                 return Ok(TurnResult::Interrupted);
             }
-            compact::maybe(self, session, &events).await?;
+            // T3：条件压缩等待可取消；取消时不改会话，由下一次检查收尾。
+            compact::maybe_cancelable(self, session, &events, &cancel).await?;
+            if cancel.is_cancelled() {
+                return Ok(TurnResult::Interrupted);
+            }
             let streamed = match self.stream_assistant(session, &cancel, &events).await {
                 Ok(streamed) => streamed,
                 Err(e) => {
@@ -207,13 +226,29 @@ impl Agent {
                     );
                     if overflow && !overflow_retried {
                         overflow_retried = true;
-                        compact::force(self, session, &events).await?;
+                        compact::force_cancelable(self, session, &events, &cancel).await?;
+                        if cancel.is_cancelled() {
+                            return Ok(TurnResult::Interrupted);
+                        }
                         continue;
                     }
                     event::emit(&events, Event::Error(e.to_string())).await;
                     return Err(e);
                 }
             };
+
+            // T1：在 PreToolUse / ToolStart / execute_calls 之前，用既有消息
+            // 校验核心检查 assistant 与历史的关系（重复/历史复用 ID、空
+            // ID/name、错误块）。非法 → 零副作用：不跑 hook、不执行工具、
+            // 不落盘，直接错出（历史保持可校验，下一次 run_turn 可合并继续）。
+            // 空 content 照旧跳过（finish_turn 不落盘）；合法但 JSON 参数损坏
+            // 的 malformed 块能通过校验，走已有 ToolResult 流程。
+            if !streamed.message.content.is_empty() {
+                if let Err(err) = validate_assistant(session, &streamed.message) {
+                    event::emit(&events, Event::Error(err.to_string())).await;
+                    return Err(err);
+                }
+            }
 
             let calls = streamed.message.tool_uses();
             let results = self
@@ -227,7 +262,7 @@ impl Agent {
                 String::new()
             };
 
-            // 所有退出路径统一落盘：assistant 与答复它的 user 消息一起写，
+            // 所有退出路径统一落盘：assistant 与答复它的 user 消息批量提交，
             // 保证 02 的会话不变量。
             finish_turn(session, streamed.message, results)?;
 
@@ -237,10 +272,14 @@ impl Agent {
             if calls.is_empty() {
                 // Stop 被阻止 → 注入提醒 user 消息、本轮继续跑（§2.7）。
                 if self
-                    .stop_hook(session, last_assistant, &mut stop_blocks)
+                    .stop_hook(session, last_assistant, &mut stop_blocks, &cancel)
                     .await?
                 {
                     continue;
+                }
+                // T3：Stop 等待中被取消 → 按 Interrupted 收尾，不按 Done 结束。
+                if cancel.is_cancelled() {
+                    return Ok(TurnResult::Interrupted);
                 }
                 return Ok(TurnResult::Done);
             }
@@ -250,17 +289,26 @@ impl Agent {
 
     /// hook 触发点：Stop。被阻止 → 注入提醒 user 消息并返回 true（本轮继续跑）；
     /// 无 hooks / 未阻止 / 连续阻止超上限（默认 8）强制结束返回 false，防死循环（§2.7）。
+    /// 等待受 token 约束：取消则 drop hook future（子进程经 kill_on_drop
+    /// 回收），不注入提醒、不做决策，返回 false；调用方随后检查 token 并按
+    /// Interrupted 收尾。
     async fn stop_hook(
         &self,
         session: &mut Session,
         last_assistant: String,
         stop_blocks: &mut u32,
+        cancel: &CancellationToken,
     ) -> crate::Result<bool> {
         let Some(hooks) = &self.hooks else {
             return Ok(false);
         };
         let ctx = hook_ctx(session, HookEvent::Stop).with_message(last_assistant);
-        if let HookDecision::Block(reason) = hooks.run(&ctx).await {
+        let decision = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(false),
+            decision = hooks.run(&ctx) => decision,
+        };
+        if let HookDecision::Block(reason) = decision {
             *stop_blocks += 1;
             if *stop_blocks > STOP_BLOCK_LIMIT {
                 tracing::warn!(
@@ -300,7 +348,15 @@ impl Agent {
         cancel: &CancellationToken,
         events: &mpsc::Sender<Event>,
     ) -> crate::Result<AssistantStream> {
-        let specs = self.tools.list().await;
+        // T3：工具 inventory 枚举等待受 token 约束；取消则 drop 等待 future
+        // 并按取消的空折叠返回（调用方按 Interrupted 收尾，不发请求）。
+        let specs = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Ok(AssistantStream::cancelled_empty());
+            }
+            specs = self.tools.list() => specs,
+        };
         let ctx = prompt::PromptContext {
             tools: &specs,
             cwd: &session.header.cwd,
@@ -445,24 +501,66 @@ fn flush_text(blocks: &mut Vec<Content>, text: &mut String) {
     }
 }
 
-/// assistant + 工具结果一次性落盘（空 content 跳过，保 validate 不变量 3）。
+/// 新输入落盘（T2 / A02）：历史末尾为 assistant（或空历史）时正常追加一条
+/// 新 user 消息；末尾为 user（摘要、未回答输入、tool results、中断/nudge 尾）
+/// 时把新文本作为新 Text 块并入原 content，经原子 rewrite 落盘。
+/// 原 content 块顺序不变（摘要、旧 prompt、ToolResult、Image 都在前，新文本在
+/// 后），不放宽角色交替、不丢旧输入、不发明模型回答。下一次 run_turn 可直接
+/// 继续，`validate` / `resume` 一致。
+fn prepare_input(session: &mut Session, text: String) -> crate::Result<()> {
+    let trailing_user = matches!(
+        session.messages.last(),
+        Some(Message {
+            role: Role::User,
+            ..
+        })
+    );
+    if !trailing_user {
+        session.append(Message::user_text(text))?;
+        return Ok(());
+    }
+    let mut messages = session.messages.clone();
+    if let Some(last) = messages.last_mut() {
+        last.content.push(Content::Text(text));
+    }
+    session.rewrite(messages)
+}
+
+/// 副作用前校验（T1 / A01）：候选历史 = 现有消息 + 新收到的 assistant，用
+/// `validate_for_append` 同一校验核心检查（重复/历史复用 ID、空 ID/name、错
+/// 位块、交替）。调用方保证非空 content；通过后 execute_calls 才允许产生
+/// PreToolUse / ToolStart / 工具副作用。
+fn validate_assistant(session: &Session, assistant: &Message) -> crate::Result<()> {
+    let mut candidate = session.messages.clone();
+    candidate.push(assistant.clone());
+    crate::message::validate_for_append(&candidate).map_err(|err| {
+        anyhow::anyhow!(
+            "assistant message failed validation against session history \
+             (tools were not executed): {err:#}"
+        )
+    })
+}
+
+/// assistant + 工具结果批量落盘（02 的 `append_batch`：先预序列化+校验再写，
+/// 失败零落盘、内存回滚）。空 content 跳过，保 validate 不变量 3。
 fn finish_turn(
     session: &mut Session,
     assistant: Message,
     results: Vec<Content>,
 ) -> crate::Result<()> {
+    let mut batch = Vec::with_capacity(2);
     if !assistant.content.is_empty() {
-        session.append(assistant)?;
+        batch.push(assistant);
     }
     if !results.is_empty() {
-        session.append(Message {
+        batch.push(Message {
             role: Role::User,
             content: results,
             ts: chrono::Utc::now().timestamp(),
             usage: None,
-        })?;
+        });
     }
-    Ok(())
+    session.append_batch(batch)
 }
 
 #[cfg(test)]
@@ -886,7 +984,10 @@ mod tests {
         assert_eq!(result.unwrap(), TurnResult::Interrupted);
         assert_eq!(provider.calls(), 0);
         crate::message::validate(&session.messages).unwrap();
-        assert_eq!(session.messages.len(), 1);
+        // T2：预取消在 hook/写文件前直接退出——连 user 输入都不落盘。
+        assert!(session.messages.is_empty());
+        let raw = std::fs::read_to_string(&session.path).unwrap();
+        assert_eq!(raw.lines().count(), 1, "只有 header 行");
     }
 
     #[tokio::test]
