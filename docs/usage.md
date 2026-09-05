@@ -194,7 +194,8 @@ plugins:
 | `INSTAGENT_DATA_DIR` | `~/.local/share/instagent` |
 | `INSTAGENT_AGENTS_DIR` | `~/.agents` |
 
-日志：`RUST_LOG=warn`（默认关闭，REPL 输出干净；日志走 stderr）。
+日志：默认 warning 到 stderr（健康路径保持安静，stdout 仍仅答案）；
+显式 `RUST_LOG` 优先（如 `RUST_LOG=info instagent chat` 看详细日志）。
 
 ### 4.3 `settings.json`（三层）
 
@@ -216,6 +217,8 @@ plugins:
 - `enabledPlugins` 三态（ADR 0003 D5）：**缺失** = 不表态（"除
   `disabledPlugins` 外全部启用"）；**非空** = 白名单，只有列出的启用；
   **显式 `[]`** = 空白名单终值，禁用全部，低层不得恢复任何名字。
+  `enabledPlugins: []` 后 `plugin enable <name>` 会把该名字写回白名单；
+  禁用白名单最后一项仍保持白名单模式，不会回退成"全部启用"。
 - `disabledPlugins`：黑名单，各层取并集；缺失与 `[]` 等价。
 - 同名插件的 enabled/disabled 字段：以最高层出现的为准；某层缺省的字段
   不参与覆盖（"没写"与"写了空数组"是两种语义，见上）。
@@ -258,6 +261,11 @@ plugins:
   会话（id 见 `instagent sessions list`）。
 - **单进程独占**：不要对同一会话 id 同时开两个 `--resume`，两进程追加写
   会互相漂移。
+- **续轮语义**：历史末尾为 user（摘要、未回答输入或 tool results）时，
+  新输入合并追加到该消息并原子重写落盘；末尾为 assistant 才追加新 user
+  消息。`/compact` / 取消 / 失败后继续都保持该不变量。
+- **读取预算**：header 64 KiB、单消息 96 MiB、总文件 256 MiB；超预算
+  报错并保留原文件，不截短用户数据。
 - 上下文过长时按 `compaction_threshold` 自动压缩；`/compact` 手动触发，
   完成后显示 `· compacted X → Y tokens`。
 - `run` 子命令每次都会新建会话（结束时打印 `session <id>` 到 stderr）。
@@ -274,8 +282,10 @@ plugins:
 2. 配置 `plugins:` 列出的目录
 3. 项目级 `<cwd>/.agents/plugins/`
 4. 用户级 `~/.agents/plugins/`
-5. bundled（随二进制分发的内置插件，首次运行物化到
-   `~/.local/share/instagent/bundled/`）
+5. bundled（随二进制分发的内置插件，首次运行物化为
+   `<data>/bundled/v1-<fnv1a64>/` 不可变快照：身份取全部内嵌文件
+   "路径+内容"的 FNV-1a 64，只复用逐字节一致的快照；损坏整体替换，
+   不原地覆盖正在读取的目录）
 
 manifest 校验失败的目录记警告跳过，不中断启动；settings 里启用但目录已删
 的插件同样只警告。同名插件先到先得。
@@ -583,6 +593,11 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 - `command`：可执行名或 `./` 插件相对路径；`${PORT}` 在拉起时替换成分配
   的端口；就绪探针轮询 `ready` 路径（默认 `/v1/models`）直到返回 200 或
   超时（默认 20s）。
+- **就绪期限与重试**：总就绪期限 = `timeout_secs`（默认 20s），全部候选
+  尝试共享，重试不重新获得完整 timeout；就绪前提前退出换端口重试至多
+  额外 2 次（共 3 次尝试，失败带 provider/命令/尝试数/退出状态）。
+  端口选择是 bind→释放→子进程 bind，竞争只能缓解不能根除（见
+  `docs/release.md` 的采样记录与 roadmap RM06）。
 
 变量展开（所有 provider JSON）：`${env:NAME}` / `${PLUGIN_ROOT}` /
 `${PLUGIN_DATA}`；`${PORT}` 保留给运行时。
@@ -603,6 +618,14 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 
 用量超过 `compaction_threshold`（默认 0.8）× 上限时自动压缩会话。
 
+### 9.5 流式预算与截断
+
+- 单 SSE 事件 1 MiB、单响应文本 8 MiB、累计工具参数 8 MiB、单响应最多
+  256 个工具调用；超限终止流并报有界诊断（不回显原始载荷）。
+- 缺少 `[DONE]` 且无非空 `finish_reason` 的 EOF 报结构化错误，不执行
+  pending 工具调用；已收到非空 `finish_reason` 的流按正常完成处理。
+  极大 usage 按饱和转换，不回绕成小值绕过压缩阈值。
+
 ---
 
 ## 10. 文件位置速查
@@ -619,7 +642,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 | `~/.agents/skills/` | 用户级 skills |
 | `~/.local/share/instagent/sessions/*.jsonl` | 会话文件 |
 | `~/.local/share/instagent/plugins/<name>/` | 插件数据目录（`${PLUGIN_DATA}`） |
-| `~/.local/share/instagent/bundled/` | 物化的内嵌插件 |
+| `~/.local/share/instagent/bundled/v1-<fnv1a64>/` | 物化的内嵌插件快照（`bundled/` 为缓存父目录） |
 
 均可被 `INSTAGENT_CONFIG_DIR` / `INSTAGENT_DATA_DIR` /
 `INSTAGENT_AGENTS_DIR` 重定向。
@@ -632,12 +655,12 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 |---|---|
 | 启动报配置解析错 | 检查 config.yaml 的 YAML 语法，或残留的旧 `api_key` / `api_key_env` 键（报错会带迁移提示，ADR 0003 D1） |
 | provider 重名报错 | 配置里写 `插件名/provider名` |
-| `proxy not ready` | proxy 进程未在 `timeout_secs` 内就绪：手动跑该命令确认能监听 `${PORT}` 并在 `ready` 路径返回 200 |
-| 想看详细日志 | `RUST_LOG=warn instagent chat`（或 `info` / `debug`），日志走 stderr |
+| `proxy not ready` | proxy 进程未在总就绪期限（`timeout_secs`，默认 20s）内就绪：手动跑该命令确认能监听 `${PORT}` 并在 `ready` 路径返回 200；重试耗尽后的报错带 provider/命令/尝试数/退出状态 |
+| 想看更详细日志 | `RUST_LOG=info instagent chat`（或 `debug`），日志走 stderr；默认 warning 已可见，无需显式开启 |
 | 会话内容错乱 | 确认没有两个进程同时 `--resume` 同一个会话 |
 
 开发自检：
 
 ```bash
-bash scripts/ci.sh    # fmt / clippy / test
+bash scripts/ci.sh    # fmt / clippy / cargo test / python 回归 / rustdoc / release smoke / --help
 ```

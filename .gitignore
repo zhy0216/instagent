@@ -6,3 +6,6 @@
 .config/instagent/settings.local.json
 # 原子写入残留的同目录临时文件（settings / 安装元数据）。
 .config/instagent/*.tmp
+# Python 回归缓存（ci.sh 以 PYTHONDONTWRITEBYTECODE 运行，规则只覆盖缓存本身）。
+__pycache__/
+*.py[cod]

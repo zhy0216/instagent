@@ -15,7 +15,7 @@
 //! - durability：append 至少 flush（进程崩溃不丢，主机掉电不保证）；create /
 //!   rewrite / salvage 修复写回额外 `sync_all`，rename 后尽力同步父目录。
 //! - 有界读取（S01）：header / 正文按字节逐行带预算读取（见
-//!   [`DEFAULT_LIMITS`]），超行/总预算即拒绝打开，原文件字节保持原状，不借
+//!   `DEFAULT_LIMITS`），超行/总预算即拒绝打开，原文件字节保持原状，不借
 //!   salvage 删除超预算内容；错误只带路径 / 行号 / 约束，不回显行原文
 //!   （假密钥不进 stderr）。
 //! - resume salvage（S02）：正文坏 UTF-8 / 坏 JSON / 违反不变量的尾部保留合法
@@ -148,7 +148,7 @@ impl Session {
         })
     }
 
-    /// 全量读回（默认预算 [`DEFAULT_LIMITS`]）。id 先过
+    /// 全量读回（默认预算 `DEFAULT_LIMITS`）。id 先过
     /// [`validate_session_id`]。header（第 1 行）损坏明确报错（只带路径 / 行号
     /// / 约束，不回显原文）；正文按"合法前缀"恢复：坏 UTF-8 / 坏 JSON 行即
     /// 截断，再回退到最近一条满足 `message::validate` 的前缀，丢弃行数向

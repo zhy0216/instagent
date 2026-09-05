@@ -10,7 +10,7 @@
 | `src/agent/` | agent loop：`assemble` / `run_turn` / 流式输出、压缩（`compact.rs`）、hooks 触发点 |
 | `src/provider/` | provider **引擎**层：`openai.rs` / `proxy.rs` 两种引擎 + 共享 SSE 流驱动（`shared.rs`）+ `registry.rs` |
 | `src/tools/` | `ToolSource` trait + Registry；唯一内置内容 = 6 个工具 `shell` `read` `write` `edit` `tree` `read_image`（`builtin/`） |
-| `src/plugin/` | 插件加载器：manifest 校验、四级发现（`--plugin` > 项目 > 用户 > bundled，同名覆盖）、install / enable |
+| `src/plugin/` | 插件加载器：manifest 校验、五层发现（`--plugin` > 配置 `plugins` 额外路径 > 项目 > 用户 > bundled，同名高优先级覆盖）、install / enable |
 | `src/hooks.rs` | hooks 运行时——内核只提供执行机制，脚本来自插件 |
 | `src/commands.rs` | 斜杠命令加载器（`dev.instagent/commands/*.md`） |
 | `src/session.rs` `src/message.rs` | 会话 JSONL 持久化、消息模型 |
@@ -22,7 +22,10 @@
 - `bundled/` 是编译时内嵌的一个插件（`plugin.json` name=`bundled`），只含
   `dev.instagent/providers/` 下 **5 个 provider 定义 JSON**：openai / ollama /
   groq / deepseek / openrouter。引擎在内核，"哪个引擎 +
-  base_url + key 环境变量 + 模型列表"在插件里。
+  base_url + key 环境变量 + 模型列表"在插件里。首次运行时物化为
+  `<data>/bundled/v1-<fnv1a64>/` 完整不可变快照（身份 = 全部内嵌文件
+  "路径+内容"的 FNV-1a 64；命中复用零重写，损坏整体替换不原地覆盖在读
+  目录；`bundled/` 为缓存父目录）。
 - 其余组件类型内核只有运行时，内容全部来自外部插件：
   - MCP server：插件根 `mcp.json`
   - skills：`skills/<name>/SKILL.md`（经 `load_skill` 工具暴露）

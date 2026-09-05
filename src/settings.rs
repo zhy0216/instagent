@@ -9,7 +9,7 @@
 //! 往返与 enable/disable 全用同一判定：区分"未声明白名单"与"声明后剩余集合
 //! 为空"——后者仍是白名单模式（禁用全部），绝不退化成"全启用"（I01）。
 //! `disabledPlugins` 维持并集，缺失与 `[]` 等价。
-//! 单层读取有字节预算（[`SETTINGS_FILE_MAX_BYTES`]）；超限 / 坏 JSON / IO
+//! 单层读取有字节预算（`SETTINGS_FILE_MAX_BYTES`）；超限 / 坏 JSON / IO
 //! 错误都带该层文件路径且不回显内容，原文件保持不变；只有 `NotFound` 按
 //! 该层无内容处理。所有写路径走 `write_private_atomic`（同目录临时文件 +
 //! fsync + rename，Unix mode 0600），崩溃或 rename 失败只会留下旧的完整

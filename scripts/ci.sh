@@ -13,6 +13,10 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo test"
 cargo test
 
+echo "==> python regression: convert_providers (ResourceWarning 不得出现)"
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON:-python3}" -W error::ResourceWarning \
+  -m unittest discover -s tests -p 'test_*.py'
+
 echo "==> cargo rustdoc --lib -- -D warnings"
 cargo rustdoc --lib -- -D warnings
 

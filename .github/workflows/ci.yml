@@ -25,12 +25,28 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Python 回归（与 scripts/ci.sh 同命令）：解释器由 setup-python 固定，
+      # PYTHONDONTWRITEBYTECODE 防子进程落缓存；ResourceWarning 直接失败，
+      # 不做全局屏蔽。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
       # rustdoc 断链即失败（todos/16 已清零存量警告）。
       - run: cargo rustdoc --lib -- -D warnings
       # release smoke：release profile 下全 target 可编译。
       - run: cargo check --release --all-targets
       # 与 scripts/ci.sh 对齐的 --help smoke。
       - run: cargo run -q -- --help
+  msrv:
+    # 已声明 MSRV 的持续验证（plan E03，阻断）：固定最低版本 1.93.1，
+    # 不跟随主工具链升级；主构建仍由 rust-toolchain.toml 的 1.94.0 控制。
+    # --locked 保证不动 Cargo.toml / Cargo.lock / feature。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: cargo +1.93.1 check --locked --all-targets
   audit:
     # cargo-audit（RUSTSEC 公告）扫描。安全政策与豁免记录见 docs/release.md：
     # PR/push 上不阻断——修复公告需要升级依赖，违反 AGENTS.md 的依赖锁定；

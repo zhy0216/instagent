@@ -21,8 +21,9 @@
   组件）；本地和 CI（rustup 读取同一文件）使用同一可复现 toolchain，
   不允许无记录的 moving stable。
 - **MSRV**：`Cargo.toml` 的 `rust-version = "1.93"`。验证证据：
-  2026-09-05 在本机 `cargo +1.93.1 check --all-targets` 通过（全部依赖 +
-  测试 target 可编译）。该值是已验证下界，不是承诺支持更早版本。
+  2026-09-05 在本机 `cargo +1.93.1 check --locked --all-targets` 通过（全部依赖 +
+  测试 target 可编译）；CI `msrv` job 固定 1.93.1 持续执行同一命令，主工具链
+  仍由 `rust-toolchain.toml` 的 1.94.0 控制。该值是已验证下界，不是承诺支持更早版本。
 - **升级政策**：钉版升级 = 一次独立 commit，PR 内必须记录新版本号并跑完
   下方全部门槛命令；不允许顺手 bump。降级 MSRV 需重新验证依赖树。
 
@@ -33,9 +34,14 @@
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
-4. `cargo rustdoc --lib -- -D warnings`（intra-doc 断链即失败）
-5. `cargo check --release --all-targets`（release smoke）
-6. `cargo run -q -- --help`（CLI 冒烟）
+4. Python 回归：`PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'`
+   （解释器由 `actions/setup-python` 固定；`ResourceWarning` 直接失败，不全局屏蔽）
+5. `cargo rustdoc --lib -- -D warnings`（intra-doc 断链即失败）
+6. `cargo check --release --all-targets`（release smoke）
+7. `cargo run -q -- --help`（CLI 冒烟）
+
+`msrv` job（阻断）：`cargo +1.93.1 check --locked --all-targets`（固定最低版本；
+主工具链仍由 `rust-toolchain.toml` 的 1.94.0 控制；`--locked` 保证不动依赖与 feature）。
 
 `audit` job（cargo-audit / RUSTSEC 公告）：
 
@@ -81,9 +87,15 @@
   缓解只会掩盖竞态，不做。修复任务落地时以本文档的并发采样命令作为
   回归验收（并发 24 run 至少 0 失败）。
 
+本轮验证（todo 05，当前构建的 `tests/provider_proxy` 二进制
+`--test-threads 4`，timeout 120s）：并发 3 波 × 8 进程 = 24 run
+全部通过（0 失败，360 次测试执行）。采样只补充说明有限重试与总期限的
+缓解效果，不证明 TOCTOU 已消除：选端口（bind→释放）与子进程 bind 之间
+仍无原子交接，完整端口继承协议属 roadmap RM06。
+
 ## 全部验证命令
 
 ```bash
-bash scripts/ci.sh                    # 1–6 全量
-cargo +1.93.1 check --all-targets    # MSRV 下界复验（需装有 1.93.1）
+bash scripts/ci.sh                                  # 1–7 全量 + audit 提示
+cargo +1.93.1 check --locked --all-targets          # MSRV 下界复验（需装有 1.93.1）
 ```

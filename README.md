@@ -59,15 +59,16 @@ instagent --help
 
 | 位置 | 内容 |
 |---|---|
-| `~/.config/instagent/config.yaml` | provider / model / `plugins` 额外搜索路径等 |
+| `~/.config/instagent/config.yaml` | provider / model / `plugins` 额外搜索路径等（只有用户级一层，见 `docs/usage.md` §4.1） |
 | `~/.config/instagent/settings.json` | `enabledPlugins` / `disabledPlugins`（三层合并：`.local` > 项目 > 用户） |
-| `<project>/.config/instagent/` | 项目级 config/settings 覆盖 |
-| `~/.local/share/instagent/` | 数据目录：`sessions/*.jsonl`、`plugins/<name>/`（PLUGIN_DATA）、`bundled/`（物化的内嵌插件） |
+| `<project>/.config/instagent/` | 项目级 settings（`settings.json` / `settings.local.json`）；不读项目级 config.yaml |
+| `~/.local/share/instagent/` | 数据目录：`sessions/*.jsonl`、`plugins/<name>/`（PLUGIN_DATA）、`bundled/v1-<fnv1a64>/`（内嵌插件的不可变快照） |
 | `~/.agents/plugins/` | 用户插件安装根（Agent Plugins 规范的共享位置） |
 
 环境变量（优先级高于配置文件）：`INSTAGENT_PROVIDER`、`INSTAGENT_MODEL`；
 沙箱/测试用：`INSTAGENT_CONFIG_DIR`、`INSTAGENT_DATA_DIR`、
-`INSTAGENT_AGENTS_DIR`；日志：`RUST_LOG=warn`（默认关闭，REPL 输出干净）。
+`INSTAGENT_AGENTS_DIR`；日志：默认 warning 到 stderr（健康路径保持安静，
+stdout 仍仅答案），显式 `RUST_LOG` 优先。
 
 设计语义须知：
 
@@ -185,7 +186,7 @@ settings 里启用但目录已删的插件同样只警告不致命。详见第�
 ## 开发
 
 ```bash
-bash scripts/ci.sh        # = CI 全量：fmt / clippy / test / rustdoc / release smoke / --help
+bash scripts/ci.sh        # = CI 全量：fmt / clippy / cargo test / python 回归 / rustdoc / release smoke / --help
 cargo run -- --help
 ```
 
@@ -195,6 +196,7 @@ cargo run -- --help
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 cargo rustdoc --lib -- -D warnings
 cargo check --release --all-targets
 ```

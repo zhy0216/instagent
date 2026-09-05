@@ -14,7 +14,7 @@
 | `done/06-bundled-snapshots.md` ✅ | P1 | hard | max | bundled 完整快照与并发物化 |
 | 07-tool-inventory-io.md | P1 | hard | max | 一致工具缓存、失败恢复与有界 MCP 日志 |
 | done/08-cli-diagnostics-validation.md ✅ | P1 | hard | max | 默认可见诊断、配置校验与 CLI 回归 |
-| 09-ci-docs-alignment.md | P2 | medium | flash | Python/CI/MSRV 和最终文档 |
+| `done/09-ci-docs-alignment.md` ✅ | P2 | medium | flash | Python/CI/MSRV 和最终文档 |
 
 flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-max`。必须显式传 `--auto --model`，不静默换模型。
 
@@ -28,7 +28,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 6. `done/06-bundled-snapshots.md` ✅ — 完成。`materialize_at` 改为以 `<base>/bundled/` 为缓存父目录的完整不可变快照：身份 `v1-<fnv1a64>`（全部内嵌文件"路径+内容"的 FNV-1a 64，非密码学承诺，不凭 manifest.version 判有效）；私有 `.staging-*` 临时目录写满并逐字节读回核验后原子 rename 发布，`Plugin.root` 指向快照；损坏（缺失/多余/被改/半份）整体替换——先 `.retired-*` 移走再换入，绝不原地覆盖在读目录；并发发布同一快照经 fast-path 复验 + rename 竞争复用已核验目录，败者清理自己的临时目录；失败只回收本次 `.staging-*`/`.retired-*`，旧布局/未知目录保留在盘上不参与运行时发现。新增 8 个测试：逐字节集合一致、旧布局不加载（registry 只见 5 个内嵌 provider）、重复加载不重写（mtime 不变）、半份/额外/篡改 JSON 均整体重建、8 线程并发单快照无残留、3 子进程（进程组 + kill_on_drop）+ 父线程跨进程竞态、注入写/发布失败后旧快照可读且无 tmp 遗留。lib 403 通过。依赖：无。
 7. [done/07-tool-inventory-io.md](done/07-tool-inventory-io.md) ✅ — 完成。Registry 原子快照（specs/routes/errors 同发）+单飞合并+代次失效丢弃旧枚举，失败来源 5s–60s 退避重试（到期前复用缓存、拨到期后一次刷新恢复），同源重复去重诊断；MCP stderr 固定块增量解码、单行 8 KiB 截断+持续排空、10s 窗口 20 条限速汇总，超限不杀 server。依赖：无。
 8. [done/08-cli-diagnostics-validation.md](done/08-cli-diagnostics-validation.md) ✅ — 完成。CLI 默认 warning 到 stderr（显式 `RUST_LOG` 优先），`auto_update_all` 顶层 Err 进 notes，Skill 扫描区分不存在与读取/权限/超限失败（后者有界带路径 warning）；config.yaml 1 MiB 有界读取、`compaction_threshold` f32 下溢复检、`validate_merged` 在 `-m` 合并后复验，`/compact` 接 `force_cancelable`（取消/空历史 no-op、三路收尾无遗留任务）；CLI e2e 15→34 项，8 个隔离复现全部反转（P01 切分/P02 无完成标记/A01 复用 ID/A02 压缩后继续/取消后继续/空白名单与跨层清空/S01 假密钥不回显/I02 恢复副本保留/I03 幽灵文件忽略）。依赖：03-agent-turn-continuation、04-plugin-settings-recovery、05-proxy-lifecycle、06-bundled-snapshots、07-tool-inventory-io。
-9. [09-ci-docs-alignment.md](09-ci-docs-alignment.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery、03-agent-turn-continuation、04-plugin-settings-recovery、05-proxy-lifecycle、06-bundled-snapshots、07-tool-inventory-io、08-cli-diagnostics-validation。
+9. [done/09-ci-docs-alignment.md](done/09-ci-docs-alignment.md) ✅ — 完成。Python 句柄关闭 + 本地/CI 回归 + `__pycache__/` 忽略；CI 固定 1.93.1 `msrv` job（`--locked --all-targets` 本地通过）；README/usage/architecture/release 按最终行为同步（含 bundled 快照路径、warning 默认、白名单语义、续轮/预算、SSE 截断、proxy 重试期限与采样限制）。未解决：基线 rustdoc 私有 intra-doc 链接失败（02/04/05 引入，文件面外未动）、provider_proxy 全并行偶发 1 次（重跑全绿）。依赖：01–08 全部合入。
 
 ## 并行与集成
 

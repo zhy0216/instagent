@@ -99,9 +99,11 @@ class ConverterTest(unittest.TestCase):
 
     def test_repeatable_runs(self):
         self.convert("--fixture")
-        first = open(os.path.join(self.out, "acme.json")).read()
+        with open(os.path.join(self.out, "acme.json")) as f:
+            first = f.read()
         self.convert("--fixture")
-        self.assertEqual(open(os.path.join(self.out, "acme.json")).read(), first)
+        with open(os.path.join(self.out, "acme.json")) as f:
+            self.assertEqual(f.read(), first)
 
     def test_missing_source_dir_is_diagnosable(self):
         r = run("--source", os.path.join(self.tmp, "nope"), self.out, "acme")
@@ -117,8 +119,10 @@ class ConverterTest(unittest.TestCase):
     def test_duplicate_definition_names_rejected(self):
         dup = {"name": "custom_acme", "engine": "openai",
                "base_url": "https://a.test/v1"}
+        with open(os.path.join(FIXTURE_SRC, "custom_acme.json")) as f:
+            fixture_acme = json.load(f)
         src = write_source(self.tmp, {
-            "custom_acme.json": json.load(open(os.path.join(FIXTURE_SRC, "custom_acme.json"))),
+            "custom_acme.json": fixture_acme,
             "acme_copy.json": dup,
         })
         r = run("--source", src, self.out, "acme")

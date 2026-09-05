@@ -11,7 +11,7 @@
 //! - 总就绪期限 = `timeout_secs`（默认 [`ProxyDef::DEFAULT_TIMEOUT_SECS`]），
 //!   全部候选尝试共享这一期限，重试不重新获得完整 timeout；每次探针请求与
 //!   轮询 sleep 各取自身上限与剩余期限的较小值。候选在就绪前提前退出（可能
-//!   是选端口与 bind 之间被抢注）时换端口重试，至多额外 [`MAX_PORT_RETRIES`]
+//!   是选端口与 bind 之间被抢注）时换端口重试，至多额外 `MAX_PORT_RETRIES`
 //!   次；spawn 失败、配置无效与期限耗尽立即失败。端口选择是
 //!   bind→释放→子进程 bind，竞争只能缓解不能根除，原子端口交接协议属
 //!   roadmap（RM06）。
