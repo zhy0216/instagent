@@ -152,3 +152,32 @@ cargo test
 - 只承诺单进程会话使用，快照并发与 proxy 重启测试不等于全局多租户或跨进程事务保证。
 - 本轮无阻塞性产品问题；数值预算采用上述默认假设。发布、依赖升级、全路径隔离、完整端口协议等决策均已标 roadmap。
 - 自动启动要求计划已提交、原 checkout 干净且 `HERDR_ENV=1`；否则保留已完成的计划成果并如实报告具体阻塞原因。
+
+## 执行结果（协调器收尾，2026-09-05）
+
+9 个任务全部合入原分支 main（ff-only，无 merge commit），一个 todo = 一个 commit，共 9 个本地 commit，未 push：
+
+| commit | todo | 内容 |
+| --- | --- | --- |
+| 6327b6c | 04 | 白名单三态 + settings 有界读取 + 安装恢复备份（I01、I02、D03 settings） |
+| 725d515 | 02 | 会话有界读取、`append_batch`、失败回退与备份归属（S01–S04） |
+| aaaada3 | 05 | proxy 总就绪期限、换端口重试、并发重启合并（R01–R02） |
+| 51f0dd5 | 01 | SSE 字节增量解析、终止区分与资源预算（P01–P04） |
+| cb1ea43 | 06 | bundled 完整不可变快照与并发物化（I03） |
+| 1d04a0d | 07 | Registry 原子快照/代次/有界重试 + MCP stderr 有界排空（T01–T02） |
+| 340347c | 03 | 副作用前校验、续轮合并、取消覆盖与摘要完整性（A01–A04） |
+| 88e2ce1 | 08 | 默认 warning 诊断、合并后配置校验、8 个隔离复现 CLI 回归（D01–D03、A04） |
+| da8ef43 | 09 | Python 回归进 CI、MSRV job、最终文档 + rustdoc 收口修复（E01–E03） |
+
+归档：`todos/` 下 9 个文件全部移入本计划 `todos/done/`，`todos/README.md` 状态已同步；未动根 `todos/done/` 与旧计划归档。roadmap RM01–RM10 未入队。
+
+模型变更：首批 5 个任务曾用 `bailian-token-plan/qwen3.8-max` 启动，后因额度耗尽全部停止；经用户明确指示，后续所有任务统一改用 opencode 挂载的 `opencode-go/muse-spark-1.3-contributor`（含原定 flash 的 09），worktree 未提交进度均被接手保留、无重做无回滚。
+
+集成与验证：rebase → 冲突解决 → 仓库级校验 → `merge --ff-only` 全程串行持有集成锁；每个任务合入前协调器在任务 worktree 亲自跑过 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`env -u TOKEN_PLAN_API_KEY cargo test`（环境预置 key 会使 live_e2e 联网超时，属已知环境限制，live 按设计 skip）。09 合入态另有 `bash scripts/ci.sh` 全绿、`cargo rustdoc --lib -- -D warnings` 通过、`cargo +1.93.1 check --locked --all-targets` 通过。
+
+已知问题与未解决项：
+
+- 全并行 `cargo test` 负载下见过 3 次偶发单测失败，均未复现（05 树 provider_proxy 1 次用例名未捕获、06 树 lib 1 次用例名未捕获、09 树 `cancelled_restart_candidate_is_reaped` 1 次 left:2/right:1），隔离与全量重跑均绿。属已知负载偶发模式，建议后续观察，必要时加固该取消用例的时序断言。
+- `TOKEN_PLAN_API_KEY` 预置 + 网关配额耗尽（429）时 live_e2e 必然联网超时，属环境限制，与改动无关；CI 无 key 时按设计 skip。
+- 09 收口修复了 02/04/05 引入的 4 处 rustdoc 私有 intra-doc 链接（doc 注释单行，零逻辑改动，属 09 验收清单要求的收口职责，已在完成记录与本节记录）。
+- 本轮残留：无。Herdr workspace/worktree/任务分支已全部清理；原分支 `git status` 干净。
