@@ -11,7 +11,7 @@
 | 03-agent-turn-continuation.md | P1 | hard | max | 执行前校验、续轮、取消和摘要完整性 |
 | done/04-plugin-settings-recovery.md ✅ | P1 | hard | max | 保留白名单模式和安装恢复备份 |
 | done/05-proxy-lifecycle.md ✅ | P1 | hard | max | 有限换端口重试、总期限和并发重启 |
-| 06-bundled-snapshots.md | P1 | hard | max | bundled 完整快照与并发物化 |
+| `done/06-bundled-snapshots.md` ✅ | P1 | hard | max | bundled 完整快照与并发物化 |
 | 07-tool-inventory-io.md | P1 | hard | max | 一致工具缓存、失败恢复与有界 MCP 日志 |
 | 08-cli-diagnostics-validation.md | P1 | hard | max | 默认可见诊断、配置校验与 CLI 回归 |
 | 09-ci-docs-alignment.md | P2 | medium | flash | Python/CI/MSRV 和最终文档 |
@@ -25,7 +25,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 3. [03-agent-turn-continuation.md](03-agent-turn-continuation.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery。
 4. [done/04-plugin-settings-recovery.md](done/04-plugin-settings-recovery.md) ✅ — 完成。settings 三态（未表态 / 白名单 / 显式空白名单）在合并、serde 往返与 enable/disable 全入口保留：`[]` 后 enable 写入白名单、禁用最后一项保持白名单模式、低层白名单被高层清空后仍禁用其他名字；read_layer 1 MiB 有界读取，超限 / 坏 JSON / IO 错误均指向对应层文件且原文件不变；移除 `.replaced-*` 无条件清扫，成功替换只清自己的备份、失败仍回滚，list / auto-update / discovery 扫描排除 `.replaced-*` 与 `.tmp-install` 内部目录。依赖：无。
 5. [done/05-proxy-lifecycle.md](done/05-proxy-lifecycle.md) ✅ — 完成。launch 共享总就绪期限（受检时间运算，极大 timeout 报 too large；探针/sleep 取 min(上限, 剩余期限）），就绪前退出换端口重试至多额外 2 次（共 3 attempts，错误保留 provider/命令/尝试数/退出状态），spawn 失败与配置无效立即失败；restart 经 tokio 锁串行 + 代次识别合并并发重启，全程不持 std Mutex guard await，被取消候选经 drop 回收，单调用至多一次 HTTP 重试保留；stderr 保持 null、无无限缓冲。并发采样（当前构建 tests/provider_proxy 二进制 --test-threads 4，timeout 120s）：3 波 × 8 进程 = 24 run 全部通过（0 失败，360 次测试执行）；采样不证明 TOCTOU 已消除，原子端口交接属 roadmap RM06，供 09 更新 release 文档。依赖：无。
-6. [06-bundled-snapshots.md](06-bundled-snapshots.md) — 待执行。依赖：无。
+6. `done/06-bundled-snapshots.md` ✅ — 完成。`materialize_at` 改为以 `<base>/bundled/` 为缓存父目录的完整不可变快照：身份 `v1-<fnv1a64>`（全部内嵌文件"路径+内容"的 FNV-1a 64，非密码学承诺，不凭 manifest.version 判有效）；私有 `.staging-*` 临时目录写满并逐字节读回核验后原子 rename 发布，`Plugin.root` 指向快照；损坏（缺失/多余/被改/半份）整体替换——先 `.retired-*` 移走再换入，绝不原地覆盖在读目录；并发发布同一快照经 fast-path 复验 + rename 竞争复用已核验目录，败者清理自己的临时目录；失败只回收本次 `.staging-*`/`.retired-*`，旧布局/未知目录保留在盘上不参与运行时发现。新增 8 个测试：逐字节集合一致、旧布局不加载（registry 只见 5 个内嵌 provider）、重复加载不重写（mtime 不变）、半份/额外/篡改 JSON 均整体重建、8 线程并发单快照无残留、3 子进程（进程组 + kill_on_drop）+ 父线程跨进程竞态、注入写/发布失败后旧快照可读且无 tmp 遗留。lib 403 通过。依赖：无。
 7. [07-tool-inventory-io.md](07-tool-inventory-io.md) — 待执行。依赖：无。
 8. [08-cli-diagnostics-validation.md](08-cli-diagnostics-validation.md) — 待执行。依赖 03-agent-turn-continuation、04-plugin-settings-recovery、05-proxy-lifecycle、06-bundled-snapshots、07-tool-inventory-io。
 9. [09-ci-docs-alignment.md](09-ci-docs-alignment.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery、03-agent-turn-continuation、04-plugin-settings-recovery、05-proxy-lifecycle、06-bundled-snapshots、07-tool-inventory-io、08-cli-diagnostics-validation。
