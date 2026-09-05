@@ -10,7 +10,7 @@
 | done/02-session-io-recovery.md ✅ | P1 | hard | max | 会话有界读取、恢复、成批追加与备份保护 |
 | 03-agent-turn-continuation.md | P1 | hard | max | 执行前校验、续轮、取消和摘要完整性 |
 | done/04-plugin-settings-recovery.md ✅ | P1 | hard | max | 保留白名单模式和安装恢复备份 |
-| 05-proxy-lifecycle.md | P1 | hard | max | 有限换端口重试、总期限和并发重启 |
+| done/05-proxy-lifecycle.md ✅ | P1 | hard | max | 有限换端口重试、总期限和并发重启 |
 | 06-bundled-snapshots.md | P1 | hard | max | bundled 完整快照与并发物化 |
 | 07-tool-inventory-io.md | P1 | hard | max | 一致工具缓存、失败恢复与有界 MCP 日志 |
 | 08-cli-diagnostics-validation.md | P1 | hard | max | 默认可见诊断、配置校验与 CLI 回归 |
@@ -24,7 +24,7 @@ flash = `bailian-token-plan/qwen3.8-flash`；max = `bailian-token-plan/qwen3.8-m
 2. [done/02-session-io-recovery.md](done/02-session-io-recovery.md) ✅ — 完成。有界字节读取（header 64KiB/单行 96MiB/总量 256MiB），错误只带路径/行号/约束；坏正文保留合法前缀并物理修复，缺换行尾规范化后可追加，超预算原文件不动；新增 `Session::append_batch`（签名与语义见归档文件完成记录），非法零落盘、IO 失败回退旧长度+旧内存、symlink 双向拒绝；tmp 任一失败清理，备份创建即 0600、精确归属、每会话 5 份。依赖：无。
 3. [03-agent-turn-continuation.md](03-agent-turn-continuation.md) — 待执行。依赖 01-sse-stream-integrity、02-session-io-recovery。
 4. [done/04-plugin-settings-recovery.md](done/04-plugin-settings-recovery.md) ✅ — 完成。settings 三态（未表态 / 白名单 / 显式空白名单）在合并、serde 往返与 enable/disable 全入口保留：`[]` 后 enable 写入白名单、禁用最后一项保持白名单模式、低层白名单被高层清空后仍禁用其他名字；read_layer 1 MiB 有界读取，超限 / 坏 JSON / IO 错误均指向对应层文件且原文件不变；移除 `.replaced-*` 无条件清扫，成功替换只清自己的备份、失败仍回滚，list / auto-update / discovery 扫描排除 `.replaced-*` 与 `.tmp-install` 内部目录。依赖：无。
-5. [05-proxy-lifecycle.md](05-proxy-lifecycle.md) — 待执行。依赖：无。
+5. [done/05-proxy-lifecycle.md](done/05-proxy-lifecycle.md) ✅ — 完成。launch 共享总就绪期限（受检时间运算，极大 timeout 报 too large；探针/sleep 取 min(上限, 剩余期限）），就绪前退出换端口重试至多额外 2 次（共 3 attempts，错误保留 provider/命令/尝试数/退出状态），spawn 失败与配置无效立即失败；restart 经 tokio 锁串行 + 代次识别合并并发重启，全程不持 std Mutex guard await，被取消候选经 drop 回收，单调用至多一次 HTTP 重试保留；stderr 保持 null、无无限缓冲。并发采样（当前构建 tests/provider_proxy 二进制 --test-threads 4，timeout 120s）：3 波 × 8 进程 = 24 run 全部通过（0 失败，360 次测试执行）；采样不证明 TOCTOU 已消除，原子端口交接属 roadmap RM06，供 09 更新 release 文档。依赖：无。
 6. [06-bundled-snapshots.md](06-bundled-snapshots.md) — 待执行。依赖：无。
 7. [07-tool-inventory-io.md](07-tool-inventory-io.md) — 待执行。依赖：无。
 8. [08-cli-diagnostics-validation.md](08-cli-diagnostics-validation.md) — 待执行。依赖 03-agent-turn-continuation、04-plugin-settings-recovery、05-proxy-lifecycle、06-bundled-snapshots、07-tool-inventory-io。

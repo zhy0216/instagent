@@ -101,6 +101,18 @@ fn read_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// `starts.log` 行形如 `start <port> <pid>`，解析出端口与进程号。
+fn parse_start(line: &str) -> (u16, u32) {
+    let mut parts = line.split_whitespace();
+    assert_eq!(parts.next(), Some("start"), "{line}");
+    let port = parts.next().and_then(|v| v.parse().ok());
+    let pid = parts.next().and_then(|v| v.parse().ok());
+    (
+        port.unwrap_or_else(|| panic!("bad start line {line}")),
+        pid.unwrap_or_else(|| panic!("bad start line {line}")),
+    )
+}
+
 /// 等 pid 消失（kill -0 失败）；kill_on_drop 的 reap 在 tokio 运行时上异步
 /// 发生，必须用 tokio sleep 让 worker 推进。
 async fn wait_pid_gone(pid: u32) {
@@ -238,7 +250,9 @@ async fn connection_crash_restarts_once_and_serves_again() {
     let provider = ProxyProvider::start(&def, &plugin_root())
         .await
         .expect("ready");
-    assert_eq!(read_lines(&log), vec![format!("start {}", provider.port())]);
+    let first = read_lines(&log);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(parse_start(&first[0]).0, provider.port());
 
     // 第一个进程在处理 chat 请求时自杀 → Transport → 自动重启（第二个实例
     // 见 state 文件存在，转为稳定模式）。
@@ -246,8 +260,11 @@ async fn connection_crash_restarts_once_and_serves_again() {
     let starts = read_lines(&log);
     assert_eq!(starts.len(), 2, "{starts:?}");
     // 重启后端口换了、endpoint 跟着指到新进程。
-    assert_eq!(starts[1], format!("start {}", provider.port()));
-    assert_ne!(starts[0], starts[1]);
+    let (first_port, first_pid) = parse_start(&starts[0]);
+    let (second_port, second_pid) = parse_start(&starts[1]);
+    assert_eq!(second_port, provider.port());
+    assert_ne!(first_port, second_port);
+    assert_ne!(first_pid, second_pid);
     // 稳定后不再触发重启。
     assert_eq!(collect_text(&provider).await.unwrap(), "pong");
     assert_eq!(read_lines(&log).len(), 2);
@@ -281,6 +298,286 @@ async fn restart_is_bounded_to_once_per_call() {
         "{err}"
     );
     assert_eq!(read_lines(&log).len(), 3);
+}
+
+// ---- 4b. T1：有限换端口重试与总就绪期限 ----
+
+#[tokio::test]
+async fn first_candidate_fails_then_next_succeeds_on_retry() {
+    let tmp = TempDir::new().unwrap();
+    let marker = tmp.path().join("first-failed");
+    let log = tmp.path().join("starts.log");
+    let args = vec![
+        "--fail-first-start".to_string(),
+        marker.display().to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 15);
+    let provider = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect("second candidate succeeds after first exits");
+    // 第一个候选退出、第二个就绪：两次启动，且最终服务可用。
+    let starts = read_lines(&log);
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(parse_start(&starts[1]).0, provider.port());
+    assert_eq!(collect_text(&provider).await.unwrap(), "pong");
+    // 首个失败候选的进程组被回收。
+    wait_pid_gone(parse_start(&starts[0]).1).await;
+}
+
+#[tokio::test]
+async fn persistent_early_exit_stops_after_fixed_attempts() {
+    let tmp = TempDir::new().unwrap();
+    let log = tmp.path().join("starts.log");
+    let args = vec![
+        "--exit-early".to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 15);
+    let started = Instant::now();
+    let err = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect_err("always exits early");
+    // 固定尝试次数（1 + MAX_PORT_RETRIES）后放弃，而非无限重试。
+    assert_eq!(read_lines(&log).len(), 3, "{:?}", read_lines(&log));
+    let msg = format!("{err:#}");
+    assert!(msg.contains("3 attempt"), "{msg}");
+    assert!(msg.contains("exit status: 2"), "{msg}");
+    assert!(msg.contains("exited"), "{msg}");
+    // 不白等 15s 超时。
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // 全部失败候选进程组被回收。
+    for line in read_lines(&log) {
+        wait_pid_gone(parse_start(&line).1).await;
+    }
+}
+
+#[tokio::test]
+async fn spawn_missing_command_fails_immediately_without_retry() {
+    let tmp = TempDir::new().unwrap();
+    let log = tmp.path().join("starts.log");
+    // `./` 相对路径在插件根下不存在 → 配置无效，立即失败、不换端口重试。
+    let mut def = proxy_def(Vec::new(), BTreeMap::new(), 15);
+    def.proxy.as_mut().unwrap().command = "./no-such-proxy-bin".to_string();
+    def.proxy.as_mut().unwrap().args = vec!["--log-file".to_string(), log.display().to_string()];
+    let started = Instant::now();
+    let err = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect_err("missing command must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not found under plugin root"), "{msg}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // 一次都没真正 spawn。
+    assert!(!log.exists(), "{:?}", read_lines(&log));
+}
+
+#[tokio::test]
+async fn never_ready_non_200_stays_within_total_budget() {
+    let tmp = TempDir::new().unwrap();
+    let log = tmp.path().join("starts.log");
+    // 进程正常监听并就绪探针永远返回 503：只拉起一个候选，且总耗时
+    // ≈ 总期限（不因重试而获得多份完整 timeout）。
+    let args = vec![
+        "--ready-status".to_string(),
+        "503".to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 2);
+    let started = Instant::now();
+    let err = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect_err("never 200");
+    let elapsed = started.elapsed();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not ready"), "{msg}");
+    // 单个候选耗尽总期限；调度容差内不超预算，也不因重试翻倍。
+    assert_eq!(read_lines(&log).len(), 1, "{:?}", read_lines(&log));
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    for line in read_lines(&log) {
+        wait_pid_gone(parse_start(&line).1).await;
+    }
+}
+
+#[tokio::test]
+async fn hanging_ready_probe_is_bounded_by_remaining_budget() {
+    let tmp = TempDir::new().unwrap();
+    let log = tmp.path().join("starts.log");
+    // accept 但不回包：单次探针请求可能挂住，探针超时被剩余期限收口，
+    // 总耗时仍不超预算加少量容差。
+    let args = vec![
+        "--accept-and-hold".to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 2);
+    let started = Instant::now();
+    let err = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect_err("probe hangs");
+    let elapsed = started.elapsed();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not ready"), "{msg}");
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    for line in read_lines(&log) {
+        wait_pid_gone(parse_start(&line).1).await;
+    }
+}
+
+// ---- 4c. T2：并发连接失败合并重启 ----
+
+#[tokio::test]
+async fn concurrent_transport_failures_restart_once_and_both_succeed() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("crashed");
+    let log = tmp.path().join("starts.log");
+    let args = vec![
+        "--crash-on-chat".to_string(),
+        "--state-file".to_string(),
+        state.display().to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 15);
+    let provider = std::sync::Arc::new(
+        ProxyProvider::start(&def, &plugin_root())
+            .await
+            .expect("ready"),
+    );
+    assert_eq!(read_lines(&log).len(), 1);
+
+    // 屏障让两个请求在同一刻打到将死的旧实例：首个 chat 让旧进程自杀，
+    // 两个请求都拿到 Transport 并触发重启。
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let provider = provider.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            collect_text(&provider).await
+        }));
+    }
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.unwrap());
+    }
+    // 两个请求都成功：先到者重启，后到者复用新实例而非再拉一份。
+    for result in &results {
+        assert_eq!(result.as_deref().unwrap_or("ERR"), "pong", "{results:?}");
+    }
+    // 只启动了一份替代实例：1（原始）+ 1（合并后的重启）。
+    let starts = read_lines(&log);
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    // 后到者不杀正在服务的实例：当前端口即重启实例，且仍可用。
+    assert_eq!(parse_start(&starts[1]).0, provider.port());
+    assert_eq!(collect_text(&provider).await.unwrap(), "pong");
+    assert_eq!(read_lines(&log).len(), 2, "{:?}", read_lines(&log));
+}
+
+#[tokio::test]
+async fn late_restart_reuses_replacement_and_drop_cleans_up() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("crashed");
+    let log = tmp.path().join("starts.log");
+    // 重启后的稳定实例慢就绪，拉长重启窗口，让第二个失败请求必然"后到"。
+    let args = vec![
+        "--crash-on-chat".to_string(),
+        "--state-file".to_string(),
+        state.display().to_string(),
+        "--late-ready-delay".to_string(),
+        "0.8".to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 15);
+    let provider = std::sync::Arc::new(
+        ProxyProvider::start(&def, &plugin_root())
+            .await
+            .expect("ready"),
+    );
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let provider = provider.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            collect_text(&provider).await
+        }));
+    }
+    let mut ok = 0;
+    for task in tasks {
+        if matches!(task.await.unwrap().as_deref(), Ok("pong")) {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 2);
+    // 只重启一份；后到者复用，未再拉起、也未杀掉在服务的实例。
+    assert_eq!(read_lines(&log).len(), 2, "{:?}", read_lines(&log));
+    let url = format!("{}/v1/models", provider.endpoint());
+    let pid = provider.child_pid().expect("live child");
+    assert_eq!(get_status(&url).await, Some(reqwest::StatusCode::OK));
+
+    // drop 最终 provider：子进程被回收、监听消失。
+    drop(provider);
+    wait_pid_gone(pid).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if get_status(&url).await.is_none() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "proxy listener still up");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_restart_candidate_is_reaped() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("crashed");
+    let log = tmp.path().join("starts.log");
+    // 重启候选慢就绪（30s 远大于取消窗口），保证取消时候选仍在轮询未就绪。
+    let args = vec![
+        "--crash-on-chat".to_string(),
+        "--state-file".to_string(),
+        state.display().to_string(),
+        "--late-ready-delay".to_string(),
+        "30".to_string(),
+        "--log-file".to_string(),
+        log.display().to_string(),
+    ];
+    let def = proxy_def(args, BTreeMap::new(), 60);
+    let provider = ProxyProvider::start(&def, &plugin_root())
+        .await
+        .expect("ready");
+    assert_eq!(read_lines(&log).len(), 1);
+
+    // 首个 chat 让旧实例自杀 → Transport → 重启开始拉慢就绪候选；
+    // 在候选就绪前取消整个调用。
+    let messages = vec![Message::user_text("ping".to_string())];
+    let result = tokio::select! {
+        result = provider.stream(request(&messages)) => Some(result),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => None,
+    };
+    assert!(result.is_none(), "expected cancellation before ready");
+
+    // 候选确实被拉起过，随后因取消被 drop：进程组回收、监听不存在。
+    let starts = read_lines(&log);
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    let (candidate_port, candidate_pid) = parse_start(&starts[1]);
+    wait_pid_gone(candidate_pid).await;
+    assert!(
+        get_status(&format!("http://127.0.0.1:{candidate_port}/v1/models"))
+            .await
+            .is_none(),
+        "cancelled candidate must not keep listening"
+    );
 }
 
 // ---- 5. registry `proxy` 分支接线：JSON → 拉起 → 可用引擎 ----
