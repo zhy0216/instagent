@@ -49,3 +49,27 @@ cargo test
 ```
 
 本任务不修改 message 校验语义或 agent；提供批量 API 后在完成记录写明签名供 03 使用。一个本地 commit。
+
+## 完成记录（2026-09-05，任务 commit `dccd309`，rebase 后见本分支唯一任务 commit）
+
+实现：`src/session.rs`（实现与模块内测试）+ 新增 `tests/session_recovery.rs`（9 项端到端）。
+
+- T1：header/正文按字节逐行带预算读取（header 64KiB / 单行 96MiB / 总量 256MiB，
+  私有 `ReadLimits` 可注入小预算测试）；错误只带路径/行号/约束，不回显原文；
+  正文坏 UTF-8/坏 JSON 保留合法前缀并物理修复；有效末行缺换行规范化后才允许
+  append；超预算拒绝打开且原文件字节不动。
+- T2：新增 `Session::append_batch`，`append` 保持签名并复用单条路径；预序列化 +
+  候选历史统一校验（非法零落盘）；写/flush 失败按原长度回退并保持内存旧状态，
+  回退失败明确要求重新恢复；主文件 symlink 读/写双向拒绝；0600/0700 不变。
+- T3：`atomic_replace` 写/flush/sync/rename 任一失败清理 tmp；备份经
+  `create_private` 从创建起 0600；备份归属按 `<id>.<数字>[.<数字>].bak.jsonl`
+  精确解析，每会话保留最近 5 份。
+
+供 03 使用的最终签名：
+`pub fn append_batch(&mut self, messages: Vec<Message>) -> crate::Result<()>`
+（空 vec 为 no-op；非法候选零落盘；IO 失败回退旧长度 + 旧内存）。
+
+校验：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
+`cargo test --lib`（411 通过，含 session 43 项）、`session_recovery` 9 项、
+`cli_e2e` 15 项、`mcp_e2e` 14 项、`provider_proxy` 7 项全绿；`live_e2e`
+无 key 时 skip 全过（环境注入 key 时走真实网络超时，与本改动无关）。
