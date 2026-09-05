@@ -20,6 +20,10 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// 单个 config.yaml 的读取字节预算（方案默认：config/settings 1 MiB）。
+/// 超限直接报错并保留原文件，不做截断读取、不回显原文（todo 08 / D03）。
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
 /// `~/.config/instagent/config.yaml` 的完整形状。
 ///
 /// 不再包含任何密钥字段（ADR 0003 D1）：旧 `api_key` / `api_key_env` 键
@@ -147,7 +151,16 @@ fn compaction_threshold(source: &str, value: Option<f64>) -> crate::Result<f32> 
                      (got {raw}; suggested: 0.8)"
                 );
             }
-            Ok(raw as f32)
+            let narrowed = raw as f32;
+            // f64→f32 可能下溢到 0（极小正数）：转后仍须正且有限，否则阈值
+            // 退化成"永不/永远压缩"（todo 08 / D03）。
+            if !narrowed.is_finite() || narrowed <= 0.0 || narrowed > 1.0 {
+                bail!(
+                    "{source}: field `compaction_threshold` must be a finite number in (0, 1] \
+                     after f32 narrowing (got {raw}; suggested: 0.8)"
+                );
+            }
+            Ok(narrowed)
         }
     }
 }
@@ -177,19 +190,19 @@ impl Config {
     /// 读用户级 config.yaml，做字段级校验（错误带来源文件、字段与建议值），
     /// 叠加环境变量覆盖，并把 `plugins` 路径展开（`~` 前缀 + 相对路径按
     /// `cwd` 解析）。含 `api_key` / `api_key_env` 的文件在加载期报错
-    /// （ADR 0003 D1）。
+    /// （ADR 0003 D1）。单文件有界读取（[`MAX_CONFIG_FILE_BYTES`]）：超限 /
+    /// 非 UTF-8 / 坏 YAML 都带来源报错、不回显原文，原文件保持不变。
     pub fn load(cwd: &Path) -> crate::Result<Config> {
         let path = config_dir()?.join("config.yaml");
         let source = path.display().to_string();
-        let mut config = match std::fs::read_to_string(&path) {
-            Ok(text) => {
+        let mut config = match read_config_file(&path, &source)? {
+            Some(text) => {
                 reject_forbidden_key_fields(&text, &source)?;
                 let raw: RawConfig =
                     serde_yaml::from_str(&text).with_context(|| format!("in {source}"))?;
                 raw.into_config(&source)?
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(e) => return Err(e.into()),
+            None => Config::default(),
         };
         let (provider_from_env, model_from_env) = apply_env_overrides(&mut config);
         non_empty_optional(
@@ -213,8 +226,65 @@ impl Config {
                 path
             };
         }
+        config.validate_merged(&source)?;
         Ok(config)
     }
+
+    /// 合并后校验（todo 08 / D03）：文件 + 环境 + CLI override 全部合并后、
+    /// provider/MCP 启动前调用。拒绝空白 provider/model/shell 与非正/非有限
+    /// 的 f32 阈值（含 f64→f32 下溢到 0 的极小值）；错误带来源，不回显原文。
+    /// [`Config::load`] 已在返回前调用一次；CLI `-m` 等覆盖后由 assembly 再
+    /// 调一次，来源指向 CLI 合并结果。
+    pub fn validate_merged(&self, source: &str) -> crate::Result<()> {
+        non_empty_optional(source, "provider", self.provider.clone())?;
+        non_empty_optional(source, "model", self.model.clone())?;
+        non_empty_optional(source, "shell", self.shell.clone())?;
+        if !self.compaction_threshold.is_finite()
+            || self.compaction_threshold <= 0.0
+            || self.compaction_threshold > 1.0
+        {
+            bail!(
+                "{source}: field `compaction_threshold` must be a finite number in (0, 1] \
+                 (got {}; suggested: 0.8)",
+                self.compaction_threshold
+            );
+        }
+        for (index, path) in self.plugins.iter().enumerate() {
+            if path.as_os_str().is_empty() {
+                bail!(
+                    "{source}: field `plugins[{index}]` must be a non-empty path \
+                     (suggested: remove the empty entry)"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 有界读取 config.yaml：`NotFound` 按无配置处理（`None`）；超限/非 UTF-8/
+/// IO 错误都带来源报错、不回显原文，原文件保持不变（只读，从不截断改写）。
+fn read_config_file(path: &Path, source: &str) -> crate::Result<Option<String>> {
+    use std::io::Read as _;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read config file {source}")),
+    };
+    let mut buf = Vec::new();
+    std::io::Read::take(&mut file, MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read config file {source}"))?;
+    if buf.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        bail!(
+            "{source}: config file exceeds the {MAX_CONFIG_FILE_BYTES}-byte read budget; \
+             the file was left unchanged, trim it and retry"
+        );
+    }
+    String::from_utf8(buf)
+        .map_err(|_| {
+            anyhow::anyhow!("{source}: config file is not valid UTF-8; the file was left unchanged")
+        })
+        .map(Some)
 }
 
 fn env_override(name: &str) -> Option<String> {
@@ -447,6 +517,57 @@ mod tests {
         assert!(message.contains("INSTAGENT_MODEL"), "{message}");
         assert!(message.contains("model"), "{message}");
         std::env::remove_var("INSTAGENT_MODEL");
+    }
+
+    // ---- todo 08 / D03：下溢阈值、有界读取与合并后校验 ----
+
+    #[test]
+    fn underflow_threshold_narrowing_to_zero_is_rejected() {
+        let (_guard, dir) = temp_config_dir();
+        // 1e-46 在 f64 合法但 f32 下溢到 0（f32 最小次正规约 1.4e-45）：
+        // 必须拒绝，不退化成永不压缩。
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "compaction_threshold: 1e-46\n",
+        )
+        .unwrap();
+        let err = Config::load(Path::new("/tmp/project")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("compaction_threshold"), "{message}");
+        assert!(message.contains("0.8"), "{message}");
+    }
+
+    #[test]
+    fn oversized_config_is_rejected_with_source_and_left_unchanged() {
+        let (_guard, dir) = temp_config_dir();
+        let path = dir.path().join("config.yaml");
+        // 合法前缀 + 填充到超限 1 字节：错误带来源、不回显原文、文件不动。
+        let filler = "x".repeat(MAX_CONFIG_FILE_BYTES as usize + 1);
+        let content = format!("provider: openai\nmodel: m\nshell: /bin/sh # {filler}\n");
+        assert!(content.len() as u64 > MAX_CONFIG_FILE_BYTES);
+        std::fs::write(&path, &content).unwrap();
+        let err = Config::load(Path::new("/tmp/project")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("config.yaml"), "{message}");
+        assert!(message.contains("budget"), "{message}");
+        assert!(!message.contains(&filler[..64]), "错误不得回显原文");
+        assert_eq!(std::fs::read(&path).unwrap().len(), content.len());
+    }
+
+    #[test]
+    fn validate_merged_rejects_blank_cli_model_override() {
+        let (_guard, _dir) = temp_config_dir();
+        let config = Config {
+            provider: Some("fake".into()),
+            model: Some("   ".into()),
+            ..Config::default()
+        };
+        let err = config
+            .validate_merged("merged config (config.yaml + env + CLI -m/--model)")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("model"), "{message}");
+        assert!(message.contains("CLI -m"), "{message}");
     }
 
     #[test]

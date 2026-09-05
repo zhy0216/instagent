@@ -106,20 +106,37 @@ impl SkillsSource {
 
 /// 一层子目录扫描：每个含 `SKILL.md` 的子目录是一个 skill，不递归。
 /// `namespace` 是插件名（拼 `<plugin>:<skill>`），用户/项目根传 `None`。
+/// 不存在根目录按正常（无 skills）静默处理；读取/权限失败则带路径 warning
+/// （todo 08 / D02：超大/不可读 SKILL.md 在默认 warning 日志中可见，健康
+/// 来源继续加载，不新增审批、不改 fail-open）。
 fn scan_skills_root(
     root: &Path,
     namespace: Option<&str>,
     seen: &mut HashSet<String>,
     out: &mut SkillsSource,
 ) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return; // 根目录不存在不算错误
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!("跳过 skills 根 {}：读取目录失败 {err}", root.display());
+            return;
+        }
     };
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!("跳过 skills 根 {} 下条目：读取失败 {err}", root.display());
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
     dirs.sort();
     for dir in dirs {
         let dir_name = match dir.file_name().and_then(|n| n.to_str()) {
@@ -127,9 +144,27 @@ fn scan_skills_root(
             None => continue,
         };
         let path = dir.join("SKILL.md");
-        // 有界读取：缺文件与超上限都跳过（没有 SKILL.md 的普通子目录不算无效）。
-        let Ok(text) = read_skill_file(&path) else {
-            continue;
+        // 无 SKILL.md 的普通子目录不算 skill，静默跳过；其他元信息失败
+        // （权限等）才是有界诊断。
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(
+                    "跳过 skill {}：读取 {} 失败 {err}",
+                    dir.display(),
+                    path.display()
+                );
+                continue;
+            }
+        }
+        // 有界读取：超限/非 UTF-8/读取失败都带路径 warn 后跳过该 skill。
+        let text = match read_skill_file(&path) {
+            Ok(text) => text,
+            Err(message) => {
+                tracing::warn!("跳过 skill {}：{}", dir.display(), truncate_warn(&message));
+                continue;
+            }
         };
         let name = namespace.map_or_else(
             || dir_name.clone(),
@@ -149,6 +184,19 @@ fn scan_skills_root(
             }
             Err(err) => tracing::warn!("跳过无效 skill `{}`：{err:#}", dir.display()),
         }
+    }
+}
+
+/// warning 截断：诊断带路径即可，不倾倒文件内容；超长只保留前 512 字符。
+fn truncate_warn(message: &str) -> String {
+    const LIMIT: usize = 512;
+    if message.chars().count() <= LIMIT {
+        message.to_string()
+    } else {
+        format!(
+            "{}…(truncated)",
+            message.chars().take(LIMIT).collect::<String>()
+        )
     }
 }
 

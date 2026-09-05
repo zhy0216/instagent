@@ -195,15 +195,35 @@ async fn watch_ctrl_c(cancel: CancellationToken, quit: Arc<AtomicBool>) {
     }
 }
 
-/// `/compact`：立即强制压缩（`16` 的 compact::force）。
+/// `/compact`：立即强制压缩（`16` 的 [`compact::force_cancelable`]，可取消）。
+/// Ctrl-C 取消当前压缩：printer/watcher 正确收尾，REPL 可继续，会话不动；
+/// 无可压缩历史时同样 no-op；错误返回也不遗留打印任务（todo 08 / A04）。
 async fn compact_now(rt: &mut Runtime, session: &mut Session) -> instagent::Result<()> {
+    let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel::<instagent::agent::Event>(64);
     let printer = tokio::spawn(print_events(rx));
-    compact::force(&rt.agent, session, &tx).await?;
+    let watcher = tokio::spawn(watch_compact_ctrl_c(cancel.clone()));
+    let result = compact::force_cancelable(&rt.agent, session, &tx, &cancel).await;
+    let cancelled = cancel.is_cancelled();
     drop(tx);
+    drop(cancel);
+    watcher.abort();
     let _ = printer.await;
-    eprintln!("(compacted)");
+    match result? {
+        true => eprintln!("(compacted)"),
+        false if cancelled => eprintln!("(compaction cancelled)"),
+        false => eprintln!("(nothing to compact)"),
+    }
     Ok(())
+}
+
+/// 压缩内 Ctrl-C：只取消当前压缩，REPL 继续（与轮内两段式不同，压缩取消
+/// 后不直接退出；第二次 Ctrl-C 由下一轮的 `watch_ctrl_c` 处理）。
+async fn watch_compact_ctrl_c(cancel: CancellationToken) {
+    if tokio::signal::ctrl_c().await.is_ok() {
+        cancel.cancel();
+        eprintln!("\n^C cancelling compaction");
+    }
 }
 
 fn print_help(plugin_commands: &[SlashCommand]) {

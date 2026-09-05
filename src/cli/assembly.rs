@@ -49,21 +49,29 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
     let mut notes = Vec::new();
 
     // 24h 节流的 git 自动更新（`07`；失败只 warn，不挡启动）。
-    if let Ok(results) = install::auto_update_all(chrono::Utc::now().timestamp()) {
-        for item in results {
-            if let Err(err) = item.result {
-                notes.push(format!(
-                    "auto-update plugin `{}` failed: {err:#}",
-                    item.name
-                ));
+    // 顶层 Err（扫描用户插件目录失败等）同样进 notes 可见（todo 08 / D02），
+    // 不静默吞掉；单项失败仍逐条记录。
+    match install::auto_update_all(chrono::Utc::now().timestamp()) {
+        Ok(results) => {
+            for item in results {
+                if let Err(err) = item.result {
+                    notes.push(format!(
+                        "auto-update plugin `{}` failed: {err:#}",
+                        item.name
+                    ));
+                }
             }
         }
+        Err(err) => notes.push(format!("auto-update check failed: {err:#}")),
     }
 
     let mut config = Config::load(&opts.cwd)?;
     if let Some(model) = &opts.model {
         config.model = Some(model.clone());
     }
+    // T2：CLI override 合并后再校验（todo 08 / D03）：空白 `-m` 等在
+    // provider/MCP 启动前报错，不等到 assemble 才含糊失败。
+    config.validate_merged("merged config (config.yaml + env + CLI -m/--model)")?;
     let settings = Settings::merged(&opts.cwd)?;
     // `--plugin PATH` 与配置 plugins 同规则：`~` 前缀展开、相对路径按 cwd 解析。
     let cli_plugins: Vec<PathBuf> = opts

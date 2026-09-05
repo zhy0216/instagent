@@ -111,12 +111,14 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// `tracing` 初始化：默认关（REPL 输出干净），`RUST_LOG` 打开。
+/// `tracing` 初始化：默认 warning 到 stderr（健康路径保持安静），
+/// 显式 `RUST_LOG` 优先（todo 08 / D01：hook fail-open、清单失败等 warning
+/// 在不设 RUST_LOG 的真实 CLI 中可见；stdout 仍仅答案）。
 pub fn init_logging() {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let registry = tracing_subscriber::registry().with(filter).with(
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
