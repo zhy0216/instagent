@@ -1,10 +1,5 @@
-//! 系统提示（第二版 §2.9）：`format!` 拼四段——身份一句话、工具说明、
-//! `cwd` + 当前时间、响应规范（markdown、简洁）。
-//!
-//! 文本从 goose `crates/goose/src/prompts/system.md`（commit `4ad43df`）精简搬运：
-//! 身份句改 goose→instagent（system.md:1~2），Extensions 段改为 MCP instructions
-//! 注入位（system.md:10~30），Response Guidelines 沿用（system.md:37~39）。
-//! 不用模板引擎；MCP server instructions 与 skill 行由 `18` 装配时传入。
+//! Headless 系统提示：自主执行任务、工具说明、`cwd` + 当前时间、输出契约。
+//! MCP server instructions 与 skill 行由装配层传入。
 
 use std::path::Path;
 
@@ -27,19 +22,24 @@ pub struct PromptContext<'a> {
 /// 生成 system 字符串（请求字段，不是 Message）。
 pub fn system(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::from(
-        "You are instagent, a minimal general-purpose AI agent, developed as an \
-         open-source project.\n\n",
+        "You are instagent, a headless AI agent executing an unattended task. \
+         No user is available during execution. Complete the supplied task autonomously: \
+         do not ask follow-up questions, request approval, or wait for user input. \
+         Make reasonable assumptions from the task and environment and state material \
+         assumptions in the result. If essential information, credentials, permissions, \
+         or capabilities are missing, explain why the task could not be completed and \
+         never claim success.\n\n",
     );
 
     prompt.push_str("# Tools\n\n");
     if ctx.tools.is_empty() {
         prompt.push_str(
-            "No tools are available in this conversation. Answer directly and say so when \
+            "No tools are available for this task. Answer directly and say so when \
              you cannot inspect the environment.\n\n",
         );
     } else {
         prompt.push_str(
-            "You can call the tools below to work with the user's environment. Prefer a tool \
+            "You can call the tools below to work with the task environment. Prefer a tool \
              call over guessing when you need facts about files or commands, and wait for \
              results before continuing.\n\n",
         );
@@ -57,7 +57,8 @@ pub fn system(ctx: &PromptContext<'_>) -> String {
         prompt.push_str("# Extensions & Skills\n\n");
         prompt.push_str(
             "Tool and skill behavior may be governed by the instructions below; follow them \
-             when using the matching tools.\n\n",
+             when using the matching tools. If an instruction requires user interaction, \
+             report the unmet prerequisite instead of waiting for a response.\n\n",
         );
         for line in ctx.mcp_instructions {
             prompt.push_str(&format!("- {line}\n"));
@@ -77,8 +78,10 @@ pub fn system(ctx: &PromptContext<'_>) -> String {
 
     prompt.push_str("# Response Guidelines\n\n");
     prompt.push_str(
-        "Use Markdown formatting for all responses. Keep answers concise and focused on what \
-         the user asked.\n",
+        "Follow the output format requested by the task, including plain text, JSON, or \
+         another specified format. Keep the final result concise and focused on the task. \
+         Describe the outcome and any unresolved blockers accurately; distinguish verified \
+         results from assumptions. Do not offer to continue or end with a question.\n",
     );
     prompt
 }
@@ -128,7 +131,7 @@ mod tests {
         assert!(prompt.contains("- skill pdf — read pdf documents"));
         assert!(prompt.contains("Primary working directory: /work/demo"));
         assert!(prompt.contains("Today's date and time: 2026-01-02 03:04 UTC"));
-        assert!(prompt.contains("Use Markdown formatting"));
+        assert!(prompt.contains("Follow the output format requested by the task"));
     }
 
     #[test]
@@ -143,5 +146,24 @@ mod tests {
         let prompt = system(&ctx);
         assert!(prompt.contains("No tools are available"));
         assert!(!prompt.contains("# Extensions & Skills"));
+    }
+
+    #[test]
+    fn unattended_task_contract_never_requires_a_reply_or_markdown() {
+        let prompt = system(&PromptContext {
+            tools: &[],
+            cwd: Path::new("/tmp"),
+            now: fixed_now(),
+            mcp_instructions: &[],
+            skill_lines: &[],
+        });
+        assert!(prompt.contains("headless AI agent executing an unattended task"));
+        assert!(prompt
+            .contains("do not ask follow-up questions, request approval, or wait for user input"));
+        assert!(prompt.contains("Make reasonable assumptions"));
+        assert!(prompt.contains("explain why the task could not be completed"));
+        assert!(prompt.contains("never claim success"));
+        assert!(prompt.contains("including plain text, JSON"));
+        assert!(!prompt.contains("Use Markdown"));
     }
 }

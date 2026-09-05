@@ -5,6 +5,8 @@
 - 依据：`plans/repo-improvements-2026-09-04/plan.md` §总体方案第 1 条（S6、S12、S13、S16、A5、A6）
 - 关联：ADR 0001（Anthropic 原生引擎移除，engine 只剩 openai / proxy）、ADR 0002（sandbox agent、工具自动执行、无 approval/trust/mode UI）
 - 后续实现任务：`plans/repo-improvements-2026-09-04/todos/` 02、03、04、06、08、10、11、12（映射见各决策末尾）
+- 后续修订：2026-09-05 [ADR 0004](0004-headless-agent.md) 将项目定位为 headless agent，
+  扩展 D4 的 JSON 结果、状态/退出码与取消期限；D1–D3、D5–D6 继续有效。
 
 ## 背景
 
@@ -85,14 +87,16 @@ Anthropic 支持（ADR 0001），不引入任何交互式 approval / trust / mod
 
 ### D4 · CLI 机器契约：stdout 只放答案，其余全走 stderr
 
-- **默认**：`instagent` CLI 中 stdout 只输出模型最终回答文本流
+- **默认**：`instagent run --output text` 中 stdout 只输出模型文本流
   （TextDelta）；工具事件（`▶` / `✓` / `✗` 行）、预览、usage、compaction
   提示、错误、诊断与 tracing 日志全部走 stderr。`>file` / 管道消费方
-  因此拿到纯答案。
+  因此拿到模型文本（可能含中间说明或失败前的部分输出）。
 - **错误行为**：运行失败 → 非零退出码，stderr 末行为 `error: {message}`；
-  渲染 / 关闭 stdout 失败（如 EPIPE）不改退出码。`--output json` 类
-  结构化输出不在本轮，出现需求时另立决策。
-- **例外**：无。
+  text 模式渲染 / 关闭 stdout 失败（如 EPIPE）不改退出码。
+- **后续扩展**：[ADR 0004](0004-headless-agent.md) 已定义 `--output json` 单文档结果，
+  以及完成、失败、轮数耗尽、超时、取消对应的退出码。JSON 模式 stdout 只放结果文档，
+  诊断仍走 stderr。JSON 写入或 flush 失败退出 1；具体状态、字段与生命周期以
+  ADR 0004 为准。
 - **后续实现**：todo 12（render.rs 迁移 + 契约回归测试，现有接受混合
   输出的测试同步改）。
 

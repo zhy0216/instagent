@@ -11,11 +11,10 @@ use anyhow::bail;
 
 use instagent::agent::Agent;
 use instagent::commands::load_commands;
-use instagent::commands::SlashCommand;
+use instagent::commands::TaskTemplate;
 use instagent::config::Config;
 use instagent::hooks::Hooks;
 use instagent::plugin::bundled::discover_with_bundled;
-use instagent::plugin::install;
 use instagent::plugin::install::plugin_data_dir;
 use instagent::provider::ProviderRegistry;
 use instagent::settings::Settings;
@@ -25,18 +24,19 @@ use instagent::tools::CommandTools;
 use instagent::tools::Registry;
 use instagent::tools::SkillsSource;
 
-/// 装配入参（一次 chat / run 的命令行层配置）。
+/// 装配入参（一次 run 的命令行层配置）。
 #[derive(Debug, Clone)]
 pub struct AssemblyOpts {
     pub cwd: PathBuf,
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub cli_plugins: Vec<PathBuf>,
 }
 
 /// 装配产物。
 pub struct Runtime {
     pub agent: Agent,
-    pub slash_commands: Vec<SlashCommand>,
+    pub task_templates: Vec<TaskTemplate>,
     /// 会话 header 记录（`02`）。
     pub provider_name: String,
     pub model: String,
@@ -48,24 +48,10 @@ pub struct Runtime {
 pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
     let mut notes = Vec::new();
 
-    // 24h 节流的 git 自动更新（`07`；失败只 warn，不挡启动）。
-    // 顶层 Err（扫描用户插件目录失败等）同样进 notes 可见（todo 08 / D02），
-    // 不静默吞掉；单项失败仍逐条记录。
-    match install::auto_update_all(chrono::Utc::now().timestamp()) {
-        Ok(results) => {
-            for item in results {
-                if let Err(err) = item.result {
-                    notes.push(format!(
-                        "auto-update plugin `{}` failed: {err:#}",
-                        item.name
-                    ));
-                }
-            }
-        }
-        Err(err) => notes.push(format!("auto-update check failed: {err:#}")),
-    }
-
     let mut config = Config::load(&opts.cwd)?;
+    if let Some(provider) = &opts.provider {
+        config.provider = Some(provider.clone());
+    }
     if let Some(model) = &opts.model {
         config.model = Some(model.clone());
     }
@@ -185,7 +171,7 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
 
     Ok(Runtime {
         agent,
-        slash_commands: load_commands(&plugins)?,
+        task_templates: load_commands(&plugins)?,
         provider_name,
         model,
         notes,
@@ -227,12 +213,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        handlers::run(
-            "say hi".to_string(),
-            Some(env.cwd.path().to_path_buf()),
-            None,
-            Vec::new(),
-        )
+        handlers::run(crate::cli::RunArgs {
+            task: Some("say hi".to_string()),
+            cwd: Some(env.cwd.path().to_path_buf()),
+            ..Default::default()
+        })
         .await
         .unwrap();
 

@@ -1,12 +1,14 @@
 # instagent TODO 队列
 
-用 Rust 从零实现一个**插件为核心的最小 agent**。任务队列按 `todos/README.md` 的顺序推进，
+用 Rust 从零实现一个**以插件为核心的 headless agent**，面向无人值守任务执行。
+任务队列按 `todos/README.md` 的顺序推进，
 每个 todo 文件 = 一个独立任务 = 一个任务分支 = 最终一个 commit。
 
 ## 设计依据
 
-- **主依据**：`docs/goose-plugin-core-plan.md`（第三版：插件模型、provider、工具来源、内核边界）
-- **补充**：`docs/goose-from-scratch-plan.md`（第二版 §2.2 消息、§2.5 loop、§2.6 会话、§2.7 压缩、§2.11 CLI 被第三版沿用）
+- **当前依据**：`docs/adr/0004-headless-agent.md`（无人值守任务与插件契约）、`docs/usage.md`（现行接口）。
+- **当前迁移方案**：`plans/headless-agent/plan.md`，任务 `20-headless-agent.md`。
+- **历史背景**：`docs/goose-plugin-core-plan.md`、`docs/goose-from-scratch-plan.md`。已归档任务保留当时设计，不作为恢复交互入口的依据。
 - **参考基线**：`~/yyds/goose`（block/goose commit `4ad43df`，只读）。本地不存在时先
   `git clone https://github.com/block/goose ~/yyds/goose && git -C ~/yyds/goose checkout 4ad43df`。
   只作参照与文本/代码搬运来源，不改它。
@@ -33,6 +35,9 @@ cargo test
 
 ## 并行策略（给协调器）
 
+00–19 已完成并归档。以下骨架顺序记录保留供历史查阅；当前任务 20 按自身
+“涉及文件”划分实现、测试与文档，每个文件由单一执行者负责。
+
 Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：它建好 Cargo 工程和完整模块树
 （所有模块都是可编译的空壳），之后每个 todo 只填充自己名下的文件，互不重叠。
 
@@ -56,6 +61,7 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 | P2 | 13-tools-core-builtin.md, 14-tools-mcp.md, 15-tools-command-skills.md | 工具层 |
 | P3 | 16-agent-loop.md, 17-hooks-commands.md | loop 与扩展点 |
 | P4 | 18-cli.md, 19-hardening.md | 收口 |
+| 当前 | [20-headless-agent.md](20-headless-agent.md) | 无人值守定位迁移：run、结果契约、期限、插件模板、文档与回归 |
 
 ## 文件
 
@@ -81,3 +87,4 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 18. [done/17-hooks-commands.md](done/17-hooks-commands.md) — ✅ 完成。依赖：00、03、05、16
 19. [done/18-cli.md](done/18-cli.md) — ✅ 完成。依赖：00、16、10、11、14、15、17、01
 20. [done/19-hardening.md](done/19-hardening.md) — ✅ 完成。依赖：全部
+21. [20-headless-agent.md](20-headless-agent.md) — ✅ 已完成（2026-09-05）。依赖：00–19；实现与验收记录见当前方案。

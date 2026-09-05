@@ -10,7 +10,7 @@
 //! `session ` / `▶` 等诊断全在 stderr。
 //!
 //! 用例表对应 `plans/live-e2e/plan.md`：a1/a2 run 全链路，b1/b2 会话管理，
-//! d1–d5 插件链路（command tool / hooks / skill / 斜杠命令，消费
+//! d1–d5 插件链路（command tool / hooks / skill / 任务模板，消费
 //! `tests/fixtures/liveplug`），e1 环境变量覆盖。
 
 use std::path::Path;
@@ -20,7 +20,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_instagent");
 /// 真 API 比 wiremock 慢一个量级；超时兜底防挂死。
@@ -124,25 +123,6 @@ async fn output(mut cmd: tokio::process::Command) -> Output {
         .await
         .expect("instagent 二进制执行超时（180s）")
         .expect("spawn instagent 二进制")
-}
-
-/// 同 [`output`]，但先经 stdin 喂一段输入（chat REPL 管道输入用）。
-async fn output_with_stdin(mut cmd: tokio::process::Command, stdin: &[u8]) -> Output {
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    instagent::subprocess::configure_subprocess(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn instagent 二进制");
-    let mut child_stdin = child.stdin.take().unwrap();
-    child_stdin
-        .write_all(stdin)
-        .await
-        .expect("write stdin to instagent");
-    drop(child_stdin);
-    tokio::time::timeout(TIMEOUT, child.wait_with_output())
-        .await
-        .expect("instagent 二进制执行超时（180s）")
-        .expect("wait instagent 二进制")
 }
 
 fn assert_ok(output: &Output, ctx: &str) {
@@ -256,28 +236,36 @@ async fn live_b1_sessions_list_read_rm() {
     assert!(!file.exists(), "rm 后会话文件应被删除");
 }
 
-/// b2：管道 stdin 喂 chat 记暗号，`--resume last` 问回来。
+/// b2：独立批次记住暗号，`run --resume last` 恢复后读回。
 #[tokio::test]
-async fn live_b2_chat_remember_resume() {
+async fn live_b2_run_remember_resume() {
     if !has_key() {
         return;
     }
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
 
-    let first = output_with_stdin(
-        sandbox.cmd(&["chat"]),
-        "记住暗号 BLUE_OTTER_3。只回复“记住了”，不要输出其他内容。\n/exit\n".as_bytes(),
-    )
+    let first = output(sandbox.cmd(&[
+        "run",
+        "-t",
+        "记住暗号 BLUE_OTTER_3。只回复“记住了”，不要输出其他内容。",
+    ]))
     .await;
-    assert_ok(&first, "b2 chat 记暗号");
+    assert_ok(&first, "b2 run 记暗号");
 
-    let second = output_with_stdin(
-        sandbox.cmd(&["chat", "--resume", "last"]),
-        "我刚才让你记住的暗号是什么？只回复暗号本身，不要输出其他内容。\n/exit\n".as_bytes(),
-    )
+    let second = output(sandbox.cmd(&[
+        "run",
+        "--resume",
+        "last",
+        "-t",
+        "我刚才让你记住的暗号是什么？只回复暗号本身，不要输出其他内容。",
+    ]))
     .await;
-    assert_ok(&second, "b2 chat --resume last 问暗号");
+    assert_ok(&second, "b2 run --resume last 问暗号");
+    assert_eq!(
+        session_id_of(&String::from_utf8_lossy(&first.stderr)),
+        session_id_of(&String::from_utf8_lossy(&second.stderr)),
+    );
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(stdout.contains("BLUE_OTTER_3"), "{stdout}");
 }
@@ -416,9 +404,9 @@ async fn live_d4_plugin_skill() {
     assert!(stdout.contains("KIWI_55"), "{stdout}");
 }
 
-/// d5：斜杠命令——`/greet pineapple` 展开 `$ARGUMENTS`，回复提及该词（§9.7）。
+/// d5：任务模板展开 `$ARGUMENTS`，回复提及该词（§9.7）。
 #[tokio::test]
-async fn live_d5_plugin_slash_command() {
+async fn live_d5_plugin_task_template() {
     if !has_key() {
         return;
     }
@@ -426,12 +414,17 @@ async fn live_d5_plugin_slash_command() {
     sandbox.install_live_provider();
     let plugin = liveplug_fixture().display().to_string();
 
-    let out = output_with_stdin(
-        sandbox.cmd(&["chat", "--plugin", &plugin]),
-        b"/greet pineapple\n/exit\n",
-    )
+    let out = output(sandbox.cmd(&[
+        "run",
+        "--plugin",
+        &plugin,
+        "--command",
+        "liveplug:greet",
+        "--args",
+        "pineapple",
+    ]))
     .await;
-    assert_ok(&out, "d5 slash command");
+    assert_ok(&out, "d5 task template");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("pineapple"), "{stdout}");
 }

@@ -1,20 +1,16 @@
-//! CLI（第二版 §2.11；第三版 §8 完整图景）：
-//! clap 入口 + chat / run / sessions / plugin 四个子命令与运行时装配。
-//!
-//! 本模块只在 `main.rs` 里声明（`src/cli/**` 不在 lib 模块树，`00` 的约定）；
-//! 装配见 [`assembly`]，REPL 见 [`repl`]。
+//! Headless CLI: execute a complete task, manage persisted sessions and plugins.
+//! Runtime setup lives in [`assembly`]; no terminal input or REPL is provided.
 
 pub mod assembly;
 pub mod handlers;
 pub mod render;
-pub mod repl;
 
-use clap::Parser;
-use clap::Subcommand;
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "instagent", version, about = "插件为核心的最小 agent")]
+#[command(name = "instagent", version, about = "插件为核心的 headless agent")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,40 +18,75 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// 交互式 REPL（rustyline；/exit /clear /compact /tools /help）
-    Chat {
-        /// 恢复会话：id 或 "last"
-        #[arg(long)]
-        resume: Option<String>,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(short, long)]
-        model: Option<String>,
-        /// 开发时临时加载插件路径
-        #[arg(long = "plugin")]
-        plugin: Vec<PathBuf>,
-    },
-    /// 无交互跑一条任务（结束打印最终回复和 usage）
-    Run {
-        #[arg(short = 't', long)]
-        task: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(short, long)]
-        model: Option<String>,
-        #[arg(long = "plugin")]
-        plugin: Vec<PathBuf>,
-    },
-    /// 会话管理
+    /// Execute an unattended task and exit
+    Run(RunArgs),
+    /// Manage persisted sessions
     Sessions {
         #[command(subcommand)]
         action: SessionsAction,
     },
-    /// 插件管理
+    /// Manage plugins before running tasks
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Stream assistant text to stdout, diagnostics to stderr
+    #[default]
+    Text,
+    /// Write one terminal JSON result to stdout
+    Json,
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("input").required(true).multiple(false)))]
+pub struct RunArgs {
+    /// Complete task text; stdin is never read
+    #[arg(short = 't', long, group = "input")]
+    pub task: Option<String>,
+    /// Read the complete task from a regular UTF-8 file
+    #[arg(long, group = "input")]
+    pub task_file: Option<PathBuf>,
+    /// Plugin task template, qualified as plugin:name
+    #[arg(long, group = "input")]
+    pub command: Option<String>,
+    /// Literal arguments substituted into the task template
+    #[arg(long, requires = "command", conflicts_with_all = ["task", "task_file"])]
+    pub args: Option<String>,
+    /// Append this task to an existing session (id or last)
+    #[arg(long)]
+    pub resume: Option<String>,
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long = "plugin")]
+    pub plugin: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "text")]
+    pub output: OutputFormat,
+    /// Run deadline in seconds, followed by at most five seconds for cleanup
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=604800))]
+    pub timeout: u64,
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            task: None,
+            task_file: None,
+            command: None,
+            args: None,
+            resume: None,
+            cwd: None,
+            model: None,
+            plugin: Vec::new(),
+            output: OutputFormat::Text,
+            timeout: 600,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -90,24 +121,19 @@ pub enum PluginAction {
     },
 }
 
-/// `main` 入口：分发四个子命令。
-pub async fn run() -> anyhow::Result<()> {
+/// Dispatch a single noninteractive command.
+pub async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Chat {
-            resume,
-            cwd,
-            model,
-            plugin,
-        } => handlers::chat(resume, cwd, model, plugin).await,
-        Commands::Run {
-            task,
-            cwd,
-            model,
-            plugin,
-        } => handlers::run(task, cwd, model, plugin).await,
-        Commands::Sessions { action } => handlers::sessions(action),
-        Commands::Plugin { action } => handlers::plugin(action),
+        Commands::Run(args) => handlers::run(args).await,
+        Commands::Sessions { action } => {
+            handlers::sessions(action)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Plugin { action } => {
+            handlers::plugin(action)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

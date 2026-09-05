@@ -1,6 +1,7 @@
-//! 插件斜杠命令（第三版 §2.8）：`dev.instagent/commands/*.md`，Claude Code
-//! 约定。frontmatter 取 `description` / `argument-hint`，正文 `$ARGUMENTS`
-//! 展开；无占位符且带参数时参数追加到末尾（Claude Code 行为）。
+//! 无交互任务模板：保留 `dev.instagent/commands/*.md` 插件文件格式，
+//! 通过 `run --command plugin:name --args ...` 提供任务。frontmatter 取
+//! `description` / `argument-hint`，正文 `$ARGUMENTS` 展开；无占位符且
+//! 带参数时参数追加到末尾。
 //!
 //! 目录枚举与正文读取都带可见诊断与硬上限（R12、S18）：坏 symlink、无权限、
 //! 超长正文、解析失败、重名一律汇总成 [`SkippedCommand`]，不静默消失。
@@ -15,8 +16,8 @@ use crate::plugin::PluginSet;
 use crate::plugin::NAMESPACE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlashCommand {
-    /// 命令名 = 文件名（不含扩展名）。
+pub struct TaskTemplate {
+    /// 完整模板名 = `plugin:文件名`（文件名不含扩展名），不提供裸名称别名。
     pub name: String,
     pub description: Option<String>,
     pub argument_hint: Option<String>,
@@ -71,10 +72,10 @@ pub struct SkippedCommand {
 }
 
 /// 发现启用插件的 `dev.instagent/commands/*.md`（插件名升序、文件名升序，
-/// 同名命令先到先得）。坏目录、坏 symlink、无权限、超长正文、解析失败与重名
+/// 名称按 `plugin:name` 消歧）。坏目录、坏 symlink、无权限、超长正文、解析失败与重名
 /// 都汇总成可见诊断（[`collect_commands`] 返回、[`load_commands`] 逐条 warn），
 /// 不静默消失；解析失败不中断加载。
-pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<SlashCommand>> {
+pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<TaskTemplate>> {
     let (commands, skipped) = collect_commands(plugins);
     for skipped in &skipped {
         tracing::warn!("跳过 {}：{}", skipped.path.display(), skipped.reason);
@@ -84,7 +85,7 @@ pub fn load_commands(plugins: &PluginSet) -> crate::Result<Vec<SlashCommand>> {
 
 /// [`load_commands`] 的诊断面：返回（命令列表，被跳过项）。装配层需要时可直接
 /// 用它把 `skipped` 并入启动 notes。
-pub fn collect_commands(plugins: &PluginSet) -> (Vec<SlashCommand>, Vec<SkippedCommand>) {
+pub fn collect_commands(plugins: &PluginSet) -> (Vec<TaskTemplate>, Vec<SkippedCommand>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for plugin in plugins.iter() {
@@ -135,9 +136,11 @@ pub fn collect_commands(plugins: &PluginSet) -> (Vec<SlashCommand>, Vec<SkippedC
         }
         files.sort();
         for path in files {
-            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                skipped.push(diagnostic(plugin, &path, "template filename must be UTF-8"));
                 continue;
             };
+            let name = format!("{}:{stem}", plugin.manifest.name);
             let text = match read_bounded(&path) {
                 Ok(text) => text,
                 Err(reason) => {
@@ -152,15 +155,15 @@ pub fn collect_commands(plugins: &PluginSet) -> (Vec<SlashCommand>, Vec<SkippedC
                     continue;
                 }
             };
-            if out.iter().any(|cmd: &SlashCommand| cmd.name == name) {
+            if out.iter().any(|cmd: &TaskTemplate| cmd.name == name) {
                 skipped.push(diagnostic(
                     plugin,
                     &path,
-                    &format!("command `/{name}` is duplicated, first one wins"),
+                    &format!("task template `{name}` is duplicated"),
                 ));
                 continue;
             }
-            out.push(SlashCommand {
+            out.push(TaskTemplate {
                 name,
                 description: frontmatter.description,
                 argument_hint: frontmatter.argument_hint,
@@ -214,8 +217,8 @@ fn parse_command_file(text: &str) -> crate::Result<(CommandFrontmatter, String)>
     crate::tools::skills::parse_frontmatter(text, true)
 }
 
-/// 命令正文 + 用户参数 → 一条用户消息文本（`/review security` 的展开）。
-pub fn expand(cmd: &SlashCommand, args: &str) -> String {
+/// 模板正文 + 调用参数 → 一条任务消息文本。
+pub fn expand(cmd: &TaskTemplate, args: &str) -> String {
     let args = args.trim();
     if cmd.template.contains("$ARGUMENTS") {
         cmd.template.replace("$ARGUMENTS", args)
@@ -277,14 +280,14 @@ mod tests {
 
         let commands = load_commands(&set).unwrap();
         assert_eq!(commands.len(), 2);
-        let review = commands.iter().find(|c| c.name == "review").unwrap();
+        let review = commands.iter().find(|c| c.name == "a:review").unwrap();
         assert_eq!(
             review.description.as_deref(),
             Some("Review the current diff")
         );
         assert_eq!(review.argument_hint.as_deref(), Some("[focus]"));
 
-        // `/review security` 展开成一条用户消息。
+        // `--command a:review --args security` 展开成一条任务消息。
         let message = expand(review, "security");
         assert!(message.contains("focus on: security"), "{message}");
         assert!(!message.contains("$ARGUMENTS"));
@@ -292,30 +295,27 @@ mod tests {
         // 无参数时占位符展开为空。
         assert!(expand(review, "").contains("focus on: ."));
         // 无 $ARGUMENTS 占位符时参数追加到末尾（Claude Code 约定）。
-        let deploy = commands.iter().find(|c| c.name == "deploy").unwrap();
+        let deploy = commands.iter().find(|c| c.name == "b:deploy").unwrap();
         assert_eq!(expand(deploy, "--force"), "push to prod\n\n--force");
         assert_eq!(expand(deploy, ""), "push to prod");
     }
 
     #[test]
-    fn skips_invalid_and_duplicate_commands() {
+    fn skips_invalid_files_and_keeps_same_named_templates_from_each_plugin() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         command_file(&a, "broken.md", "---\ndescription: [unclosed\n---\nbody\n");
-        command_file(&a, "dup.md", "first wins\n");
+        command_file(&a, "dup.md", "first plugin\n");
         command_file(&a, "not-frontmatter.md", "plain body without frontmatter\n");
         let b = dir.path().join("b");
-        command_file(&b, "dup.md", "second loses\n");
+        command_file(&b, "dup.md", "second plugin\n");
         let set = PluginSet {
             plugins: vec![plugin(&a, "a"), plugin(&b, "b")],
             skipped: Vec::new(),
         };
         let (commands, skipped) = collect_commands(&set);
         let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
-        assert!(
-            skipped.iter().any(|s| s.reason.contains("duplicated")),
-            "重名要可见：{reasons:?}"
-        );
+        assert_eq!(skipped.len(), 1, "只跳过坏 YAML：{reasons:?}");
         assert!(
             skipped
                 .iter()
@@ -323,22 +323,22 @@ mod tests {
             "坏 YAML 要可见：{reasons:?}"
         );
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"dup"), "{names:?}");
         assert_eq!(
             commands
                 .iter()
-                .filter(|c| c.name == "dup")
-                .map(|c| c.template.as_str())
+                .filter(|c| c.name.ends_with(":dup"))
+                .map(|c| (c.name.as_str(), c.template.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["first wins"],
-            "同名先到先得"
+            vec![("a:dup", "first plugin"), ("b:dup", "second plugin")],
+            "插件命名空间保留两个模板"
         );
+        assert!(!names.contains(&"dup"), "不得提供不明确的裸名称");
         let plain = commands
             .iter()
-            .find(|c| c.name == "not-frontmatter")
+            .find(|c| c.name == "a:not-frontmatter")
             .unwrap();
         assert_eq!(plain.description, None, "无 frontmatter 容忍为正文");
-        assert!(!names.contains(&"broken"), "坏 YAML 跳过：{names:?}");
+        assert!(!names.contains(&"a:broken"), "坏 YAML 跳过：{names:?}");
     }
 
     #[test]
@@ -349,6 +349,34 @@ mod tests {
             skipped: Vec::new(),
         };
         assert!(load_commands(&set).unwrap().is_empty());
+    }
+
+    // macOS filesystems reject non-UTF-8 filenames at creation time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_template_filename_has_no_lossy_alias() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a");
+        command_file(&root, "review.md", "review task");
+        let invalid = root
+            .join(NAMESPACE)
+            .join("commands")
+            .join(OsString::from_vec(b"review-\xff.md".to_vec()));
+        std::fs::write(&invalid, "unaddressable task").unwrap();
+        let set = PluginSet {
+            plugins: vec![plugin(&root, "a")],
+            skipped: Vec::new(),
+        };
+
+        let (commands, skipped) = collect_commands(&set);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "a:review");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, invalid);
+        assert!(skipped[0].reason.contains("filename must be UTF-8"));
     }
 
     /// R12 / S18：坏 symlink、超长正文都有带 path + 来源的可见诊断；
@@ -381,7 +409,7 @@ mod tests {
         let (commands, skipped) = collect_commands(&set);
         assert_eq!(
             commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            ["good"]
+            ["a:good"]
         );
         let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
         assert!(

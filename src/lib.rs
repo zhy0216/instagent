@@ -1,9 +1,10 @@
-//! instagent：插件为核心的最小 agent（Rust 从零实现）。
+//! instagent：插件为核心的 headless agent（Rust 从零实现）。
 //!
 //! 模块树由 todos/00 锁定：本文件之后的任务只填充各自负责模块的实现
 //! （`// TODO(<编号>)` 标注归属），不改模块声明、不改公共类型布局。
 //!
-//! - 设计主依据：`docs/goose-plugin-core-plan.md`（第三版）
+//! - 当前定位与运行契约：`docs/adr/0004-headless-agent.md`
+//! - 插件设计基础：`docs/goose-plugin-core-plan.md`（第三版）
 //! - 设计补充：`docs/goose-from-scratch-plan.md`（第二版）
 //! - 顶层错误一律 `anyhow::Result`（见 [`error`]）。
 

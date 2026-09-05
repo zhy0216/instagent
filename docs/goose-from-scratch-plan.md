@@ -6,8 +6,9 @@
 > 只有 openai / proxy；§0 的工具审批（auto / approve / chat + 白名单）已被
 > ADR 0002 否弃；配套文档 `goose-core-cherry-pick-plan.md` 未随仓库保留。
 > 命名映射：`mini-agent` → `instagent`、`MINI_AGENT_*` → `INSTAGENT_*`
-> （全表见 README"命名对照"）。loop、消息、会话、压缩、CLI 的多数设计
-> （§2.2、2.5、2.6、2.7、2.11）仍被沿用。
+> （全表见 README"命名对照"）。loop、消息、会话、压缩设计仍被沿用；
+> **§2.11 交互 CLI 已被 [ADR 0004](adr/0004-headless-agent.md) 的 headless 定位取代**：
+> 唯一任务入口是 run，不提供 chat/REPL；输入、结果、退出码和期限以当前使用说明为准。
 
 - 日期：2026-09-02
 - 参考基线：`~/yyds/goose` commit `4ad43df`（下文所有 goose 文件路径和行号都以此为准）

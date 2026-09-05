@@ -1,8 +1,9 @@
 # instagent 使用说明
 
-instagent 是一个**以插件为核心**的最小 agent：内核只有 6 个内置工具
+instagent 是一个**以插件为核心的 headless agent**，接收脚本、CI、调度器或其他程序
+提交的完整任务，无人值守地执行并返回终态结果。内核提供 6 个内置工具
 （`shell` `read` `write` `edit` `tree` `read_image`）和一个 agent loop；provider、MCP
-server、skills、hooks、斜杠命令、command tools 全部以插件形式加载——连内置的
+server、skills、hooks、任务模板、command tools 全部以插件形式加载——连内置的
 5 个 provider 定义（openai / ollama / groq / deepseek / openrouter）
 也来自一个随二进制分发的 bundled 插件。
 
@@ -11,6 +12,8 @@ hooks 的载荷与决策协议与 [block/goose](https://github.com/block/goose) 
 
 instagent 运行在 sandbox 内，工具直接执行，安全边界由 sandbox 承担
 （见 [docs/adr/0002](adr/0002-sandbox-agent-no-ui-permission.md)）。
+任务运行中不向用户提问、不等待审批，所选 provider、model 或所需密钥缺失直接报错。
+定位与生命周期契约见 [ADR 0004](adr/0004-headless-agent.md)。
 
 ---
 
@@ -20,7 +23,7 @@ instagent 运行在 sandbox 内，工具直接执行，安全边界由 sandbox �
 2. [快速上手](#2-快速上手)
 3. [命令参考](#3-命令参考)
 4. [配置](#4-配置)
-5. [REPL 交互](#5-repl-交互)
+5. [无人值守执行](#5-无人值守执行)
 6. [会话管理](#6-会话管理)
 7. [插件管理](#7-插件管理)
 8. [插件开发](#8-插件开发)
@@ -58,8 +61,8 @@ model: llama-3.3-70b-versatile
 
 ```bash
 export GROQ_API_KEY=...
-instagent chat                 # 交互式 REPL
-instagent run -t "list files"  # 无交互跑一条任务
+instagent run -t "列出当前目录的文件并说明用途"
+instagent run --task-file ./task.md --output json > result.json
 ```
 
 不想碰真实配置可以先用沙箱目录试：
@@ -85,40 +88,78 @@ model: qwen2.5-coder
 
 | 命令 | 说明 |
 |---|---|
-| `instagent chat` | 交互式 REPL |
-| `instagent run -t "任务"` | 无交互跑一条任务 |
+| `instagent run -t "任务"` | 执行任务，返回结果后退出 |
 | `instagent sessions <list\|rm>` | 会话管理 |
 | `instagent plugin <子命令>` | 插件管理 |
-
-### `instagent chat`
-
-```bash
-instagent chat [--resume <id|last>] [--cwd PATH] [-m MODEL] [--plugin PATH ...]
-```
-
-| 选项 | 说明 |
-|---|---|
-| `--resume <id>` | 恢复指定会话；`--resume last` 恢复最近一次 |
-| `--cwd PATH` | 工作目录（不存在会创建），影响 shell/read 等工具的相对路径与项目级 settings/skills 发现 |
-| `-m, --model MODEL` | 覆盖配置里的 `model` |
-| `--plugin PATH` | 临时加载一个插件目录（可多次），不安装、不落盘，开发调试用 |
-
-会话生命周期会触发插件的 `SessionStart` / `SessionEnd` hooks。
 
 ### `instagent run`
 
 ```bash
-instagent run -t "..." [--cwd PATH] [-m MODEL] [--plugin PATH ...]
+instagent run --task "任务" [选项]
+instagent run --task-file ./task.md [选项]
+instagent run --command my-plugin:review --args "当前 diff" [选项]
 ```
 
-无交互：新建一个会话，把 `-t` 内容作为唯一一条用户消息跑完。
+三个任务来源必须且只能指定一个：`-t, --task` 直接传文本，`--task-file` 读取
+普通 UTF-8 文件，`--command` 展开已启用插件的任务模板（§8.7）。文件路径相对于
+调用时的目录解析；空白任务、不可读文件、目录和非 UTF-8 内容会报错。
+`--task` 文本和 `--task-file` 内容最多 1 MiB。
+不隐式读取 stdin，也不支持用 `--task-file -` 表示 stdin。
 
-**输出契约**（[ADR 0003 D4](adr/0003-repo-boundaries-and-runtime-policies.md)）：
-stdout 只输出模型最终回答的流式文本，`>file` / 管道拿到的就是纯答案；
-工具事件（`▶` / `✓` / `✗` 行与预览）、`usage:` 行、`session <id>`、
-装配提示（`note: …`）与一切诊断统一走 stderr。运行失败 → 非零退出码，
-stderr 末行为 `error: <原因>`；stdout 写失败（如管道提前关闭的 EPIPE）
-不改退出码。`chat` 同契约：横幅、斜杠命令反馈、Ctrl-C 提示也在 stderr。
+| 选项 | 说明 |
+|---|---|
+| `--resume <id\|last>` | 恢复指定或最近会话，并追加本次任务；仍必须指定任务来源 |
+| `--cwd PATH` | 工作目录（不存在会创建），影响工具相对路径与项目级 settings/skills 发现；恢复时须与原目录一致 |
+| `-m, --model MODEL` | 覆盖配置里的 `model` |
+| `--plugin PATH` | 临时加载一个插件目录（可多次），不安装、不落盘，开发调试用 |
+| `--args TEXT` | 模板参数，仅与 `--command plugin:name` 配合使用；省略为空串 |
+| `--output text\|json` | 默认 `text`；`json` 输出一个终态文档 |
+| `--timeout SECONDS` | `1`–`604800` 秒（最多 7 天），默认 `600`；覆盖初始化和任务执行，清理额外最多 5 秒 |
+
+**文本输出**：默认 stdout 流式输出模型文本，可能包含工具调用前的说明或失败前的
+部分输出。工具事件、预览、`usage:`、`session <id>`、装配提示与 tracing 日志都走
+stderr。stdout 提前关闭（例如 EPIPE）不改变任务退出码。
+
+**JSON 输出**：`--output json` 的 stdout 只写一个 JSON 文档，不混入文本流或日志：
+
+```json
+{
+  "schema_version": 1,
+  "status": "completed",
+  "session_id": "...",
+  "output": "检查完成，测试通过。",
+  "usage": { "input": 120, "output": 30, "cache_read": 0, "cache_write": 0 },
+  "error": null
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `schema_version` | 当前为 `1` |
+| `status` | `completed` / `failed` / `max_turns` / `timed_out` / `cancelled` |
+| `session_id` | 会话 id；会话创建或恢复前失败时为 `null` |
+| `output` | 仅 `completed` 填入本次执行最终助手消息的文本，保留原文且不额外添加换行；其他状态为空串 |
+| `usage` | 仅 `completed` 提供最近记录的助手响应用量；未提供用量或其他状态为 `null`，不是本次任务的累计计费 |
+| `error` | `completed` 为 `null`；其他状态为错误原因字符串 |
+
+JSON 结果从会话数据提取，不依赖展示事件。恢复历史不会把上一任务的答案作为
+本次结果；非完成状态的中间工作可通过 `session_id` 对应的会话记录查看。
+JSON 写入或 flush 失败时，stderr 报错并退出 `1`，因为调用方未收到完整结果。
+
+| 情况 | JSON `status` | 退出码 |
+|---|---|---|
+| 执行正常结束 | `completed` | `0` |
+| 配置、provider、工具流程或执行失败 | `failed` | `1` |
+| 命令行参数解析错误 | 无文档，错误写 stderr | `2` |
+| 达到 `max_turns` | `max_turns` | `3` |
+| 达到执行期限 | `timed_out` | `124` |
+| 收到 SIGINT / SIGTERM | `cancelled` | `130` |
+
+`completed` 表示执行生命周期正常结束，不证明外部业务验收通过；调用方应检查
+结果，或用插件 Stop hook 实施确定性验收。provider 截断、未正常结束的响应、
+Stop hook 连续阻止超过上限均不能当作完成。
+参数解析错误（例如输入来源冲突、缺少任务、非法 `--timeout`）由 CLI 在运行前报告；
+参数解析后的输入读取、模板查找或配置错误属于运行失败。
 
 ### `instagent sessions`
 
@@ -130,7 +171,7 @@ instagent sessions rm <id>     # 删除会话文件
 ### `instagent plugin`
 
 ```bash
-instagent plugin install <git-url 或本地路径> [--auto-update]
+instagent plugin install <git-url 或本地路径>
 instagent plugin list
 instagent plugin show <name>
 instagent plugin enable <name>
@@ -154,7 +195,7 @@ settings，见 §4.3）。所有字段可缺省，缺省取默认值：
 | `provider` | 无 | provider 名字，定义来自插件（§9）；重名时写 `插件名/provider名` |
 | `model` | 无 | 模型名 |
 | `max_tokens` | `8192` | 单次回复最大 token |
-| `max_turns` | `1000` | 单条用户消息内最多循环多少轮工具调用 |
+| `max_turns` | `1000` | 单次任务最多循环多少轮；耗尽以 `max_turns` / 退出码 `3` 结束 |
 | `context_limit` | 无 | 覆盖模型上下文上限（默认按 §9 的四级推导） |
 | `compaction_threshold` | `0.8` | token 用量占上下文比例超过该值时自动压缩会话 |
 | `shell` | `$SHELL` | `shell` 工具使用的解释器 |
@@ -194,8 +235,8 @@ plugins:
 | `INSTAGENT_DATA_DIR` | `~/.local/share/instagent` |
 | `INSTAGENT_AGENTS_DIR` | `~/.agents` |
 
-日志：默认 warning 到 stderr（健康路径保持安静，stdout 仍仅答案）；
-显式 `RUST_LOG` 优先（如 `RUST_LOG=info instagent chat` 看详细日志）。
+日志：默认 warning 到 stderr（健康路径保持安静，stdout 为文本或 JSON 结果）；
+显式 `RUST_LOG` 优先（如 `RUST_LOG=info instagent run -t "检查项目"` 看详细日志）。
 
 ### 4.3 `settings.json`（三层）
 
@@ -225,31 +266,26 @@ plugins:
 
 ---
 
-## 5. REPL 交互
+## 5. 无人值守执行
 
-启动横幅显示 provider / model / session id。输入行直接发给模型；
-`/` 开头是斜杠命令：
+任务应包含目标、可用输入、约束、验收条件和期望的输出格式。例如：
 
-| 命令 | 说明 |
-|---|---|
-| `/exit` `/quit` | 退出 |
-| `/clear` | 丢弃当前上下文（会话文件原子重写，留 `.bak.jsonl`） |
-| `/compact` | 立即强制压缩会话 |
-| `/tools` | 列出当前可见的全部工具（含来源前缀与 read-only 标记） |
-| `/help` | 帮助 + 插件提供的斜杠命令列表 |
-| `/<插件命令> [参数]` | 插件斜杠命令，展开成一条用户消息（§8.7） |
+```bash
+instagent run --task-file ./review-task.md --timeout 300 --output json > result.json
+```
 
-**Ctrl-C 语义**：
+provider、model、凭据和插件应在调用前准备好。系统提示要求 agent 根据任务和
+环境作合理假设，自主使用工具；缺少必要条件时说明无法完成，不把未完成工作报告为成功。
+模型不会获得用于请求用户输入或审批的交互入口。任务可以要求它把业务结果写成 JSON，
+这段文本会放在结果文档的 `output` 字符串中。
 
-- 模型生成中：第一次取消当前轮（`(turn cancelled)`，REPL 可继续），
-  第二次退出进程。
-- 空闲提示符：第一次提示，第二次退出。
-- Ctrl-D：直接退出。
+`--timeout` 从运行初始化开始计时；SIGINT（终端 Ctrl-C）或 SIGTERM 都取消本次任务。
+取消和超时会停止 provider/工具执行，配齐会话中的工具结果，并尝试触发 SessionEnd、
+关闭插件子进程，清理额外最多 5 秒。同步本地文件系统调用不承诺被强制中断；
+部署方仍应在 sandbox 层设置资源和进程生命周期上限。
 
-**输出渲染**：流式文本逐字打印到 stdout（答案流）；工具调用 `▶ 工具名 …`
-+ 参数预览与耗时、每轮末尾的 `usage:` 行（token 用量）、横幅与斜杠命令
-反馈等诊断统一走 stderr（§3 输出契约）。REPL 输入历史存在
-`~/.config/instagent/history.txt`。
+`chat`、REPL、斜杠命令分发和输入历史已移除。原 `/review 参数` 改成
+`run --command 插件名:review --args "参数"`；需要继续任务时重新调用 `run --resume`。
 
 ---
 
@@ -257,18 +293,20 @@ plugins:
 
 - 会话以 JSONL 存在 `~/.local/share/instagent/sessions/<id>.jsonl`，
   首行是 header（id、时间、provider、model、cwd）。
-- `instagent chat --resume last` 恢复最近会话；`--resume <id>` 恢复指定
-  会话（id 见 `instagent sessions list`）。
+- `instagent run --resume last -t "后续任务"` 恢复最近会话；`--resume <id>` 恢复
+  指定会话（id 见 `instagent sessions list`）。没有可恢复会话时报错。
+- 恢复时使用会话记录的 cwd、provider、model；`--model` 可以显式覆盖模型，
+  `--cwd` 若与原会话目录不同则报错。
 - **单进程独占**：不要对同一会话 id 同时开两个 `--resume`，两进程追加写
   会互相漂移。
 - **续轮语义**：历史末尾为 user（摘要、未回答输入或 tool results）时，
   新输入合并追加到该消息并原子重写落盘；末尾为 assistant 才追加新 user
-  消息。`/compact` / 取消 / 失败后继续都保持该不变量。
+  消息。自动压缩、取消或失败后恢复都保持该不变量。
 - **读取预算**：header 64 KiB、单消息 96 MiB、总文件 256 MiB；超预算
   报错并保留原文件，不截短用户数据。
-- 上下文过长时按 `compaction_threshold` 自动压缩；`/compact` 手动触发，
-  完成后显示 `· compacted X → Y tokens`。
-- `run` 子命令每次都会新建会话（结束时打印 `session <id>` 到 stderr）。
+- 上下文过长时按 `compaction_threshold` 自动压缩，诊断写 stderr。
+- 未指定 `--resume` 的 `run` 创建新会话；id 写入 stderr 和 JSON 结果，便于后续恢复。
+- 每次运行触发 `SessionStart` / `SessionEnd` 生命周期 hooks；不创建等待输入的空闲会话。
 
 ---
 
@@ -290,15 +328,23 @@ plugins:
 manifest 校验失败的目录记警告跳过，不中断启动；settings 里启用但目录已删
 的插件同样只警告。同名插件先到先得。
 
+所选 provider、model 或 provider 要求的密钥缺失时，任务以 `failed` 结束。
+可选组件沿用降级策略：无效的 MCP 配置、连接失败或无效工具定义可能只输出诊断并跳过，
+剩余能力继续运行。启动不会为此询问用户或等待用户补配置；调用方需要把业务必需的
+工具能力纳入预检或 Stop hook 验收，不能仅凭 `completed` 推断全部插件都已可用。
+
 ### 7.2 安装 / 更新
 
 ```bash
 instagent plugin install https://github.com/some/plugin-repo   # git 克隆到 ~/.agents/plugins/<name>/
 instagent plugin install ./my-local-plugin                     # 本地路径：复制安装
-instagent plugin install <src> --auto-update                   # 标记为可自动更新
 instagent plugin update              # 更新全部 git 来源插件（git pull）
 instagent plugin update my-plugin    # 只更新一个
 ```
+
+`run` 只加载现有插件，不进行自动更新。部署流程在执行任务前显式运行
+`plugin update`。安装参数 `--auto-update` 和已有安装元数据为兼容旧格式保留，
+不会使 headless 任务启动时自动拉取代码。
 
 ### 7.3 查看 / 启用 / 禁用
 
@@ -312,10 +358,10 @@ instagent plugin enable my-plugin
 ### 7.4 开发时临时加载
 
 ```bash
-instagent chat --plugin ./my-dev-plugin
+instagent run --plugin ./my-dev-plugin --command my-dev-plugin:review --args "当前 diff"
 ```
 
-不安装、不进 settings，适合边写边试；该插件定义的 provider / 斜杠命令等
+不安装、不进 settings，适合边写边试；该插件定义的 provider / 任务模板等
 立即可用。
 
 ---
@@ -336,7 +382,7 @@ groq-and-review/
   ├ providers/groq.json          # provider 定义
   ├ tools/weather.json           # command tool
   ├ hooks.json                   # hooks
-  ├ commands/review.md           # 斜杠命令
+  ├ commands/review.md           # 任务模板
   └ scripts/...
 ```
 
@@ -360,7 +406,8 @@ groq-and-review/
 
 ### 8.2 `mcp.json`
 
-固定在插件根目录。只支持 `stdio` 传输（`sse` 会跳过并提示）：
+固定在插件根目录。支持 `stdio` 和 `streamable-http` 传输；`sse` 会跳过并提示。
+远程 HTTP 使用 `url`，当前不发送 manifest 的 `headers`（会输出说明）。下面是 stdio 示例：
 
 ```json
 {
@@ -405,7 +452,8 @@ groq-and-review/
 - 执行：`command`（展开 `${PLUGIN_ROOT}` 后）用 `sh -c` 跑；工具入参 JSON
   写入 **stdin**，**stdout** 作为工具结果；退出码非 0 / 超时（默认 30s）/
   被取消 → 结果是 `is_error`。
-- 子进程按进程组管理，超时杀整组。
+- 子进程按进程组管理，超时、取消或直接进程退出时回收整组（包括后台孙进程）。
+  内置 shell 和 hooks 使用相同的回收机制；需要持续提供工具的服务应由 MCP 插件管理。
 - 解析失败或非法的定义跳过（warn 日志），不影响其它工具。
 
 ### 8.5 `dev.instagent/hooks.json`
@@ -496,9 +544,9 @@ skill 跳过不报错。
 `名字 — 描述` 一行放进 system prompt，模型按需调用 `load_skill` 读正文
 或 `references/` 下的文件。
 
-### 8.7 `dev.instagent/commands/*.md`（斜杠命令）
+### 8.7 `dev.instagent/commands/*.md`（任务模板）
 
-文件名即命令名（`review.md` → `/review`）。frontmatter 取 `description` /
+文件名即模板名（`review.md` → `groq-and-review:review`）。frontmatter 取 `description` /
 `argument-hint`，正文是模板：
 
 ```markdown
@@ -509,10 +557,15 @@ argument-hint: [focus]
 Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 ```
 
-- `$ARGUMENTS` 展开为用户在命令后输入的参数；
-- 模板里没有 `$ARGUMENTS` 时，参数追加到正文末尾（Claude Code 约定）；
-- 多插件同名命令先到先得（插件名升序）；解析失败的文件跳过。
-- `/help` 会列出全部插件命令及参数提示。
+```bash
+instagent run --command groq-and-review:review --args "错误处理与测试覆盖"
+```
+
+- 选择器必须包含 `插件名:模板名`，多插件同名模板互不覆盖。
+- `$ARGUMENTS` 展开为 `--args` 的原始文本，不解释为 shell 命令；省略时为空串。
+- 模板里没有 `$ARGUMENTS` 时，非空参数追加到正文末尾。
+- 解析失败的模板文件跳过；指定不存在或禁用插件的模板时报错。
+- 目录与 Markdown 格式沿用已有插件内容，模板展开后作为本次任务提交给 agent loop。
 
 ### 8.8 装上之后的完整效果
 
@@ -522,7 +575,7 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
   `groq-and-review__weather`（command tool）+ `load_skill`（skills）；
 - system prompt 多一行 `groq-and-review:review — …`（skill 索引）；
 - 配置里 `provider: groq` 可用；
-- REPL 里 `/review <args>` 可用；
+- `run --command groq-and-review:review --args "当前 diff"` 可用；
 - 每次调 `shell` 前 `guard.sh` 先跑。
 
 ---
@@ -634,7 +687,6 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 |---|---|
 | `~/.config/instagent/config.yaml` | 用户配置 |
 | `~/.config/instagent/settings.json` | 用户层 settings |
-| `~/.config/instagent/history.txt` | REPL 输入历史 |
 | `<项目>/.config/instagent/settings.json` | 项目层 settings |
 | `<项目>/.config/instagent/settings.local.json` | 本地层 settings |
 | `<项目>/.agents/plugins/`、`<项目>/.agents/skills/` | 项目级插件 / skills |
@@ -656,7 +708,9 @@ Review `git diff` with focus on: $ARGUMENTS. Report findings as a list.
 | 启动报配置解析错 | 检查 config.yaml 的 YAML 语法，或残留的旧 `api_key` / `api_key_env` 键（报错会带迁移提示，ADR 0003 D1） |
 | provider 重名报错 | 配置里写 `插件名/provider名` |
 | `proxy not ready` | proxy 进程未在总就绪期限（`timeout_secs`，默认 20s）内就绪：手动跑该命令确认能监听 `${PORT}` 并在 `ready` 路径返回 200；重试耗尽后的报错带 provider/命令/尝试数/退出状态 |
-| 想看更详细日志 | `RUST_LOG=info instagent chat`（或 `debug`），日志走 stderr；默认 warning 已可见，无需显式开启 |
+| 想看更详细日志 | `RUST_LOG=info instagent run -t "检查项目"`（或 `debug`），日志走 stderr；默认 warning 已可见，无需显式开启 |
+| `run` 在等待 stdin | `run` 不读取 stdin；检查 provider / MCP / 工具诊断，并使用 `--timeout` 限制执行期限 |
+| 模板未找到 | 用 `--command 插件名:模板名`，确认插件已启用且存在 `dev.instagent/commands/<模板名>.md` |
 | 会话内容错乱 | 确认没有两个进程同时 `--resume` 同一个会话 |
 
 开发自检：

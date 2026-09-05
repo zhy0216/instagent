@@ -4,7 +4,10 @@
 > `README.md`、`docs/usage.md`、`docs/architecture.md` 与 `docs/adr/` 为准。
 > 与实现不一致之处：§2.4 的可选 anthropic engine 已被 ADR 0001 移除；
 > approval / trust / mode UI 相关设想已被 ADR 0002 否弃；env、密钥、
-> stdout 契约等运行时策略以 ADR 0003 为准。命名映射：`mini-agent` →
+> stdout 契约等运行时策略以 ADR 0003 为准；**headless 定位与现行任务接口以
+> [ADR 0004](adr/0004-headless-agent.md) 为准**：chat/REPL 已移除，commands 改作
+> `run --command plugin:name --args` 任务模板，run 不自动更新插件。
+> 命名映射：`mini-agent` →
 > `instagent`、`dev.miniagent` → `dev.instagent`、`MINI_AGENT_*` →
 > `INSTAGENT_*`（全表见 README"命名对照"）。
 

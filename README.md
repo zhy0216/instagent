@@ -1,18 +1,19 @@
 # instagent
 
-插件为核心的最小 agent（Rust 从零实现）。除了 6 个最简单的内置工具
+以插件为核心的 **headless agent**（Rust 从零实现），由脚本、CI、调度器或其他程序
+提交完整任务，自主执行并返回结果。运行过程中不向用户提问、不等待审批；
+每次 `run` 都有明确的结束状态和执行期限。除了 6 个内置工具
 （`shell` `read` `write` `edit` `tree` `read_image`），provider、MCP、skills、hooks、
-斜杠命令、command tools 全部以**插件**形式加载——provider 也不例外，
+任务模板、command tools 全部以**插件**形式加载——provider 也不例外，
 内置的 5 个 provider（openai / ollama / groq / deepseek / openrouter）
 同样来自一个 bundled 插件。
 
 - 使用说明：[`docs/usage.md`](docs/usage.md)
 - 架构总览：[`docs/architecture.md`](docs/architecture.md)
-- 决策记录：[`docs/adr/`](docs/adr/)（0001 不支持 Anthropic；0002 sandbox 内 agent，UI/permission 非目标；0003 仓库边界与运行时策略）
+- 当前定位：[`ADR 0004：Headless agent`](docs/adr/0004-headless-agent.md)
+- 决策记录：[`docs/adr/`](docs/adr/)（0001 provider 范围；0002 sandbox 边界；0003 运行时策略；0004 无人值守执行）
 - 发布与校验政策：[`docs/release.md`](docs/release.md)（toolchain/MSRV、安全扫描豁免、CI 门槛）
 - 历史设计文档：`docs/goose-*.md` 是当时的计划书，不是当前契约（文首有说明）
-- 设计主依据：[`docs/goose-plugin-core-plan.md`](docs/goose-plugin-core-plan.md)（第三版）
-- 补充：[`docs/goose-from-scratch-plan.md`](docs/goose-from-scratch-plan.md)（第二版）
 - 插件规范：[Agent Plugins v1.0.0](https://agent-plugins.org/specification)
 - 参考基线：[block/goose](https://github.com/block/goose)（commit `4ad43df`，只读）
 
@@ -48,12 +49,21 @@ instagent --help
 
    ```bash
    export GROQ_API_KEY=...
-   instagent chat                # REPL：/help /exit /clear /compact /tools
-   instagent run -t "list files" # 无交互跑一条任务
-   instagent chat --resume last  # 恢复最近会话（JSONL 在 ~/.local/share/instagent/sessions/）
+   instagent run -t "列出当前目录的文件并说明用途"
+   instagent run --task-file ./task.md --output json > result.json
+   instagent run --resume last -t "为刚才的修改运行测试并报告结果"
    ```
 
 3. 本地无密钥试跑可用 ollama（provider `ollama` 指向 `http://localhost:11434/v1`）。
+
+任务输入必须通过 `--task`、`--task-file` 或 `--command plugin:name --args` 之一给出，
+不读取 stdin。默认 `--output text` 流式输出模型文本；`--output json` 输出单个终态
+JSON 文档，包含 `status`、`session_id`、`output`、`usage` 和 `error`（schema 版本为 1）。
+工具事件、用量和诊断都走 stderr。`--timeout` 默认 600 秒，范围为 1–604800 秒（7 天）。
+
+退出码：完成 `0`，失败 `1`，参数错误 `2`，轮数耗尽 `3`，超时 `124`，
+SIGINT / SIGTERM 取消 `130`。`completed` 表示执行流程正常结束；业务结果由调用方
+或插件 Stop hook 验收。完整契约见[使用说明](docs/usage.md#3-命令参考)。
 
 ### 配置与环境变量
 
@@ -68,30 +78,35 @@ instagent --help
 环境变量（优先级高于配置文件）：`INSTAGENT_PROVIDER`、`INSTAGENT_MODEL`；
 沙箱/测试用：`INSTAGENT_CONFIG_DIR`、`INSTAGENT_DATA_DIR`、
 `INSTAGENT_AGENTS_DIR`；日志：默认 warning 到 stderr（健康路径保持安静，
-stdout 仍仅答案），显式 `RUST_LOG` 优先。
+stdout 为模型文本或 JSON 结果），显式 `RUST_LOG` 优先。
 
 设计语义须知：
 
 - instagent 运行在 sandbox 内，工具调用直接执行，安全边界由 sandbox 隔离
   承担（ADR 0002）。
 - 会话文件假设单进程独占：不要对同一会话 id 同时开两个
-  `instagent chat --resume`，两进程追加会互相漂移。
+  `instagent run --resume`，两进程追加会互相漂移。
 
 ### 插件管理
 
 ```bash
-instagent plugin install <git-url 或本地路径> [--auto-update]
+instagent plugin install <git-url 或本地路径>
 instagent plugin list                 # 含启用/禁用状态
 instagent plugin show <name>
 instagent plugin enable <name>
 instagent plugin disable <name>
 instagent plugin update [name]
-instagent chat --plugin ./my-dev-plugin   # 开发时临时加载，不安装
+instagent run --plugin ./my-dev-plugin --command my-dev-plugin:review --args "当前 diff"
 ```
+
+任务运行期间不自动更新插件。更新由部署流程显式调用 `plugin update`，
+配置、密钥和插件内容应在提交任务前准备好。
+provider、model 或所需密钥缺失会直接失败；可选插件组件（例如 MCP 连接失败）仍可能
+警告后降级运行。业务必须依赖的工具能力应由调用方或 Stop hook 验证。
 
 ## 插件开发指南
 
-一个完整插件长这样（第三版 §8，规范组件 + `dev.instagent` 命名空间组件）：
+一个完整插件长这样（规范组件 + `dev.instagent` 命名空间组件）：
 
 ```
 groq-and-review/
@@ -163,13 +178,14 @@ schema，只用它选本地校验规则）：
 装上之后模型能看到：`shell` `read` `write` `edit` `tree` `read_image`（内置）、
 `everything__echo` 等（MCP）、`groq-and-review__weather`（command tool）、
 `load_skill`（skills）；system prompt 里多一行 `groq-and-review:review — …`；
-配置里 `provider: groq` 生效；`/review` 可用；每次调 `shell` 前 `guard.sh` 先跑。
+配置里 `provider: groq` 生效；`run --command groq-and-review:review --args "当前 diff"`
+把模板展开成任务；每次调 `shell` 前 `guard.sh` 先跑。
 会执行命令的组件（MCP / hooks / command tools / proxy provider）直接加载，
 安全由 sandbox 隔离承担（ADR 0002）。
 
 发现优先级：`--plugin PATH` > 配置 `plugins` 路径 > 项目 `<cwd>/.agents/plugins/` >
 用户 `~/.agents/plugins/` > bundled。manifest 校验失败的目录记警告跳过；
-settings 里启用但目录已删的插件同样只警告不致命。详见第三版 §2。
+settings 里启用但目录已删的插件同样只警告不致命。详见[插件管理](docs/usage.md#7-插件管理)。
 
 ## 命名对照（计划文档 → 本仓库）
 
@@ -201,28 +217,6 @@ cargo rustdoc --lib -- -D warnings
 cargo check --release --all-targets
 ```
 
-## 手工验证清单（todos/18 · CLI 与运行时装配）
-
-`cargo test` 覆盖不到的交互路径，按此清单手工验证（建议先
-`INSTAGENT_CONFIG_DIR=$(mktemp -d) cargo run -- chat` 用沙箱目录，不碰真实配置）：
-
-1. **多轮对话**：`cargo run -- chat`（配好 provider/model），连续问两三条消息，
-   确认流式文本逐字打印、每轮末尾打 `usage:` 行、会话 JSONL 落在
-   `<data>/sessions/`。
-2. **Ctrl-C 一次取消、两次退出**：发起一条会让模型长时间输出的消息，轮内按
-   Ctrl-C → 打印 `^C cancelling current turn`、本轮以 `(turn cancelled)` 结束、
-   REPL 可继续；再发一条并按两次 Ctrl-C → 进程退出。空闲提示符下按两次
-   Ctrl-C 也应退出。
-3. **/compact**：多聊几轮后输入 `/compact`，看到 `· compacted X → Y tokens` 与
-   `(compacted)`；`/clear` 会丢弃上下文（会话文件原子重写、留 `.bak.jsonl`）。
-4. **--resume last**：退出后 `cargo run -- chat --resume last`，确认历史被读回、
-   模型能引用上一会话内容；`instagent sessions list` 两行、`sessions rm <id>` 可删。
-5. **run -t**：`cargo run -- run -t "list files"`，无交互跑完，stdout 只有最终回复
-   （输出契约 ADR 0003 D4）；`usage:` 行、`session <id>` 与工具调用
-   `▶ shell  …` + 预览/耗时都在 stderr。
-6. **plugin 子命令**：`cargo run -- plugin install <本地含 hooks/mcp/tools 的
-   插件路径>` → 不提问直接装好；`plugin list / show / disable / enable` 正常；
-   启用后 chat 启动即加载其 mcp/hooks/command tools（安全由 sandbox 隔离承担）。
-7. **--plugin PATH 临时加载**：把含 provider JSON 的开发目录经 `--plugin` 传入，
-   `chat` 里 `provider` 可直接用该插件定义；`/help` 列出插件斜杠命令并可用
-   `/review <args>` 展开成 prompt。
+无人值守回归使用离线假 provider，覆盖任务输入、JSON 结果、会话恢复、
+模板调用、轮数耗尽、取消、超时和子进程清理。实际 provider 接入可用上述
+`run` 示例验证；凭据在调用前注入，运行中不会出现配置向导。

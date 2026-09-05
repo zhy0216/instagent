@@ -1,10 +1,13 @@
 # AGENTS.md
 
-instagent：插件为核心的最小 agent，Rust 从零实现。
+instagent：以插件为核心的 headless agent，Rust 从零实现。脚本/CI/调度器提交完整任务，
+自主执行并返回终态结果；运行中不向用户提问、不等待审批、不提供 REPL。
 
-- 设计主依据：`docs/goose-plugin-core-plan.md`（第三版：插件模型、provider、工具来源、内核边界）
-- 设计补充：`docs/goose-from-scratch-plan.md`（第二版 §2.2 消息、§2.5 loop、§2.6 会话、§2.7 压缩、§2.11 CLI 被第三版沿用）
+- 当前设计依据：`docs/adr/0004-headless-agent.md`（任务入口、结果/退出码、期限、插件模板）；现行接口见 `docs/usage.md`。
+- 运行时边界：`docs/adr/0002-sandbox-agent-no-ui-permission.md`、`docs/adr/0003-repo-boundaries-and-runtime-policies.md`。
+- 历史背景：`docs/goose-plugin-core-plan.md`、`docs/goose-from-scratch-plan.md`；旧交互 CLI 设计已被 ADR 0004 取代。
 - 任务队列：`todos/`（顺序与依赖见 `todos/README.md`）
+- 当前迁移任务：`todos/20-headless-agent.md`；方案见 `plans/headless-agent/plan.md`。
 - goose 参考基线：`~/yyds/goose`（block/goose commit `4ad43df`，只读参考）。本地若不存在：
   `git clone https://github.com/block/goose ~/yyds/goose && git -C ~/yyds/goose checkout 4ad43df`
 

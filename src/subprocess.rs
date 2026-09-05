@@ -4,18 +4,23 @@
 //! `configure_subprocess` / `spawn_long_lived_mcp_subprocess` / `git_command`，
 //! 含 Linux PR_SET_PDEATHSIG 特判与专用 spawner 线程；因本仓库不新增依赖，
 //! libc 符号改为最小 `extern "C"` 声明，并删去 Windows 分支（目标平台 macOS/Linux）。
-//! 另加 `ProcessGroupChild` 投递守卫：drop 时 SIGKILL 整个进程组（含孙进程），
-//! 弥补 tokio / rmcp 只杀直接子进程的缺口。shell / MCP stdio / hooks / proxy 都复用这里。
+//! `ProcessGroupChild` / `McpProcess` 守卫在 drop 时同步 SIGKILL 整个进程组
+//! （含孙进程），弥补 tokio / rmcp 只杀直接子进程的缺口。
+//! shell / MCP stdio / hooks / proxy 都复用这里。
 //!
 //! 输出收集走 `run_bounded`：每路硬上限 + 增量 UTF-8 解码，超限即杀整组并保留
 //! 截断头部与 `BoundedOutput::truncated` 状态。调用方（shell / command / hooks /
 //! install）显式传自己的预算（todo 06 收口后不再有隐式默认上限的兼容入口）。
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::Transport;
+use rmcp::RoleClient;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -88,15 +93,16 @@ pub fn configure_subprocess(command: &mut Command) {
 #[derive(Debug)]
 pub struct ProcessGroupChild {
     child: tokio::process::Child,
+    group: ProcessGroupGuard,
 }
 
 impl ProcessGroupChild {
     /// `configure_subprocess` 后 spawn，返回带进程组清理语义的句柄。
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
         configure_subprocess(command);
-        Ok(Self {
-            child: command.spawn()?,
-        })
+        let child = command.spawn()?;
+        let group = ProcessGroupGuard(child.id());
+        Ok(Self { child, group })
     }
 
     /// 子进程（进程组组长）的 PID。
@@ -112,13 +118,77 @@ impl ProcessGroupChild {
 
 impl Drop for ProcessGroupChild {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            // 负 PID = 目标进程组；组内所有成员（含孙进程）一起 SIGKILL。
+        self.group.terminate();
+    }
+}
+
+/// 保留 spawn 时的进程组号：wait/try_wait 清空 Child.id() 后，孙进程仍可能存活。
+/// 只发一次信号；close 后的延迟 drop 不得再次命中可能已复用的进程组号。
+#[derive(Debug)]
+struct ProcessGroupGuard(Option<u32>);
+
+impl ProcessGroupGuard {
+    fn terminate(&mut self) {
+        if let Some(pid) = self.0.take() {
+            #[cfg(unix)]
             unsafe {
                 kill(-(pid as i32), SIGKILL);
             }
+            #[cfg(not(unix))]
+            let _ = pid;
         }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// rmcp stdio transport + 整组回收守卫。守卫随 transport 穿过 initialize 和
+/// 服务生命周期；握手 future 被丢弃时立即杀整组，不依赖 rmcp 的异步单进程回收。
+pub struct McpProcess {
+    inner: TokioChildProcess,
+    group: ProcessGroupGuard,
+}
+
+impl McpProcess {
+    fn new(inner: TokioChildProcess) -> Self {
+        let group = ProcessGroupGuard(inner.id());
+        Self { inner, group }
+    }
+
+    pub fn id(&self) -> Option<u32> {
+        self.inner.id()
+    }
+}
+
+impl Drop for McpProcess {
+    fn drop(&mut self) {
+        // 必须先同步杀组，再由 inner 的 Drop 异步等待直接子进程，避免孙进程残留。
+        self.group.terminate();
+    }
+}
+
+impl Transport<RoleClient> for McpProcess {
+    type Error = io::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // close 是生命周期终点；先杀组并解除守卫，再让 rmcp 排空/回收直接子进程。
+        self.group.terminate();
+        self.inner.close()
     }
 }
 
@@ -126,7 +196,7 @@ impl Drop for ProcessGroupChild {
 struct LongLivedSpawnRequest {
     command: Command,
     runtime: tokio::runtime::Handle,
-    response: tokio::sync::oneshot::Sender<io::Result<(TokioChildProcess, Option<ChildStderr>)>>,
+    response: tokio::sync::oneshot::Sender<io::Result<(McpProcess, Option<ChildStderr>)>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -138,12 +208,9 @@ fn long_lived_spawn_sender() -> io::Result<mpsc::Sender<LongLivedSpawnRequest>> 
         std::thread::Builder::new()
             .name("instagent-extension-spawner".to_owned())
             .spawn(move || {
-                while let Ok(mut request) = receiver.recv() {
+                while let Ok(request) = receiver.recv() {
                     let _runtime_guard = request.runtime.enter();
-                    configure_subprocess(&mut request.command);
-                    let result = TokioChildProcess::builder(request.command)
-                        .stderr(std::process::Stdio::piped())
-                        .spawn();
+                    let result = spawn_mcp_process(request.command);
                     let _ = request.response.send(result);
                 }
             })
@@ -154,12 +221,20 @@ fn long_lived_spawn_sender() -> io::Result<mpsc::Sender<LongLivedSpawnRequest>> 
     }
 }
 
-/// 长驻 MCP stdio 子进程：返回 transport 与被管道化的 stderr（stderr 接日志）。
+fn spawn_mcp_process(mut command: Command) -> io::Result<(McpProcess, Option<ChildStderr>)> {
+    configure_subprocess(&mut command);
+    TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map(|(transport, stderr)| (McpProcess::new(transport), stderr))
+}
+
+/// 长驻 MCP stdio 子进程：返回带进程组守卫的 transport 与 stderr（stderr 接日志）。
 /// Linux 上把 spawn 挪到专用线程，使 PR_SET_PDEATHSIG 绑定的父线程不会随
 /// 某个 Tokio worker 退出而误杀长驻进程（移植自 goose）。
 pub async fn spawn_long_lived_mcp_subprocess(
     command: Command,
-) -> io::Result<(TokioChildProcess, Option<ChildStderr>)> {
+) -> io::Result<(McpProcess, Option<ChildStderr>)> {
     #[cfg(target_os = "linux")]
     {
         let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
@@ -178,11 +253,7 @@ pub async fn spawn_long_lived_mcp_subprocess(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let mut command = command;
-        configure_subprocess(&mut command);
-        TokioChildProcess::builder(command)
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        spawn_mcp_process(command)
     }
 }
 
@@ -404,7 +475,7 @@ async fn finish_pump(
 }
 
 /// 带硬上限输出收集的统一编排：两路管道增量解码进 collector → 带取消/超时的等待 →
-/// 任一路上限越限 / 超时 / 取消 / 非正常退出都 drop [`ProcessGroupChild`] SIGKILL 整组 →
+/// 直接子进程退出 / 任一路上限越限 / 超时 / 取消都 drop [`ProcessGroupChild`] SIGKILL 整组 →
 /// 限时收尾两路输出。`cancel` 为 `None` 时不监听取消。
 ///
 /// 未把 stdout/stderr 配成 pipe 时返回带 pid 上下文的错误（不再 panic）；
@@ -458,21 +529,12 @@ pub(crate) async fn run_bounded(
             status = wait => Outcome::Exited(status.ok().and_then(|s| s.code())),
         }
     };
-    // 超时/取消/输出越限：drop ProcessGroupChild 对整组 SIGKILL（03 的进程组守卫）。
-    // 必须在收尾 pump 之前杀，否则洪泛进程会让 pump 永远读不到 EOF。
-    let mut child = if overflow.is_cancelled() || !matches!(outcome, Outcome::Exited(_)) {
-        drop(child);
-        None
-    } else {
-        Some(child)
-    };
+    // wait 后 Child.id() 已清空，缓存的进程组守卫仍负责剩余孙进程。
+    // 成功退出也结束本次工具的进程组；收尾 pump 只排空已写入管道的输出。
+    drop(child);
 
     let (stdout, stdout_cut) = finish_pump(&mut stdout_task, &stdout_collector).await;
     let (stderr, stderr_cut) = finish_pump(&mut stderr_task, &stderr_collector).await;
-    // 竞态：进程先自然退出、pump 收尾时才越限，守卫同样要落地。
-    if stdout.truncated || stderr.truncated {
-        drop(child.take());
-    }
     Ok(CollectedRun {
         outcome,
         stdout,
@@ -571,6 +633,81 @@ mod tests {
         drop(child);
 
         eventually("mcp subprocess gone", || !signalable(pid)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_close_and_drop_kill_descendants_even_after_parent_exit() {
+        for close in [false, true] {
+            for parent_exits in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let pid_file = dir.path().join("grandchild.pid");
+                let mut command = Command::new("sh");
+                let ending = if parent_exits { "exit 0" } else { "wait" };
+                command
+                    .arg("-c")
+                    .arg(format!(
+                        "sleep 120 >/dev/null 2>&1 </dev/null & echo $! > \"$1\"; {ending}"
+                    ))
+                    .arg("mcp-cleanup-fixture")
+                    .arg(&pid_file);
+                let (mut child, _stderr) = spawn_long_lived_mcp_subprocess(command).await.unwrap();
+                let group = child.id().unwrap() as i32;
+                let mut grandchild = None;
+                eventually("MCP grandchild pid recorded", || {
+                    grandchild = read_pid_file(&pid_file);
+                    grandchild.is_some()
+                })
+                .await;
+                let grandchild = grandchild.unwrap();
+                if parent_exits {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(2), child.receive())
+                            .await
+                            .expect("exited parent closes stdout")
+                            .is_none()
+                    );
+                }
+                assert!(signalable(grandchild), "descendant must outlive the parent");
+                if close {
+                    child.close().await.unwrap();
+                    assert!(child.group.0.is_none(), "close must disarm group cleanup");
+                }
+                drop(child);
+                eventually("MCP grandchild gone", || !signalable(grandchild)).await;
+                eventually("MCP process group gone", || !signalable(-group)).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_reaps_descendants_after_successful_parent_exit() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 120 & echo $!"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = ProcessGroupChild::spawn(&mut command).unwrap();
+        let group = child.id().unwrap() as i32;
+        let run = run_bounded(child, 1024, Duration::from_secs(3), None)
+            .await
+            .unwrap();
+        assert_eq!(run.outcome, Outcome::Exited(Some(0)));
+        assert!(
+            !run.drained_short,
+            "remaining descendants must not hold pipes open"
+        );
+        let grandchild = run.stdout.text.trim().parse::<i32>().unwrap();
+        eventually("successful tool's grandchild gone", || {
+            !signalable(grandchild)
+        })
+        .await;
+        eventually("successful tool's process group gone", || {
+            !signalable(-group)
+        })
+        .await;
     }
 
     #[test]

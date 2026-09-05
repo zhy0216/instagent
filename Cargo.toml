@@ -2,7 +2,7 @@
 name = "instagent"
 version = "0.1.0"
 edition = "2021"
-description = "插件为核心的最小 agent（Rust 从零实现）"
+description = "插件为核心的 headless agent（Rust 从零实现）"
 # 发布元数据与 toolchain/MSRV 政策见 docs/release.md（plan E1/E2）。
 # license 对齐只读参考基线 block/goose（Apache-2.0，搬运片段在 commit 注明出处）。
 license = "Apache-2.0"
@@ -60,7 +60,6 @@ rmcp = { version = "3.0.0", features = [
     # 14 的 StreamableHttpClientTransport::from_uri 需要 reqwest 实现（rmcp 3.x 拆出的子 feature）
     "transport-streamable-http-client-reqwest",
 ] }
-rustyline = "18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

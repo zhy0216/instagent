@@ -18,7 +18,8 @@
 //! 残缺 provider stream（todo 11 / A3）：`ToolUseEnd` 前 EOF 的 tool-use
 //! 保留已收集片段、按 malformed 提升（loop 给它补 is_error ToolResult，
 //! 模型可见），`Done` 前 EOF 记入 [`AssistantStream::incomplete`]；两者都
-//! 同时以 `Event::Error` 上报事件层。流内 `ProviderError` 仍原样上抛
+//! 同时以 `Event::Error` 上报事件层。没有工具结果可恢复的残缺终答直接失败，
+//! 不把截断文本当作完成。流内 `ProviderError` 仍原样上抛
 //! （已是结构化错误，且不能吞掉——ContextOverflow 重试依赖它）。
 
 pub mod compact;
@@ -47,6 +48,7 @@ use crate::message::Role;
 use crate::message::Usage;
 use crate::provider::Provider;
 use crate::provider::Request;
+use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::session::Session;
 use crate::tools::Registry;
@@ -101,6 +103,8 @@ pub struct AssistantStream {
     pub message: Message,
     pub malformed: HashMap<String, String>,
     pub cancelled: bool,
+    /// provider 的终止原因；只有正常 EndTurn 的非空终答才能完成任务。
+    pub stop_reason: Option<StopReason>,
     /// provider 流在协议层被截断时的结构化 note（None = 完整）；同一 note
     /// 以 `Event::Error` 上报事件层。取消不算截断（调用方动作，已由
     /// `cancelled` 表达）。
@@ -113,6 +117,7 @@ impl AssistantStream {
             message: Message::assistant(Vec::new(), None),
             malformed: HashMap::new(),
             cancelled: true,
+            stop_reason: None,
             incomplete: None,
         }
     }
@@ -176,7 +181,8 @@ impl Agent {
     }
 
     /// 第二版 §2.5 伪代码：append user → 循环 {compact::maybe → stream_assistant
-    /// → append assistant → 无 tool call 即 Done → 执行工具（`execute_calls`，
+    /// → append assistant → 无 tool call 且完整终答并通过 Stop hook 才 Done
+    /// → 执行工具（`execute_calls`，
     /// 独立只读并行）→ 结果合成一条 user 消息}。
     pub async fn run_turn(
         &self,
@@ -256,7 +262,7 @@ impl Agent {
                 .await;
 
             // Stop hook 载荷要带助手文本；finish_turn 会 move 掉消息，先取。
-            let last_assistant = if self.hooks.is_some() {
+            let last_assistant = if calls.is_empty() || self.hooks.is_some() {
                 assistant_text(&streamed.message)
             } else {
                 String::new()
@@ -270,11 +276,34 @@ impl Agent {
                 return Ok(TurnResult::Interrupted);
             }
             if calls.is_empty() {
+                if let Some(incomplete) = streamed.incomplete {
+                    anyhow::bail!("{incomplete}");
+                }
+                if streamed.stop_reason != Some(StopReason::EndTurn) {
+                    let err = anyhow::anyhow!(
+                        "provider ended without a completed answer (stop reason: {:?})",
+                        streamed.stop_reason
+                    );
+                    event::emit(&events, Event::Error(err.to_string())).await;
+                    return Err(err);
+                }
+                if last_assistant.trim().is_empty() {
+                    let err = anyhow::anyhow!("provider returned an empty final answer");
+                    event::emit(&events, Event::Error(err.to_string())).await;
+                    return Err(err);
+                }
                 // Stop 被阻止 → 注入提醒 user 消息、本轮继续跑（§2.7）。
-                if self
+                let blocked = match self
                     .stop_hook(session, last_assistant, &mut stop_blocks, &cancel)
-                    .await?
+                    .await
                 {
+                    Ok(blocked) => blocked,
+                    Err(err) => {
+                        event::emit(&events, Event::Error(err.to_string())).await;
+                        return Err(err);
+                    }
+                };
+                if blocked {
                     continue;
                 }
                 // T3：Stop 等待中被取消 → 按 Interrupted 收尾，不按 Done 结束。
@@ -288,7 +317,8 @@ impl Agent {
     }
 
     /// hook 触发点：Stop。被阻止 → 注入提醒 user 消息并返回 true（本轮继续跑）；
-    /// 无 hooks / 未阻止 / 连续阻止超上限（默认 8）强制结束返回 false，防死循环（§2.7）。
+    /// 无 hooks / 未阻止返回 false；连续阻止超上限（默认 8）返回错误，
+    /// 防死循环且不得把未通过验收的任务标记完成。
     /// 等待受 token 约束：取消则 drop hook future（子进程经 kill_on_drop
     /// 回收），不注入提醒、不做决策，返回 false；调用方随后检查 token 并按
     /// Interrupted 收尾。
@@ -311,10 +341,10 @@ impl Agent {
         if let HookDecision::Block(reason) = decision {
             *stop_blocks += 1;
             if *stop_blocks > STOP_BLOCK_LIMIT {
-                tracing::warn!(
-                    "Stop hook 连续阻止 {stop_blocks} 次（上限 {STOP_BLOCK_LIMIT}），强制结束本轮"
+                anyhow::bail!(
+                    "Stop hook blocked completion {stop_blocks} times \
+                     (limit {STOP_BLOCK_LIMIT}): {reason}"
                 );
-                return Ok(false);
             }
             session.append(Message::user_text(format!(
                 "Stop hook blocked ending this turn:\n\n{reason}\n\n\
@@ -387,6 +417,7 @@ impl Agent {
         let mut pending: Option<(String, String, String)> = None;
         let mut malformed = HashMap::new();
         let mut usage: Option<Usage> = None;
+        let mut stop_reason = None;
         let mut cancelled = false;
         loop {
             let item = tokio::select! {
@@ -430,8 +461,12 @@ impl Agent {
                         }
                     }
                 }
-                StreamEvent::Done { usage: u, .. } => {
+                StreamEvent::Done {
+                    usage: u,
+                    stop_reason: reason,
+                } => {
                     usage = Some(u);
+                    stop_reason = Some(reason);
                     event::emit(events, Event::Usage(u)).await;
                 }
             }
@@ -471,6 +506,7 @@ impl Agent {
             message: Message::assistant(blocks, usage),
             malformed,
             cancelled,
+            stop_reason,
             incomplete,
         })
     }
@@ -1212,7 +1248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_hook_block_nudges_until_cap_then_forces_done() {
+    async fn stop_hook_block_nudges_until_cap_then_fails() {
         let dir = tempfile::tempdir().unwrap();
         let hooks = hook_fixture(dir.path(), &[("Stop", "echo keep going >&2\nexit 2")]);
         let steps: Vec<Scripted> = (0..=STOP_BLOCK_LIMIT)
@@ -1223,9 +1259,18 @@ mod tests {
         agent.hooks = Some(Arc::new(hooks));
         let mut session = temp_session(dir.path());
 
-        let (result, _) = run(&agent, &mut session, "go").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-        // 前 8 次阻止各注入一条 nudge（cap=8），第 9 次超上限强制结束。
+        let (result, events) = run(&agent, &mut session, "go").await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Stop hook blocked completion 9 times"),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("[hookplug] keep going"), "{err:#}");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Error(reason) if reason == &err.to_string())));
+        // 前 8 次阻止各注入一条 nudge（cap=8），第 9 次超上限报错结束。
         assert_eq!(provider.calls() as u32, STOP_BLOCK_LIMIT + 1);
         crate::message::validate(&session.messages).unwrap();
         assert_eq!(
@@ -1547,6 +1592,81 @@ mod tests {
             }
             .to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_answer_fails_and_retains_partial_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![scripted(vec![StreamEvent::TextDelta(
+            "partial answer".into(),
+        )])]);
+        let agent = agent(provider.clone(), 100_000);
+        let mut session = temp_session(dir.path());
+
+        let (result, _) = run(&agent, &mut session, "task").await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("stream reached EOF before Done"),
+            "{err:#}"
+        );
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(first_text(&session.messages[1]), "partial answer");
+        crate::message::validate(&session.messages).unwrap();
+        assert!(std::fs::read_to_string(&session.path)
+            .unwrap()
+            .contains("partial answer"));
+    }
+
+    #[tokio::test]
+    async fn abnormal_final_stop_reasons_never_report_done() {
+        for stop_reason in [
+            StopReason::MaxTokens,
+            StopReason::Other,
+            StopReason::ToolUse,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = MockProvider::new(vec![scripted(vec![
+                StreamEvent::TextDelta("unfinished".into()),
+                StreamEvent::Done {
+                    usage: Usage::default(),
+                    stop_reason,
+                },
+            ])]);
+            let agent = agent(provider, 100_000);
+            let mut session = temp_session(dir.path());
+            let (result, _) = run(&agent, &mut session, "task").await;
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("without a completed answer"),
+                "{stop_reason:?}: {err:#}"
+            );
+            assert_eq!(first_text(&session.messages[1]), "unfinished");
+            crate::message::validate(&session.messages).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_final_answer_on_resume_does_not_reuse_previous_answer() {
+        for text in ["", "  \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = MockProvider::new(vec![
+                scripted(vec![
+                    StreamEvent::TextDelta("previous answer".into()),
+                    done(1, 1),
+                ]),
+                scripted(vec![StreamEvent::TextDelta(text.into()), done(1, 1)]),
+            ]);
+            let agent = agent(provider, 100_000);
+            let mut session = temp_session(dir.path());
+            assert_eq!(
+                run(&agent, &mut session, "first task").await.0.unwrap(),
+                TurnResult::Done
+            );
+            let (result, _) = run(&agent, &mut session, "second task").await;
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("empty final answer"), "{err:#}");
+            crate::message::validate(&session.messages).unwrap();
+        }
     }
 
     /// 取消不是截断：cancelled 路径不产出 incomplete note（既有语义不变）。

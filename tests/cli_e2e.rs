@@ -1,21 +1,8 @@
-//! repo-improvements 09：CLI 二进制级集成测试；12（T5 / A6 / A7）：
-//! stdout/stderr 契约、退出码、resume 跨命令、/clear /compact、Ctrl-C 与
-//! 子进程组回收的回归。
+//! Headless CLI 二进制回归：完整任务输入、终态 JSON/退出码、插件能力、
+//! 跨进程恢复、自动压缩、取消/超时与子进程组清理。
 //!
-//! 经 `env!("CARGO_BIN_EXE_instagent")` 起真进程，每测试一套
-//! `INSTAGENT_CONFIG_DIR` / `INSTAGENT_DATA_DIR` / `INSTAGENT_AGENTS_DIR`
-//! 沙箱三变量隔离（tempdir，不改本测试进程 env，不触碰真实目录），
-//! provider 用测试进程内的 wiremock SSE 顶替（同 `src/cli/assembly.rs`
-//! 进程内测试的做法）。覆盖 README 手工验证清单第 4/5/7/8 条的可自动化部分。
-//!
-//! 交互路径（chat REPL）不依赖 PTY crate（依赖清单由 `00` 锁定）：
-//! rustyline 对非 tty stdin 按行读取，管道喂入即可驱动斜杠命令与
-//! Ctrl-C（`tokio::signal::ctrl_c` 与终端无关，`kill -INT` 直达进程）。
-//! 全部离线跑通，不依赖 live API key；live 测试保持可选（`live_e2e.rs`）。
-//!
-//! 输出契约（ADR 0003 D4）：stdout 只放模型回答文本流；工具事件、预览、
-//! usage、session id、notes、错误与一切诊断走 stderr；运行失败非零退出且
-//! stderr 末行 `error: …`；stdout EPIPE 不改退出码。
+//! 每测试使用独立目录与离线 wiremock provider；不依赖 stdin、TTY 或凭据。
+//! stdout 仅输出答案或单个 JSON 文档，运行诊断统一走 stderr。
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -27,11 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::sync::Mutex;
 use wiremock::matchers::body_string_contains;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -42,8 +26,6 @@ use wiremock::ResponseTemplate;
 const BIN: &str = env!("CARGO_BIN_EXE_instagent");
 /// wiremock 秒回，但 CI 机器可能很慢；超时兜底防挂死。
 const TIMEOUT: Duration = Duration::from_secs(120);
-/// 交互测试里等待单条 stderr 标记的超时。
-const WAIT: Duration = Duration::from_secs(60);
 
 const PLUGIN_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -197,128 +179,100 @@ fn assert_failed_with_error_line(output: &Output, ctx: &str) {
     );
 }
 
-// ---- 交互驱动（管道 stdin；rustyline 非 tty 按行读，见模块注释） ----
-
-/// 运行中的 REPL 子进程：stdin 可写（`None` = 已关闭送 EOF），
-/// stdout 后台抽干，stderr 按行断言。
-struct Repl {
-    child: tokio::process::Child,
-    stdin: Option<tokio::process::ChildStdin>,
-    stderr: BufReader<tokio::process::ChildStderr>,
-    stderr_seen: Vec<String>,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stdout_task: tokio::task::JoinHandle<()>,
+/// 启动一个独立批次并收集管道输出；调用者可以在结束前发送信号。
+fn spawn_run(mut cmd: tokio::process::Command) -> tokio::process::Child {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    instagent::subprocess::configure_subprocess(&mut cmd);
+    cmd.spawn().expect("spawn instagent run")
 }
 
-impl Sandbox {
-    /// 起一个可交互的 chat 子进程（三管道都接管）。
-    async fn spawn_repl(&self, args: &[&str]) -> Repl {
-        let mut cmd = self.cmd(args);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        instagent::subprocess::configure_subprocess(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn instagent chat");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = BufReader::new(child.stderr.take().unwrap());
-        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-        let drained = stdout_buf.clone();
-        let stdout_task = tokio::spawn(async move {
-            let mut reader = stdout;
-            let mut chunk = [0u8; 8192];
-            loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => drained.lock().await.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
-            }
-        });
-        Repl {
-            child,
-            stdin: Some(stdin),
-            stderr,
-            stderr_seen: Vec::new(),
-            stdout: stdout_buf,
-            stdout_task,
-        }
-    }
+async fn finish_run(child: tokio::process::Child) -> Output {
+    tokio::time::timeout(TIMEOUT, child.wait_with_output())
+        .await
+        .expect("run did not terminate")
+        .expect("reap run")
 }
 
-impl Repl {
-    /// 等 stderr 出现含 `needle` 的行（已读过的行也会复查）。
-    async fn wait_for(&mut self, needle: &str) {
-        let poll = async {
-            loop {
-                if self.stderr_seen.iter().any(|line| line.contains(needle)) {
-                    return;
-                }
-                let mut line = String::new();
-                let n = self.stderr.read_line(&mut line).await.expect("read stderr");
-                assert!(
-                    n > 0,
-                    "stderr EOF，未等到 `{needle}`；已见 {:?}",
-                    self.stderr_seen
-                );
-                self.stderr_seen.push(line.trim_end().to_string());
-            }
-        };
-        tokio::time::timeout(WAIT, poll).await.unwrap_or_else(|_| {
-            panic!(
-                "等待 `{needle}` 超时（{}s）；已见 stderr: {:?}",
-                WAIT.as_secs(),
-                self.stderr_seen
-            )
-        });
+fn terminal_json(out: &Output, status: &str, exit_code: i32) -> serde_json::Value {
+    assert_eq!(
+        out.status.code(),
+        Some(exit_code),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // from_slice rejects trailing text or multiple documents.
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid terminal JSON: {e}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    let object = value.as_object().expect("terminal object");
+    assert_eq!(object.len(), 6, "{value}");
+    for key in [
+        "schema_version",
+        "status",
+        "session_id",
+        "output",
+        "usage",
+        "error",
+    ] {
+        assert!(object.contains_key(key), "missing {key}: {value}");
     }
-
-    async fn send(&mut self, line: &str) {
-        let stdin = self.stdin.as_mut().expect("stdin still open");
-        stdin.write_all(line.as_bytes()).await.expect("write stdin");
-        stdin.flush().await.expect("flush stdin");
-    }
-
-    /// 关闭 stdin（送 EOF），触发 Ctrl-D 退出路径。
-    async fn close_stdin(&mut self) {
-        drop(self.stdin.take());
-    }
-
-    /// 等进程退出（要求成功），收齐 stdout 与全部已见 stderr。
-    async fn finish_ok(mut self, ctx: &str) -> (String, Vec<String>) {
-        let status = tokio::time::timeout(TIMEOUT, self.child.wait())
-            .await
-            .unwrap_or_else(|_| panic!("{ctx}: 等待退出超时；已见 stderr: {:?}", self.stderr_seen))
-            .expect("reap child");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["status"], status);
+    assert!(value["output"].is_string());
+    if status == "completed" {
+        assert!(value["error"].is_null(), "{value}");
+    } else {
         assert!(
-            status.success(),
-            "{ctx}: 期望退出码 0，实得 {:?}；已见 stderr: {:?}",
-            status.code(),
-            self.stderr_seen
+            value["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{value}"
         );
-        // 子进程已退出 → stdout 已 EOF，抽干任务随即结束。
-        let _ = tokio::time::timeout(Duration::from_secs(10), self.stdout_task).await;
-        let stdout = String::from_utf8(self.stdout.lock().await.clone()).expect("utf8 stdout");
-        (stdout, self.stderr_seen)
     }
+    value
+}
 
-    #[cfg(unix)]
-    fn pid(&self) -> u32 {
-        self.child.id().expect("child pid")
-    }
+fn session_messages(sandbox: &Sandbox, id: &str) -> Vec<instagent::message::Message> {
+    let content =
+        std::fs::read_to_string(sandbox.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
+    let messages: Vec<_> = content
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    instagent::message::validate(&messages).expect("persisted session remains valid");
+    messages
+}
+
+async fn wait_requests(server: &MockServer, count: usize) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if server.received_requests().await.unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("provider request did not arrive");
 }
 
 #[cfg(unix)]
-async fn sigint(pid: u32) {
-    let status = tokio::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
+async fn signal(pid: u32, signal: &str) {
+    let mut cmd = tokio::process::Command::new("kill");
+    cmd.args([signal, &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .expect("run kill -INT");
-    assert!(status.success(), "kill -INT {pid}");
+        .stderr(Stdio::null());
+    instagent::subprocess::configure_subprocess(&mut cmd);
+    assert!(
+        cmd.status().await.expect("run kill").success(),
+        "kill {signal} {pid}"
+    );
 }
 
 /// pid 文件出现（孙进程已启动）后返回其 pid。
@@ -341,19 +295,20 @@ async fn wait_pid_file(path: &Path) -> u32 {
 #[cfg(unix)]
 async fn eventually_dead(pid: u32) {
     for _ in 0..100 {
-        let status = tokio::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
+        let mut cmd = tokio::process::Command::new("kill");
+        cmd.args(["-0", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .expect("run kill -0");
+            .stderr(Stdio::null());
+        instagent::subprocess::configure_subprocess(&mut cmd);
+        let status = cmd.status().await.expect("run kill -0");
         if !status.success() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Reap the known fixture child even when the assertion exposes a cleanup regression.
+    signal(pid, "-KILL").await;
     panic!("pid {pid} 在取消后仍存活（子进程组未回收）");
 }
 
@@ -651,7 +606,213 @@ async fn run_with_plugin_flag_loads_dev_provider() {
     );
 }
 
-// ---- resume 跨命令（A7） ----
+// ---- Headless 输入、终态结果与跨进程恢复 ----
+
+#[tokio::test]
+async fn json_completed_is_single_document_with_usage_and_session() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let out = output(sandbox.cmd(&["run", "-t", "say hi", "--output", "json"])).await;
+    let result = terminal_json(&out, "completed", 0);
+    assert_eq!(result["output"], "hi there");
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({
+            "input":12,"output":5,"cache_read":0,"cache_write":0,
+        })
+    );
+    let id = result["session_id"].as_str().expect("session id");
+    assert_eq!(session_messages(&sandbox, id).len(), 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("session {id}")));
+}
+
+#[tokio::test]
+async fn json_setup_and_provider_failures_are_machine_readable() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config_yaml("");
+    let out = output(sandbox.cmd(&["run", "-t", "go", "--output", "json"])).await;
+    let result = terminal_json(&out, "failed", 1);
+    assert!(result["session_id"].is_null());
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+
+    sandbox.install_fake_provider("http://127.0.0.1:9");
+    let out = output(sandbox.cmd(&["run", "-t", "go", "--output", "json"])).await;
+    let result = terminal_json(&out, "failed", 1);
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+    let id = result["session_id"]
+        .as_str()
+        .expect("failed run session id");
+    assert_eq!(session_messages(&sandbox, id).len(), 1);
+}
+
+#[tokio::test]
+async fn json_max_turns_is_not_reported_as_completed() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(shell_call_sse("echo bounded"))
+        .mount(&server)
+        .await;
+    sandbox.install_fake_provider(&server.uri());
+    sandbox.write_config_yaml("provider: fake\nmodel: test-model\nmax_turns: 1\n");
+    let out = output(sandbox.cmd(&["run", "-t", "go", "--output", "json"])).await;
+    let result = terminal_json(&out, "max_turns", 3);
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+    let messages = session_messages(&sandbox, result["session_id"].as_str().unwrap());
+    assert_eq!(messages.len(), 3, "task + tool call + tool result");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn task_source_and_timeout_arguments_are_validated_without_stdin() {
+    let sandbox = Sandbox::new();
+    for args in [
+        vec!["run"],
+        vec!["chat"],
+        vec!["run", "-t", "hi", "--task-file", "task.md"],
+        vec!["run", "-t", "hi", "--command", "plug:task"],
+        vec!["run", "--task-file", "task.md", "--command", "plug:task"],
+        vec!["run", "-t", "hi", "--args", "unused"],
+        vec!["run", "-t", "hi", "--timeout", "0"],
+        vec!["run", "-t", "hi", "--timeout", "-1"],
+        vec!["run", "-t", "hi", "--timeout", "1.5"],
+        vec!["run", "-t", "hi", "--output", "xml"],
+        vec!["run", "--resume", "last"],
+    ] {
+        let out = output(sandbox.cmd(&args)).await;
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "{args:?}: clap writes only stderr");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("error:"));
+    }
+}
+
+#[tokio::test]
+async fn blank_task_fails_with_json_before_provider_setup() {
+    let sandbox = Sandbox::new();
+    for task in ["", " \n\t"] {
+        let out = output(sandbox.cmd(&["run", "-t", task, "--output", "json"])).await;
+        let result = terminal_json(&out, "failed", 1);
+        assert!(result["session_id"].is_null());
+        assert_eq!(result["output"], "");
+        assert!(
+            result["error"].as_str().unwrap().contains("task"),
+            "{result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_file_loads_utf8_and_rejects_missing_blank_or_nonregular_input() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    std::fs::write(
+        sandbox.cwd.path().join("task.md"),
+        "TASK_FILE_蓝莓\nsecond line",
+    )
+    .unwrap();
+    let out = output(sandbox.cmd(&["run", "--task-file", "task.md", "--output", "json"])).await;
+    terminal_json(&out, "completed", 0);
+    let request = &server.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body["messages"].to_string().contains("TASK_FILE_蓝莓"));
+    std::fs::write(sandbox.cwd.path().join("blank.md"), " \n\t").unwrap();
+    std::fs::write(sandbox.cwd.path().join("binary.md"), [0xff, 0xfe]).unwrap();
+    for name in ["missing.md", "blank.md", "binary.md", ".", "-"] {
+        let out = output(sandbox.cmd(&["run", "--task-file", name, "--output", "json"])).await;
+        let result = terminal_json(&out, "failed", 1);
+        assert!(result["session_id"].is_null(), "{name}: {result}");
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_file_fifo_is_rejected_without_opening_a_reader() {
+    let sandbox = Sandbox::new();
+    let fifo = sandbox.cwd.path().join("task.fifo");
+    let mut cmd = tokio::process::Command::new("mkfifo");
+    cmd.arg(&fifo).stdin(Stdio::null());
+    instagent::subprocess::configure_subprocess(&mut cmd);
+    assert!(cmd.status().await.unwrap().success());
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        output(sandbox.cmd(&["run", "--task-file", "task.fifo", "--output", "json"])),
+    )
+    .await
+    .expect("FIFO task input must not wait for a writer");
+    terminal_json(&out, "failed", 1);
+}
+
+#[tokio::test]
+async fn run_finishes_even_when_stdin_pipe_remains_open() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let mut cmd = sandbox.cmd(&["run", "-t", "go", "--output", "json"]);
+    cmd.stdin(Stdio::piped());
+    let mut child = spawn_run(cmd);
+    let _open_stdin = child.stdin.take().unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(10), finish_run(child))
+        .await
+        .expect("headless run must not wait for stdin EOF");
+    terminal_json(&out, "completed", 0);
+}
+
+#[tokio::test]
+async fn plugin_task_template_expands_arguments_and_unknown_template_fails() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liveplug");
+    let plugin = plugin.to_str().unwrap();
+    let out = output(sandbox.cmd(&[
+        "run",
+        "--plugin",
+        plugin,
+        "--command",
+        "liveplug:greet",
+        "--args",
+        "TEMPLATE_菠萝",
+        "--output",
+        "json",
+    ]))
+    .await;
+    terminal_json(&out, "completed", 0);
+    let request = &server.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    let messages = body["messages"].to_string();
+    assert!(messages.contains("TEMPLATE_菠萝"), "{messages}");
+    assert!(!messages.contains("$ARGUMENTS"), "{messages}");
+    for command in ["liveplug:missing", "greet", "missing:greet"] {
+        let out = output(sandbox.cmd(&[
+            "run",
+            "--plugin",
+            plugin,
+            "--command",
+            command,
+            "--output",
+            "json",
+        ]))
+        .await;
+        terminal_json(&out, "failed", 1);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
 
 #[tokio::test]
 async fn resume_across_commands_continues_same_session() {
@@ -659,156 +820,386 @@ async fn resume_across_commands_continues_same_session() {
     let server = MockServer::start().await;
     mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-
-    // run -t 建会话。
-    let run = output(sandbox.cmd(&["run", "-t", "say hi"])).await;
-    assert_ok(&run, "run -t");
-    let id = String::from_utf8_lossy(&run.stderr)
-        .lines()
-        .find_map(|line| line.strip_prefix("session "))
-        .expect("session id on stderr")
-        .trim()
-        .to_string();
-
-    // chat --resume <id>：横幅确认同一会话，再跑一轮。
-    let mut repl = sandbox.spawn_repl(&["chat", "--resume", &id]).await;
-    repl.wait_for(&format!("session {id}")).await;
-    repl.send("again\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/exit\n").await;
-    let (stdout, _) = repl.finish_ok("chat --resume").await;
-    assert_eq!(stdout, "hi there\n", "resume 轮的答案同样只走 stdout");
-
-    // 会话累计两条问答（header + 4 条消息），list 仍只有一条会话。
-    let file = sandbox.sessions_dir().join(format!("{id}.jsonl"));
-    let lines = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(lines.lines().count(), 5, "header + 4 messages: {lines}");
+    let run = output(sandbox.cmd(&["run", "-t", "say hi", "--output", "json"])).await;
+    let first = terminal_json(&run, "completed", 0);
+    let id = first["session_id"].as_str().unwrap();
+    for resume in [id, "last"] {
+        let out =
+            output(sandbox.cmd(&["run", "--resume", resume, "-t", "again", "--output", "json"]))
+                .await;
+        let result = terminal_json(&out, "completed", 0);
+        assert_eq!(result["session_id"], id);
+        assert_eq!(result["output"], "hi there", "only the current task answer");
+    }
+    assert_eq!(session_messages(&sandbox, id).len(), 6);
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert!(
+        body["messages"].to_string().contains("say hi"),
+        "restored history sent to provider"
+    );
     let list = output(sandbox.cmd(&["sessions", "list"])).await;
     assert_ok(&list, "sessions list");
-    let stdout = String::from_utf8_lossy(&list.stdout);
-    assert_eq!(
-        stdout.lines().filter(|l| !l.trim().is_empty()).count(),
-        1,
-        "resume 不应新建会话: {stdout}"
-    );
-
-    // --resume last 选中同一会话（EOF 直接退出，无新轮次）。
-    let mut repl = sandbox.spawn_repl(&["chat", "--resume", "last"]).await;
-    repl.wait_for(&format!("session {id}")).await;
-    repl.close_stdin().await;
-    let _ = repl.finish_ok("chat --resume last (EOF)").await;
+    assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 1);
 }
 
 #[tokio::test]
-async fn resume_bad_id_fails_with_error_last_line() {
+async fn resume_preserves_provider_model_and_cwd_and_rejects_conflicting_cwd() {
     let sandbox = Sandbox::new();
-    sandbox.install_fake_provider("http://127.0.0.1:9"); // 无需真连上。
-    let out = output(sandbox.cmd(&["chat", "--resume", "no-such-session"])).await;
-    assert_failed_with_error_line(&out, "resume 不存在的会话");
-
-    // 路径穿越 id 在边界被拒（02 的白名单），同样非零 + 末行 error:。
-    let out = output(sandbox.cmd(&["chat", "--resume", "../evil"])).await;
-    assert_failed_with_error_line(&out, "resume 路径穿越 id");
+    let original_cwd = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let out = output(sandbox.cmd(&[
+        "run",
+        "-t",
+        "first",
+        "--cwd",
+        original_cwd.path().to_str().unwrap(),
+        "--model",
+        "saved-model",
+        "--output",
+        "json",
+    ]))
+    .await;
+    let first = terminal_json(&out, "completed", 0);
+    let id = first["session_id"].as_str().unwrap();
+    // Later global defaults and the caller's directory must not redirect a resumed task.
+    sandbox.write_config_yaml("provider: nonexistent-provider\nmodel: unrelated-model\n");
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(shell_call_sse("pwd > resumed.cwd"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_chat_completions(&server).await;
+    let out =
+        output(sandbox.cmd(&["run", "--resume", id, "-t", "continue", "--output", "json"])).await;
+    let resumed = terminal_json(&out, "completed", 0);
+    assert_eq!(resumed["session_id"], id);
+    let actual = std::fs::read_to_string(original_cwd.path().join("resumed.cwd")).unwrap();
+    assert_eq!(
+        Path::new(actual.trim()).canonicalize().unwrap(),
+        original_cwd.path().canonicalize().unwrap()
+    );
+    assert!(!sandbox.cwd.path().join("resumed.cwd").exists());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "saved-model");
+    }
+    let out = output(sandbox.cmd(&[
+        "run",
+        "--resume",
+        id,
+        "-t",
+        "conflict",
+        "--cwd",
+        sandbox.cwd.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]))
+    .await;
+    let result = terminal_json(&out, "failed", 1);
+    assert!(result["error"].as_str().unwrap().contains("--cwd"));
+    assert_eq!(result["session_id"], id);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
-// ---- chat 斜杠命令：/clear /compact（A7，离线） ----
-
 #[tokio::test]
-async fn chat_clear_and_compact_slash_commands() {
+async fn failed_resumed_run_does_not_return_previous_answer_or_usage() {
     let sandbox = Sandbox::new();
     let server = MockServer::start().await;
-    mount_chat_completions(&server).await; // 轮次 + 压缩摘要共用同一回复形状。
+    mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("say hi\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/compact\n").await;
-    repl.wait_for("· compacted").await;
-    repl.wait_for("(compacted)").await;
-    repl.send("/clear\n").await;
-    repl.wait_for("(context cleared)").await;
-    repl.send("/exit\n").await;
-    let (stdout, stderr) = repl.finish_ok("chat /clear /compact").await;
-
-    assert_eq!(stdout, "hi there\n", "斜杠命令反馈不得进 stdout");
-    assert!(
-        !stderr.iter().any(|line| line.contains("hi there")),
-        "答案文本不得回流 stderr: {stderr:?}"
-    );
-    // /compact 与 /clear 的 rewrite 都留时间戳备份（02 语义）；主会话文件
-    // 只有一个，且 /clear 后只剩 header 行。
-    let dir = sandbox.sessions_dir();
-    let main_files: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| !path.to_string_lossy().contains(".bak"))
-        .collect();
-    assert_eq!(main_files.len(), 1, "{main_files:?}");
-    let content = std::fs::read_to_string(&main_files[0]).unwrap();
-    assert_eq!(
-        content.lines().count(),
-        1,
-        "/clear 后只留 header: {content}"
-    );
+    let out = output(sandbox.cmd(&["run", "-t", "first", "--output", "json"])).await;
+    let first = terminal_json(&out, "completed", 0);
+    let id = first["session_id"].as_str().unwrap();
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let out =
+        output(sandbox.cmd(&["run", "--resume", id, "-t", "second", "--output", "json"])).await;
+    let result = terminal_json(&out, "failed", 1);
+    assert_eq!(result["session_id"], id);
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+    assert_eq!(session_messages(&sandbox, id).len(), 3);
 }
 
 #[tokio::test]
-async fn chat_unknown_command_feedback_on_stderr() {
+async fn resume_bad_id_or_absent_last_fails_without_creating_a_session() {
     let sandbox = Sandbox::new();
-    sandbox.install_fake_provider("http://127.0.0.1:9"); // 不跑轮次，无需连上。
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("/nope\n").await;
-    repl.wait_for("unknown command /nope").await;
-    repl.send("/exit\n").await;
-    let (stdout, _) = repl.finish_ok("chat unknown command").await;
-    assert!(stdout.is_empty(), "stdout 无答案时应为空: {stdout:?}");
+    sandbox.install_fake_provider("http://127.0.0.1:9");
+    for id in ["last", "no-such-session", "../evil"] {
+        let out =
+            output(sandbox.cmd(&["run", "--resume", id, "-t", "go", "--output", "json"])).await;
+        let result = terminal_json(&out, "failed", 1);
+        assert!(result["session_id"].is_null());
+    }
 }
 
-// ---- Ctrl-C（A7 / T5；unix） ----
-//
-// 空闲提示符的 Ctrl-C（rustyline `Interrupted`）只在真终端/PTY 下产生，
-// 管道驱动无法触发；本仓库依赖清单由 00 锁定、不引 PTY crate，故该分支
-// 不在 CI 覆盖。轮内取消（`watch_ctrl_c` 经 `tokio::signal::ctrl_c`）与
-// 终端无关，`kill -INT` 即可驱动，见下测。
+#[tokio::test]
+async fn run_does_not_auto_update_preinstalled_plugins() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let metadata = sandbox.agents.path().join("plugins/fakeprov/.install.json");
+    let before = serde_json::json!({
+        "source":"file:///nonexistent/headless-plugin-repository",
+        "commit":"0000000", "installed_at":1,
+        "last_update_check":null, "auto_update":true,
+    })
+    .to_string();
+    std::fs::write(&metadata, &before).unwrap();
+    let out = output(sandbox.cmd(&["run", "-t", "go", "--output", "json"])).await;
+    terminal_json(&out, "completed", 0);
+    assert_eq!(
+        std::fs::read_to_string(&metadata).unwrap(),
+        before,
+        "run must not even advance auto-update metadata"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("auto-update"));
+}
 
-/// 轮内 Ctrl-C：取消当前轮（REPL 可继续），运行中的 shell 进程组被整组
-/// 回收——孙进程（`sleep 120`）在退出后可观测地消失。
+#[cfg(unix)]
+async fn interrupted_mcp_startup_reaps_process_group(signal_name: Option<&str>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let plugin = sandbox.agents.path().join("plugins/slowmcp");
+    write_minimal_plugin_source(&plugin, "slowmcp");
+    let script = plugin.join("startup.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nsleep 120 &\necho $! > \"$0.pid\"\nwait\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        plugin.join("mcp.json"),
+        serde_json::json!({
+            "mcpServers":{"slow":{"type":"stdio","command":"./startup.sh"}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let timeout = if signal_name.is_some() { "60" } else { "2" };
+    let child =
+        spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json", "--timeout", timeout]));
+    let grandchild = wait_pid_file(&plugin.join("startup.sh.pid")).await;
+    if let Some(name) = signal_name {
+        signal(child.id().unwrap(), name).await;
+    }
+    let out = tokio::time::timeout(Duration::from_secs(10), finish_run(child))
+        .await
+        .expect("MCP initialization and cleanup must obey run deadline");
+    let (status, code) = if signal_name.is_some() {
+        ("cancelled", 130)
+    } else {
+        ("timed_out", 124)
+    };
+    let result = terminal_json(&out, status, code);
+    assert!(
+        result["session_id"].is_null(),
+        "initialization has no session yet: {result}"
+    );
+    eventually_dead(grandchild).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn ctrl_c_midturn_cancels_and_reaps_process_group() {
+async fn sigterm_during_mcp_initialization_reaps_process_group() {
+    interrupted_mcp_startup_reaps_process_group(Some("-TERM")).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_during_mcp_initialization_reaps_process_group() {
+    interrupted_mcp_startup_reaps_process_group(None).await;
+}
+
+/// Cancel while the second MCP server initializes: both the already connected
+/// transport and the pending handshake must release their entire child groups.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_multi_server_startup_reaps_connected_and_pending_groups() {
+    use std::os::unix::fs::PermissionsExt;
+
     let sandbox = Sandbox::new();
     let server = MockServer::start().await;
-    // 唯一一次请求 = shell 工具调用；取消后不应有第二次请求。
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let plugin = sandbox.agents.path().join("plugins/multimcp");
+    write_minimal_plugin_source(&plugin, "multimcp");
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_mcp-fixture-server"),
+        plugin.join("fixture-server"),
+    )
+    .unwrap();
+    for (name, tail) in [
+        ("ready.sh", "exec \"${PLUGIN_ROOT}/fixture-server\""),
+        ("pending.sh", "wait"),
+    ] {
+        let script = plugin.join(name);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nsleep 120 &\necho $! > \"$0.pid\"\n{tail}\n",),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        plugin.join("mcp.json"),
+        serde_json::json!({
+            "mcpServers":{
+                "a_ready":{"type":"stdio","command":"./ready.sh"},
+                "b_pending":{"type":"stdio","command":"./pending.sh"},
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let child = spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json"]));
+    let ready_grandchild = wait_pid_file(&plugin.join("ready.sh.pid")).await;
+    // Servers connect in name order. The second process starts only after the
+    // fixture server's successful initialize response has been consumed.
+    let pending_grandchild = wait_pid_file(&plugin.join("pending.sh.pid")).await;
+    signal(ready_grandchild, "-0").await;
+    signal(child.id().unwrap(), "-TERM").await;
+    let out = tokio::time::timeout(Duration::from_secs(8), finish_run(child))
+        .await
+        .expect("multi-server startup cancellation must terminate");
+    let result = terminal_json(&out, "cancelled", 130);
+    assert!(result["session_id"].is_null());
+    // Join both assertions so a regression still cleans up both known fixtures.
+    let (ready, pending) = tokio::join!(
+        tokio::spawn(eventually_dead(ready_grandchild)),
+        tokio::spawn(eventually_dead(pending_grandchild)),
+    );
+    ready.expect("connected server group cleanup");
+    pending.expect("pending handshake group cleanup");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_session_end_reports_cancelled_without_completed_answer() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    write_hook_plugin(
+        sandbox.agents.path(),
+        "slowend",
+        "SessionEnd",
+        "sleep 120 & echo $! > \"${PLUGIN_ROOT}/grandchild.pid\"; wait",
+    );
+    let child = spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json"]));
+    let grandchild =
+        wait_pid_file(&sandbox.agents.path().join("plugins/slowend/grandchild.pid")).await;
+    signal(child.id().unwrap(), "-TERM").await;
+    let out = tokio::time::timeout(Duration::from_secs(8), finish_run(child))
+        .await
+        .expect("late cancellation cleanup remains bounded");
+    let result = terminal_json(&out, "cancelled", 130);
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+    let messages = session_messages(&sandbox, result["session_id"].as_str().unwrap());
+    assert_eq!(
+        messages.len(),
+        2,
+        "completed answer remains in session for recovery"
+    );
+    assert!(serde_json::to_string(&messages)
+        .unwrap()
+        .contains("hi there"));
+    eventually_dead(grandchild).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// SIGINT/SIGTERM 和任务期限都会终止当前批次、清理孙进程并留下可恢复会话。
+#[cfg(unix)]
+async fn interrupted_run_reaps_and_resumes(signal_name: Option<&str>) {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(shell_call_sse(
             "sleep 120 & echo $! > grandchild.pid; sleep 120",
         ))
+        .up_to_n_times(1)
         .mount(&server)
         .await;
+    mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("go\n").await;
-    repl.wait_for("▶ shell").await;
-
-    let pid_file = sandbox.cwd.path().join("grandchild.pid");
-    let grandchild = wait_pid_file(&pid_file).await;
-    sigint(repl.pid()).await;
-    repl.wait_for("(turn cancelled; Ctrl-C again to quit)")
-        .await;
-
-    repl.send("/exit\n").await;
-    let (stdout, _) = repl.finish_ok("ctrl-c midturn").await;
-    assert!(stdout.is_empty(), "被取消的轮没有答案文本: {stdout:?}");
-
+    let timeout = if signal_name.is_some() { "60" } else { "2" };
+    let child =
+        spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json", "--timeout", timeout]));
+    let pid = child.id().unwrap();
+    let grandchild = wait_pid_file(&sandbox.cwd.path().join("grandchild.pid")).await;
+    if let Some(name) = signal_name {
+        signal(pid, name).await;
+    }
+    let out = tokio::time::timeout(Duration::from_secs(10), finish_run(child))
+        .await
+        .expect("interrupted task and cleanup must be bounded");
+    let (status, code) = if signal_name.is_some() {
+        ("cancelled", 130)
+    } else {
+        ("timed_out", 124)
+    };
+    let result = terminal_json(&out, status, code);
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
     eventually_dead(grandchild).await;
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1, "取消后不应再请求模型");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let id = result["session_id"].as_str().unwrap();
+    let messages = session_messages(&sandbox, id);
+    assert_eq!(
+        messages.len(),
+        3,
+        "task + assistant call + paired cancelled result"
+    );
+    assert!(messages[2].content.iter().any(|content| matches!(
+        content,
+        instagent::message::Content::ToolResult { is_error: true, .. }
+    )));
+    let out =
+        output(sandbox.cmd(&["run", "--resume", id, "-t", "again", "--output", "json"])).await;
+    let resumed = terminal_json(&out, "completed", 0);
+    assert_eq!(resumed["session_id"], id);
+    assert_eq!(resumed["output"], "hi there");
+    session_messages(&sandbox, id);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_cancels_reaps_and_resumes() {
+    interrupted_run_reaps_and_resumes(Some("-INT")).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_cancels_reaps_and_resumes() {
+    interrupted_run_reaps_and_resumes(Some("-TERM")).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_reaps_and_resumes() {
+    interrupted_run_reaps_and_resumes(None).await;
 }
 
 // ---- 08 T1：默认失败诊断可见（D01/D02；不设 RUST_LOG 即 warning 到 stderr） ----
@@ -1148,77 +1539,44 @@ async fn oversized_config_fails_early_without_echo() {
     );
 }
 
-/// /compact 慢摘要中 Ctrl-C：取消后无压缩痕迹，REPL 可继续（unix）。
+/// 自动压缩的摘要请求可被取消；未提交摘要时原会话保持可恢复。
 #[cfg(unix)]
 #[tokio::test]
 async fn compact_cancel_mid_summary_keeps_session_usable() {
     let sandbox = Sandbox::new();
     let server = MockServer::start().await;
-    // 摘要请求（含压缩 prompt）延迟 30s，给取消留窗口；普通轮次秒回。
-    let slow_summary = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_delay(Duration::from_secs(30))
-        .set_body_string(concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"compacted summary\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":7}}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        ));
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("Task Context"))
-        .respond_with(slow_summary)
+        .respond_with(sse_body().set_delay(Duration::from_secs(30)))
         .mount(&server)
         .await;
     mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("hello\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/compact\n").await;
-    // 等摘要请求到达 mock 再取消（确定性窗口，不靠 sleep 猜）。
-    for _ in 0..200 {
-        let count = server.received_requests().await.unwrap().len();
-        if count >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        2,
-        "摘要请求应已发出"
-    );
-    sigint(repl.pid()).await;
-    repl.wait_for("(compaction cancelled)").await;
-
-    // 原会话可继续：再跑一轮成功后退出。
-    repl.send("again\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/exit\n").await;
-    let (stdout, _) = repl.finish_ok("compact cancel then continue").await;
-    assert_eq!(
-        stdout, "hi there\nhi there\n",
-        "取消的压缩无答案，两轮答案完整"
-    );
-
-    // 无压缩痕迹：header + 4 条消息，无摘要行。
-    let dir = sandbox.sessions_dir();
-    let files: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(files.len(), 1, "{files:?}");
-    let content = std::fs::read_to_string(&files[0]).unwrap();
-    assert_eq!(content.lines().count(), 5, "header + 4 messages: {content}");
+    sandbox.write_config_yaml("provider: fake\nmodel: test-model\ncontext_limit: 10\n");
+    let out = output(sandbox.cmd(&["run", "-t", "hello", "--output", "json"])).await;
+    let first = terminal_json(&out, "completed", 0);
+    let id = first["session_id"].as_str().unwrap();
+    let child = spawn_run(sandbox.cmd(&["run", "--resume", id, "-t", "again", "--output", "json"]));
+    wait_requests(&server, 2).await;
+    signal(child.id().unwrap(), "-INT").await;
+    let out = finish_run(child).await;
+    let result = terminal_json(&out, "cancelled", 130);
+    assert_eq!(result["session_id"], id);
+    let messages = session_messages(&sandbox, id);
+    assert_eq!(messages.len(), 3, "old exchange + unanswered input");
+    let content = serde_json::to_string(&messages).unwrap();
     assert!(
         !content.contains(instagent::message::SUMMARY_PREFIX),
-        "取消的压缩不得留下摘要: {content}"
+        "cancelled summary must not commit"
     );
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 3, "两轮 + 一次被取消的摘要");
+    // Restore the ordinary threshold so the next batch tests recovery without another summary.
+    sandbox.write_config_yaml("provider: fake\nmodel: test-model\n");
+    let out =
+        output(sandbox.cmd(&["run", "--resume", id, "-t", "continue", "--output", "json"])).await;
+    terminal_json(&out, "completed", 0);
+    assert_eq!(session_messages(&sandbox, id).len(), 4);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 // ---- 08 T3：将隔离复现变成 CLI 回归 ----
@@ -1432,89 +1790,32 @@ async fn duplicate_tool_call_ids_rejected_without_execution() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
-/// A02 反转：`hello` → `/compact` → `next` 全程成功，无 `consecutive User`。
+/// 独立批次恢复历史后自动压缩，再继续处理任务，不需要斜杠命令。
 #[tokio::test]
-async fn compact_then_continue_keeps_session_valid() {
+async fn automatic_compaction_then_continue_keeps_session_valid() {
     let sandbox = Sandbox::new();
     let server = MockServer::start().await;
-    mount_chat_completions(&server).await; // 轮次与压缩摘要共用同一回复形状。
+    mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("hello\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/compact\n").await;
-    repl.wait_for("(compacted)").await;
-    repl.send("next\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/exit\n").await;
-    let (stdout, stderr) = repl.finish_ok("compact then continue").await;
-    assert_eq!(stdout, "hi there\nhi there\n", "两轮答案都在 stdout");
-    assert!(
-        !stderr.iter().any(|line| line.contains("consecutive")),
-        "压缩后继续不得报 consecutive: {stderr:?}"
-    );
-
-    let files: Vec<_> = std::fs::read_dir(sandbox.sessions_dir())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| !path.to_string_lossy().contains(".bak"))
-        .collect();
-    assert_eq!(files.len(), 1, "{files:?}");
-    let content = std::fs::read_to_string(&files[0]).unwrap();
+    sandbox.write_config_yaml("provider: fake\nmodel: test-model\ncontext_limit: 10\n");
+    let out = output(sandbox.cmd(&["run", "-t", "hello", "--output", "json"])).await;
+    let first = terminal_json(&out, "completed", 0);
+    let id = first["session_id"].as_str().unwrap();
+    let out = output(sandbox.cmd(&["run", "--resume", id, "-t", "next", "--output", "json"])).await;
+    let second = terminal_json(&out, "completed", 0);
+    assert_eq!(second["output"], "hi there");
+    assert_eq!(second["session_id"], id);
+    let messages = session_messages(&sandbox, id);
+    let content = serde_json::to_string(&messages).unwrap();
     assert!(
         content.contains(instagent::message::SUMMARY_PREFIX),
-        "压缩摘要应保留: {content}"
+        "summary persisted: {content}"
     );
-    assert!(content.contains("next"), "新输入应并入摘要消息: {content}");
+    assert!(content.contains("next"), "new task retained: {content}");
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         3,
-        "两轮 + 一次压缩摘要"
-    );
-}
-
-/// A03 反转（取消后继续/恢复）：轮内 Ctrl-C 后 REPL 可继续，次轮成功（unix）。
-#[cfg(unix)]
-#[tokio::test]
-async fn cancelled_turn_then_next_turn_succeeds() {
-    let sandbox = Sandbox::new();
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(shell_call_sse(
-            "sleep 120 & echo $! > grandchild2.pid; sleep 120",
-        ))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-    mount_chat_completions(&server).await;
-    sandbox.install_fake_provider(&server.uri());
-
-    let mut repl = sandbox.spawn_repl(&["chat"]).await;
-    repl.wait_for("instagent · provider fake").await;
-    repl.send("go\n").await;
-    repl.wait_for("▶ shell").await;
-
-    let pid_file = sandbox.cwd.path().join("grandchild2.pid");
-    let grandchild = wait_pid_file(&pid_file).await;
-    sigint(repl.pid()).await;
-    repl.wait_for("(turn cancelled; Ctrl-C again to quit)")
-        .await;
-
-    // 取消后继续：次轮成功。
-    repl.send("again\n").await;
-    repl.wait_for("usage: in=12 out=5").await;
-    repl.send("/exit\n").await;
-    let (stdout, _) = repl.finish_ok("cancel then continue").await;
-    assert_eq!(stdout, "hi there\n", "被取消的轮无答案，次轮答案完整");
-
-    eventually_dead(grandchild).await;
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        2,
-        "取消一轮 + 成功一轮"
+        "two tasks + automatic summary"
     );
 }
 

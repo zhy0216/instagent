@@ -1,5 +1,5 @@
 //! 自动压缩（第二版 §2.7）。触发：每条 assistant 消息后
-//! `usage.input >= threshold × context_limit`；或用户 `/compact`（`18` 接）；
+//! `usage.input >= threshold × context_limit`；或由库调用者显式触发；
 //! 或 provider 报 ContextOverflow（强制压缩后重试一次）。不引 tokenizer。
 //!
 //! 摘要请求 = 历史格式化成文本（>2KB 的 ToolResult 正文先替换成

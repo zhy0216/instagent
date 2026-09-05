@@ -1,6 +1,6 @@
-//! loop → UI 的单向事件（第二版 §2.5）与通道消费契约（todo 11 / A2）。
+//! loop → 调用方的单向进度事件与通道消费契约。
 //!
-//! channel 只给 UI 看，调用方自行选择消费方式——及时 drain（交互式 UI）、
+//! channel 供调用方观察进度，调用方自行选择消费方式——及时 drain、
 //! 给足容量（近似 unbounded、事件不丢）、或不消费（事件在 [`EMIT_GRACE`]
 //! 宽限后被丢弃并计数，见 [`dropped_event_count`]）。loop 永不因接收端
 //! 落后或断开而无限期卡住。
@@ -37,7 +37,7 @@ pub enum Event {
 }
 
 /// 事件通道背压宽限（A2）：channel 满时 `emit` 最多再等这么久，
-/// 之后丢弃事件并计数——turn 不为 UI 无限期等待。
+/// 之后丢弃事件并计数——turn 不为调用方无限期等待。
 pub const EMIT_GRACE: Duration = Duration::from_millis(250);
 
 // ponytail: 进程级计数——instagent 单 agent 进程；若将来并发多 Agent 需要
@@ -55,7 +55,7 @@ fn note_event_dropped(reason: &str) {
     tracing::debug!("{reason}，事件丢弃（累计 {total}）");
 }
 
-/// 事件通道只给 UI 看（消费契约见模块头）：接收端断开不该弄死 loop；
+/// 事件通道供调用方观察进度（消费契约见模块头）：接收端断开不该弄死 loop；
 /// channel 满最多等 [`EMIT_GRACE`]，之后丢弃并计数
 /// （[`dropped_event_count`]），turn 永不因背压无限期卡住。
 pub(crate) async fn emit(events: &mpsc::Sender<Event>, event: Event) {

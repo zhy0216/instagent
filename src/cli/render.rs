@@ -1,10 +1,10 @@
 //! 渲染（第二版 §2.11）：文本流式直接打印；工具调用打一行
 //! `▶ shell  ls -la`，完成后打预览和耗时；每轮末尾打 usage；不做 markdown。
 //!
-//! 输出契约（ADR 0003 D4）：**stdout 只输出模型最终回答文本流
+//! 输出契约（ADR 0003 D4）：**text 模式 stdout 输出模型文本流（包括中间说明）
 //! （TextDelta）**，工具事件（`▶` / `✓` / `✗` 行）、预览、usage、compaction
 //! 提示、错误与一切诊断统一走 **stderr**——`>file` / 管道消费方拿到纯答案。
-//! stdout 写失败（如 EPIPE）一律忽略、不改退出码；失败退出由 `main` 保证
+//! text 模式 stdout 写失败（如 EPIPE）一律忽略、不改退出码；失败退出由 `main` 保证
 //! 非零退出码且 stderr 末行 `error: {message}`。
 //!
 //! 两个流都以 `&mut dyn Write` 注入，路由规则可纯逻辑断言（T5）。
@@ -15,6 +15,22 @@ use serde_json::Value;
 
 use instagent::agent::Event;
 use instagent::message::Usage;
+
+/// Drain progress continuously; JSON mode obtains its answer from the session.
+pub async fn print_events(mut rx: tokio::sync::mpsc::Receiver<Event>, format: super::OutputFormat) {
+    let mut state = RenderState::default();
+    let mut stdout = std::io::stdout();
+    let mut discard = std::io::sink();
+    let out: &mut dyn Write = match format {
+        super::OutputFormat::Text => &mut stdout,
+        super::OutputFormat::Json => &mut discard,
+    };
+    let mut diag = std::io::stderr();
+    while let Some(event) = rx.recv().await {
+        render_event(&event, &mut state, out, &mut diag);
+    }
+    finish_turn(&mut state, out, &mut diag);
+}
 
 /// 单轮渲染状态（打印机任务独占）。
 #[derive(Default)]

@@ -1,126 +1,297 @@
-//! 子命令处理：chat / run / sessions / plugin（第二版 §2.11，plugin 见第三版 §2.10）。
+//! Noninteractive task execution, session management and plugin management.
 
-use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
+use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use instagent::agent::TurnResult;
-use instagent::hooks::HookDecision;
-use instagent::hooks::HookEvent;
+use instagent::hooks::{HookDecision, HookEvent};
+use instagent::message::{Content, Role, Usage};
 use instagent::plugin::install;
-use instagent::plugin::install::InstallOptions;
-use instagent::plugin::install::InstallSource;
+use instagent::plugin::install::{InstallOptions, InstallSource};
 use instagent::session::Session;
 
-use super::assembly;
-use super::assembly::AssemblyOpts;
-use super::repl;
-use super::PluginAction;
-use super::SessionsAction;
+use super::assembly::{self, AssemblyOpts};
+use super::{render, OutputFormat, PluginAction, RunArgs, SessionsAction};
 
-/// `instagent chat`：交互式 REPL（会话生命周期触发 SessionStart/End hooks）。
-pub async fn chat(
-    resume: Option<String>,
-    cwd: Option<PathBuf>,
-    model: Option<String>,
-    plugin: Vec<PathBuf>,
-) -> instagent::Result<()> {
-    let cwd = resolve_cwd(cwd)?;
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RunStatus {
+    Completed,
+    Failed,
+    MaxTurns,
+    TimedOut,
+    Cancelled,
+}
+
+impl RunStatus {
+    fn exit_code(self) -> ExitCode {
+        ExitCode::from(match self {
+            Self::Completed => 0,
+            Self::Failed => 1,
+            Self::MaxTurns => 3,
+            Self::TimedOut => 124,
+            Self::Cancelled => 130,
+        })
+    }
+}
+
+/// One terminal result. Only a completed invocation has an answer; partial work
+/// stays in the session, so failed resumes can never return an older answer.
+#[derive(Serialize)]
+struct RunReport {
+    schema_version: u32,
+    status: RunStatus,
+    session_id: Option<String>,
+    output: String,
+    usage: Option<Usage>,
+    error: Option<String>,
+}
+
+pub async fn run(args: RunArgs) -> instagent::Result<ExitCode> {
+    let mut report = RunReport {
+        schema_version: 1,
+        status: RunStatus::Failed,
+        session_id: None,
+        output: String::new(),
+        usage: None,
+        error: None,
+    };
+    let cancel = CancellationToken::new();
+    let mut interruption = None;
+    let result = {
+        let execution = execute(&args, &mut report, &cancel);
+        tokio::pin!(execution);
+        tokio::select! {
+            biased;
+            signal = wait_for_signal() => {
+                interruption = Some(match signal {
+                    Ok(()) => (RunStatus::Cancelled, "run cancelled".to_string()),
+                    Err(err) => (RunStatus::Failed, format!("install signal handler: {err:#}")),
+                });
+                cancel.cancel();
+                tokio::time::timeout(Duration::from_secs(5), &mut execution)
+                    .await.unwrap_or_else(|_| Err(anyhow::anyhow!("cleanup timed out")))
+            }
+            _ = tokio::time::sleep(Duration::from_secs(args.timeout)) => {
+                interruption = Some((RunStatus::TimedOut, format!("run timed out after {} seconds", args.timeout)));
+                cancel.cancel();
+                tokio::time::timeout(Duration::from_secs(5), &mut execution)
+                    .await.unwrap_or_else(|_| Err(anyhow::anyhow!("cleanup timed out")))
+            }
+            result = &mut execution => result,
+        }
+    };
+    let (status, error) = match interruption {
+        Some((status, error)) => (status, Some(error)),
+        None => match result {
+            Ok(TurnResult::Done) => (RunStatus::Completed, None),
+            Ok(TurnResult::Interrupted) => (RunStatus::Cancelled, Some("run cancelled".into())),
+            Ok(TurnResult::MaxTurns) => (RunStatus::MaxTurns, Some("max turns reached".into())),
+            Err(err) => (RunStatus::Failed, Some(format!("{err:#}"))),
+        },
+    };
+    report.status = status;
+    report.error = error;
+    if !matches!(status, RunStatus::Completed) {
+        report.output.clear();
+        report.usage = None;
+    }
+    if let Some(error) = &report.error {
+        eprintln!("error: {error}");
+    }
+    if args.output == OutputFormat::Json {
+        let mut stdout = std::io::stdout().lock();
+        serde_json::to_writer(&mut stdout, &report).context("write JSON result")?;
+        writeln!(stdout).context("finish JSON result")?;
+        stdout.flush().context("flush JSON result")?;
+    }
+    Ok(status.exit_code())
+}
+
+/// Register before execution is first polled, including during plugin startup.
+async fn wait_for_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+async fn execute(
+    args: &RunArgs,
+    report: &mut RunReport,
+    cancel: &CancellationToken,
+) -> instagent::Result<TurnResult> {
+    // Resolve input before any provider or plugin process is started.
+    let input = read_task(args)?;
+    let mut resumed = match args.resume.as_deref() {
+        None => None,
+        Some(id) => {
+            if id == "last" && Session::list()?.is_empty() {
+                anyhow::bail!("no session to resume");
+            }
+            Some(Session::open_or_resume(
+                Some(id),
+                &std::env::current_dir()?,
+                "",
+                "",
+            )?)
+        }
+    };
+    let cwd = if let Some(session) = &resumed {
+        report.session_id = Some(session.header.id.clone());
+        let original = session
+            .header
+            .cwd
+            .canonicalize()
+            .context("resolve saved session cwd")?;
+        if let Some(cwd) = &args.cwd {
+            if cwd.canonicalize().context("resolve --cwd")? != original {
+                anyhow::bail!("--cwd differs from the resumed session working directory");
+            }
+        }
+        original
+    } else {
+        resolve_cwd(args.cwd.clone())?
+    };
     let opts = AssemblyOpts {
         cwd: cwd.clone(),
-        model,
-        cli_plugins: plugin,
+        model: args
+            .model
+            .clone()
+            .or_else(|| resumed.as_ref().map(|s| s.header.model.clone())),
+        provider: resumed.as_ref().map(|s| s.header.provider.clone()),
+        cli_plugins: args.plugin.clone(),
     };
-    let mut rt = assembly::build(&opts).await?;
+    let rt = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(TurnResult::Interrupted),
+        result = assembly::build(&opts) => result?,
+    };
     print_notes(&rt.notes, &mut std::io::stderr());
 
-    let mut session =
-        Session::open_or_resume(resume.as_deref(), &cwd, &rt.provider_name, &rt.model)
-            .with_context(|| format!("open session {resume:?}"))?;
-
-    report_session_hook(
-        HookEvent::SessionStart,
-        rt.agent
-            .run_session_event(HookEvent::SessionStart, &session)
-            .await,
-        &mut std::io::stderr(),
-    );
-    let result = repl::chat_loop(&mut rt, &mut session).await;
-    report_session_hook(
-        HookEvent::SessionEnd,
-        rt.agent
-            .run_session_event(HookEvent::SessionEnd, &session)
-            .await,
-        &mut std::io::stderr(),
-    );
-    rt.agent.tools.shutdown().await;
+    let result = async {
+        let task = match input {
+            Some(task) => task,
+            None => {
+                let name = args.command.as_deref().context("task input is required")?;
+                let template = rt.task_templates.iter().find(|template| template.name == name)
+                    .with_context(|| format!("unknown task template `{name}`; use plugin:name from an enabled plugin"))?;
+                instagent::commands::expand(template, args.args.as_deref().unwrap_or(""))
+            }
+        };
+        if task.trim().is_empty() {
+            anyhow::bail!("task must not be empty or whitespace");
+        }
+        let mut session = match resumed.take() {
+            Some(session) => session,
+            None => Session::create(&cwd, &rt.provider_name, &rt.model)?,
+        };
+        report.session_id = Some(session.header.id.clone());
+        eprintln!("session {}", session.header.id);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            result = rt.agent.run_session_event(HookEvent::SessionStart, &session) => {
+                report_session_hook(HookEvent::SessionStart, result, &mut std::io::stderr());
+            }
+        }
+        let result = run_one_turn(&rt.agent, &mut session, task, cancel.clone(), args.output).await;
+        if matches!(&result, Ok(TurnResult::Done)) {
+            // The loop guarantees Done follows a new, nonempty terminal answer.
+            if let Some(message) = session.messages.last().filter(|m| m.role == Role::Assistant) {
+                report.output = message.content.iter().filter_map(|content| match content {
+                    Content::Text(text) => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("");
+                report.usage = message.usage;
+            }
+        }
+        // Normal hooks remain deadline-bound by the outer runner. After a
+        // cancellation give lifecycle hooks a small, explicit cleanup budget.
+        let end = rt.agent.run_session_event(HookEvent::SessionEnd, &session);
+        tokio::pin!(end);
+        let end_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => tokio::time::timeout(Duration::from_secs(2), &mut end)
+                .await.map_err(anyhow::Error::from).and_then(|result| result),
+            result = &mut end => result,
+        };
+        report_session_hook(HookEvent::SessionEnd, end_result, &mut std::io::stderr());
+        result
+    }.await;
+    if tokio::time::timeout(Duration::from_secs(3), rt.agent.tools.shutdown())
+        .await
+        .is_err()
+    {
+        eprintln!("warning: tool shutdown timed out");
+    }
     result
 }
 
-/// `instagent run -t "..."`：无交互跑一条任务。stdout 只有最终回答文本流；
-/// usage、session id、notes 等诊断走 stderr（ADR 0003 D4）。
-pub async fn run(
-    task: String,
-    cwd: Option<PathBuf>,
-    model: Option<String>,
-    plugin: Vec<PathBuf>,
-) -> instagent::Result<()> {
-    let cwd = resolve_cwd(cwd)?;
-    let opts = AssemblyOpts {
-        cwd: cwd.clone(),
-        model,
-        cli_plugins: plugin,
-    };
-    let mut stderr = std::io::stderr();
-    let rt = assembly::build(&opts).await?;
-    print_notes(&rt.notes, &mut stderr);
-
-    let mut session = Session::create(&cwd, &rt.provider_name, &rt.model)?;
-    eprintln!("session {}", session.header.id);
-
-    report_session_hook(
-        HookEvent::SessionStart,
-        rt.agent
-            .run_session_event(HookEvent::SessionStart, &session)
-            .await,
-        &mut std::io::stderr(),
-    );
-    let result = run_one_turn(&rt.agent, &mut session, task).await;
-    report_session_hook(
-        HookEvent::SessionEnd,
-        rt.agent
-            .run_session_event(HookEvent::SessionEnd, &session)
-            .await,
-        &mut std::io::stderr(),
-    );
-    rt.agent.tools.shutdown().await;
-
-    match result? {
-        TurnResult::Done => {}
-        TurnResult::Interrupted => eprintln!("(interrupted)"),
-        TurnResult::MaxTurns => eprintln!("(max turns reached)"),
+fn read_task(args: &RunArgs) -> instagent::Result<Option<String>> {
+    const MAX_TASK_BYTES: u64 = 1024 * 1024;
+    let count = usize::from(args.task.is_some())
+        + usize::from(args.task_file.is_some())
+        + usize::from(args.command.is_some());
+    if count != 1 {
+        anyhow::bail!("exactly one task input is required");
     }
-    Ok(())
+    let task = if let Some(path) = &args.task_file {
+        if !std::fs::metadata(path)
+            .with_context(|| format!("read task file {}", path.display()))?
+            .is_file()
+        {
+            anyhow::bail!("task file must be a regular UTF-8 file");
+        }
+        let file = std::fs::File::open(path).context("open task file")?;
+        let mut text = String::new();
+        file.take(MAX_TASK_BYTES + 1)
+            .read_to_string(&mut text)
+            .context("read UTF-8 task file")?;
+        Some(text)
+    } else {
+        args.task.clone()
+    };
+    if let Some(task) = &task {
+        if task.trim().is_empty() {
+            anyhow::bail!("task must not be empty or whitespace");
+        }
+        if task.len() as u64 > MAX_TASK_BYTES {
+            anyhow::bail!("task exceeds the 1 MiB input limit");
+        }
+    }
+    Ok(task)
 }
 
 async fn run_one_turn(
     agent: &instagent::agent::Agent,
     session: &mut Session,
     task: String,
+    cancel: CancellationToken,
+    output: OutputFormat,
 ) -> instagent::Result<TurnResult> {
     let (tx, rx) = tokio::sync::mpsc::channel(256);
-    let printer = tokio::spawn(repl::print_events(rx));
-    let result = agent
-        .run_turn(
-            session,
-            task,
-            tokio_util::sync::CancellationToken::new(),
-            tx,
-        )
-        .await;
-    let _ = printer.await;
+    // Both futures are owned by this invocation; cancellation cannot detach a
+    // printer that might write after the terminal JSON result.
+    let (result, ()) = tokio::join!(
+        agent.run_turn(session, task, cancel, tx),
+        render::print_events(rx, output),
+    );
     result
 }
 

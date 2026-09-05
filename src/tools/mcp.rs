@@ -44,7 +44,6 @@ use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::IntoTransport;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
 use std::time::Instant;
 use tokio::io::AsyncReadExt as _;
@@ -56,6 +55,7 @@ use crate::plugin::mcp_config::McpServerConfig;
 use crate::plugin::mcp_config::McpServerType;
 use crate::plugin::Plugin;
 use crate::subprocess::spawn_long_lived_mcp_subprocess;
+use crate::subprocess::McpProcess;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
 use crate::tools::ToolSource;
@@ -241,7 +241,7 @@ impl McpSource {
 async fn spawn_stdio(
     plugin: &Plugin,
     server: &McpServerConfig,
-) -> crate::Result<(TokioChildProcess, Option<ChildStderr>)> {
+) -> crate::Result<(McpProcess, Option<ChildStderr>)> {
     let (program, command) = stdio_command(plugin, server)?;
     spawn_long_lived_mcp_subprocess(command)
         .await
@@ -526,7 +526,7 @@ async fn drain_stderr_to_logs(id: &str, mut stderr: ChildStderr) {
 
 /// 任何 IntoTransport 统一走 serve_client（legacy initialize 握手），
 /// 整体套 [`connect_timeout`] 硬超时：握手悬死的 server 不拖垮装配
-/// （超时 drop future → transport drop → 子进程 kill_on_drop）。
+/// （超时 drop future → McpProcess 同步杀进程组 → rmcp 回收直接子进程）。
 async fn handshake<T, E, A>(
     transport: T,
     id: &str,
