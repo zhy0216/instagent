@@ -18,9 +18,10 @@
 //! 残缺 provider stream（todo 11 / A3）：`ToolUseEnd` 前 EOF 的 tool-use
 //! 保留已收集片段、按 malformed 提升（loop 给它补 is_error ToolResult，
 //! 模型可见），`Done` 前 EOF 记入 [`AssistantStream::incomplete`]；两者都
-//! 同时以 `Event::Error` 上报事件层。没有工具结果可恢复的残缺终答直接失败，
-//! 不把截断文本当作完成。流内 `ProviderError` 仍原样上抛
-//! （已是结构化错误，且不能吞掉——ContextOverflow 重试依赖它）。
+//! 同时以 `Event::Error` 上报事件层。残缺或异常终止的响应整批拒绝工具执行，
+//! 保留配对的错误结果并返回失败，不把截断响应当作完成。
+//! 流内 `ProviderError` 仍原样上抛（已是结构化错误，且不能吞掉——
+//! ContextOverflow 重试依赖它）。
 
 pub mod compact;
 pub mod event;
@@ -121,6 +122,23 @@ impl AssistantStream {
             incomplete: None,
         }
     }
+
+    /// 有工具/无工具共用的完成状态检查；取消由 loop 优先处理。
+    /// 完整工具响应兼容 EndTurn，但纯终答必须是 EndTurn。
+    /// 单个参数 JSON 损坏不代表流残缺，仍交给 execute_calls 反馈工具错误。
+    fn completion_error(&self, has_calls: bool) -> Option<String> {
+        if let Some(incomplete) = self.incomplete {
+            return Some(incomplete.to_string());
+        }
+        match self.stop_reason {
+            Some(StopReason::EndTurn) => None,
+            Some(StopReason::ToolUse) if has_calls => None,
+            _ => Some(format!(
+                "provider ended without a completed answer (stop reason: {:?})",
+                self.stop_reason
+            )),
+        }
+    }
 }
 
 /// 残缺 provider stream 的结构化说明（A3 / todo 11）：只记录截断阶段，
@@ -142,7 +160,7 @@ impl std::fmt::Display for StreamIncomplete {
             reasons.push("stream reached EOF before Done");
         }
         if self.tool_use_without_end {
-            reasons.push("1 tool-use block ended before ToolUseEnd (partial input kept, answered as malformed)");
+            reasons.push("1 tool-use block ended before ToolUseEnd (partial input kept, tools were not executed)");
         }
         write!(f, "provider stream truncated: {}", reasons.join("; "))
     }
@@ -257,9 +275,33 @@ impl Agent {
             }
 
             let calls = streamed.message.tool_uses();
-            let results = self
-                .execute_calls(session, &calls, &streamed, &cancel, &events)
-                .await;
+            // 参数完整也不能绕过响应完成状态；异常响应在所有工具/hook 副作用前
+            // 整批补错误结果。取消仍走 execute_calls 的 interrupted 收尾。
+            let completion_error = if streamed.cancelled || cancel.is_cancelled() {
+                None
+            } else {
+                streamed.completion_error(!calls.is_empty())
+            };
+            let results = if let Some(reason) = &completion_error {
+                calls
+                    .iter()
+                    .map(|call| Content::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: format!("tool was not executed because {reason}"),
+                        is_error: true,
+                    })
+                    .collect()
+            } else {
+                self.execute_calls(
+                    session,
+                    &calls,
+                    &streamed,
+                    &cancel,
+                    &events,
+                    SESSION_IMAGE_BUDGET,
+                )
+                .await
+            };
 
             // Stop hook 载荷要带助手文本；finish_turn 会 move 掉消息，先取。
             let last_assistant = if calls.is_empty() || self.hooks.is_some() {
@@ -275,18 +317,14 @@ impl Agent {
             if streamed.cancelled || cancel.is_cancelled() {
                 return Ok(TurnResult::Interrupted);
             }
+            if let Some(reason) = completion_error {
+                // 残缺流已由 stream_assistant 上报相同的诊断。
+                if streamed.incomplete.is_none() {
+                    event::emit(&events, Event::Error(reason.clone())).await;
+                }
+                anyhow::bail!("{reason}");
+            }
             if calls.is_empty() {
-                if let Some(incomplete) = streamed.incomplete {
-                    anyhow::bail!("{incomplete}");
-                }
-                if streamed.stop_reason != Some(StopReason::EndTurn) {
-                    let err = anyhow::anyhow!(
-                        "provider ended without a completed answer (stop reason: {:?})",
-                        streamed.stop_reason
-                    );
-                    event::emit(&events, Event::Error(err.to_string())).await;
-                    return Err(err);
-                }
                 if last_assistant.trim().is_empty() {
                     let err = anyhow::anyhow!("provider returned an empty final answer");
                     event::emit(&events, Event::Error(err.to_string())).await;
@@ -885,7 +923,17 @@ mod tests {
     /// 产图 stub 来源（不依赖 02 的 read_image）：look_image 返回带 image 的 ToolOutput。
     const STUB_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
-    struct ImageSource;
+    fn stub_image() -> ImageData {
+        ImageData {
+            data: STUB_PNG_B64.into(),
+            media_type: "image/png".into(),
+        }
+    }
+
+    #[derive(Default)]
+    struct ImageSource {
+        peers: Option<tokio::sync::Barrier>,
+    }
 
     #[async_trait]
     impl ToolSource for ImageSource {
@@ -902,14 +950,20 @@ mod tests {
             }]
         }
 
-        async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
+        async fn call(&self, _name: &str, input: Value, _ctx: &ToolCtx) -> ToolOutput {
+            if let Some(peers) = &self.peers {
+                peers.wait().await;
+            }
+            let mut image = stub_image();
+            match input["invalid"].as_str() {
+                Some("base64") => image.data.replace_range(..1, "!"),
+                Some("media_type") => image.media_type = "text/plain".into(),
+                _ => {}
+            }
             ToolOutput {
                 text: "Loaded image from stub".into(),
                 is_error: false,
-                image: Some(ImageData {
-                    data: STUB_PNG_B64.into(),
-                    media_type: "image/png".into(),
-                }),
+                image: Some(image),
             }
         }
     }
@@ -934,7 +988,7 @@ mod tests {
         let mut test_agent = agent(provider.clone(), 100_000);
         let mut registry = Registry::new();
         registry.register(Arc::new(BuiltinTools::new(None)));
-        registry.register(Arc::new(ImageSource));
+        registry.register(Arc::new(ImageSource::default()));
         test_agent.tools = Arc::new(registry);
         let mut session = {
             let _guard = crate::config::lock_env();
@@ -1304,7 +1358,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hooks = hook_fixture(dir.path(), &[("PreToolUse", "echo no sudo >&2\nexit 2")]);
         let provider = MockProvider::new(vec![
-            scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
+            scripted({
+                let mut events = tool_use_shell("t1", "{\"command\": \"echo hi\"}");
+                events.push(done(1, 1));
+                events
+            }),
             scripted(vec![StreamEvent::TextDelta("ok".into()), done(1, 1)]),
         ]);
         let mut agent = agent(provider.clone(), 100_000);
@@ -1349,7 +1407,11 @@ mod tests {
             ],
         );
         let provider = MockProvider::new(vec![
-            scripted(tool_use_shell("t1", "{\"command\": \"echo hi\"}")),
+            scripted({
+                let mut events = tool_use_shell("t1", "{\"command\": \"echo hi\"}");
+                events.push(done(1, 1));
+                events
+            }),
             scripted(vec![StreamEvent::TextDelta("done".into()), done(1, 1)]),
         ]);
         let mut agent = agent(provider.clone(), 100_000);
@@ -1508,14 +1570,14 @@ mod tests {
         assert_eq!(
             note,
             "provider stream truncated: stream reached EOF before Done; \
-             1 tool-use block ended before ToolUseEnd (partial input kept, answered as malformed)"
+             1 tool-use block ended before ToolUseEnd (partial input kept, tools were not executed)"
         );
     }
 
-    /// 截断流不静默丢失：残缺 tool call 按 malformed 走 loop，模型收到
-    /// is_error ToolResult，下一轮照常进行。
+    /// 截断流不静默丢失：残缺 tool call 保留并配对 is_error ToolResult，
+    /// 本次执行直接失败，不自动继续请求并掩盖异常。
     #[tokio::test]
-    async fn truncated_tool_stream_gets_error_result_and_continues() {
+    async fn truncated_tool_stream_fails_with_paired_error_result() {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![
             scripted(vec![
@@ -1532,8 +1594,12 @@ mod tests {
         let mut session = temp_session(dir.path());
 
         let (result, events) = run(&agent, &mut session, "go").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-        assert_eq!(provider.calls(), 2);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("stream reached EOF before Done"),
+            "{err:#}"
+        );
+        assert_eq!(provider.calls(), 1);
         crate::message::validate(&session.messages).unwrap();
 
         // assistant 保留文本 + 残缺 ToolUse 片段（字符串 input）。
@@ -1543,7 +1609,9 @@ mod tests {
         let results = tool_results(&session.messages[2]);
         assert!(results[0].2, "截断的 tool call 必须回 is_error");
         assert!(
-            results[0].1.contains("stream ended before ToolUseEnd"),
+            results[0]
+                .1
+                .contains("tool-use block ended before ToolUseEnd"),
             "{}",
             results[0].1
         );
@@ -1552,7 +1620,10 @@ mod tests {
             e,
             Event::Error(text) if text.starts_with("provider stream truncated:")
         )));
-        assert_eq!(first_text(&session.messages[3]), "recovered");
+        assert_eq!(session.messages.len(), 3);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ToolStart { .. })));
     }
 
     /// Done 前 EOF（没有残缺 tool call）：也要有 note；文本片段照常保留。
@@ -2053,59 +2124,71 @@ mod tests {
 
     // ---- 会话图片预算（todo 13 / S15 最小行为） ----
 
+    /// 走实际流折叠/执行/落盘路径，只给私有 executor 注入小预算。
+    async fn execute_image_batch(
+        session: &mut Session,
+        inputs: &[Value],
+        source: ImageSource,
+        budget: u64,
+    ) -> Vec<Event> {
+        let mut response = Vec::new();
+        for (index, input) in inputs.iter().enumerate() {
+            response.extend(tool_use_events(
+                &format!("image-{index}"),
+                "look_image",
+                &input.to_string(),
+            ));
+        }
+        response.push(StreamEvent::Done {
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        });
+        let test_agent = agent_with(
+            MockProvider::new(vec![scripted(response)]),
+            Arc::new(source),
+        );
+        prepare_input(session, "look".into()).unwrap();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let streamed = test_agent
+            .stream_assistant(session, &cancel, &tx)
+            .await
+            .unwrap();
+        let calls = streamed.message.tool_uses();
+        let results = tokio::time::timeout(
+            Duration::from_secs(10),
+            test_agent.execute_calls(session, &calls, &streamed, &cancel, &tx, budget),
+        )
+        .await
+        .expect("并行图片调用必须在硬超时内完成");
+        finish_turn(session, streamed.message, results).unwrap();
+        crate::message::validate(&session.messages).unwrap();
+        let raw = std::fs::read_to_string(&session.path).unwrap();
+        let persisted: Vec<Message> = raw
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(persisted, session.messages);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     /// 超过会话预算的单张图片：不附上，工具结果带可操作提示，turn 照常完成。
     #[tokio::test]
     async fn over_budget_image_is_rejected_with_actionable_note() {
-        struct BigImage;
-
-        #[async_trait]
-        impl ToolSource for BigImage {
-            fn id(&self) -> &str {
-                "test:big"
-            }
-
-            async fn list(&self) -> Vec<ToolSpec> {
-                vec![ToolSpec {
-                    name: "big_image".into(),
-                    description: "produces one huge image".into(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                    read_only: true,
-                }]
-            }
-
-            async fn call(&self, _name: &str, _input: Value, _ctx: &ToolCtx) -> ToolOutput {
-                // 无 padding 全 'A' base64：解码字节 = len/4*3 > SESSION_IMAGE_BUDGET。
-                let len = (SESSION_IMAGE_BUDGET as usize / 3 + 1) * 4;
-                ToolOutput {
-                    text: "loaded".to_string(),
-                    is_error: false,
-                    image: Some(ImageData {
-                        data: "A".repeat(len),
-                        media_type: "image/png".into(),
-                    }),
-                }
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
-        let provider = MockProvider::new(vec![
-            scripted(vec![
-                StreamEvent::ToolUseStart {
-                    id: "t1".into(),
-                    name: "big_image".into(),
-                },
-                StreamEvent::ToolUseDelta("{}".into()),
-                StreamEvent::ToolUseEnd,
-                done(3, 1),
-            ]),
-            scripted(vec![StreamEvent::TextDelta("ok".into()), done(2, 1)]),
-        ]);
-        let test_agent = agent_with(provider.clone(), Arc::new(BigImage));
         let mut session = temp_session(dir.path());
-
-        let (result, _) = run(&test_agent, &mut session, "look").await;
-        assert_eq!(result.unwrap(), TurnResult::Done);
-        crate::message::validate(&session.messages).unwrap();
+        execute_image_batch(
+            &mut session,
+            &[serde_json::json!({})],
+            ImageSource::default(),
+            stub_image().decoded_bytes() - 1,
+        )
+        .await;
         let user = &session.messages[2];
         assert_eq!(user.content.len(), 1, "超预算图片不得附上");
         match &user.content[0] {
@@ -2121,5 +2204,142 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+        let test_agent = agent(
+            MockProvider::new(vec![scripted(vec![
+                StreamEvent::TextDelta("ok".into()),
+                done(2, 1),
+            ])]),
+            100_000,
+        );
+        assert_eq!(
+            run(&test_agent, &mut session, "continue").await.0.unwrap(),
+            TurnResult::Done,
+            "图片超预算不阻止后续正常完成"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_images_do_not_consume_later_call_budget() {
+        for invalid in ["base64", "media_type"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = temp_session(dir.path());
+            let events = execute_image_batch(
+                &mut session,
+                &[
+                    serde_json::json!({"invalid": invalid}),
+                    serde_json::json!({}),
+                ],
+                ImageSource::default(),
+                stub_image().decoded_bytes(),
+            )
+            .await;
+            let blocks = &session.messages[2].content;
+            match blocks.as_slice() {
+                [Content::ToolResult {
+                    tool_use_id: bad_id,
+                    content: bad_text,
+                    is_error: true,
+                }, Content::ToolResult {
+                    tool_use_id: good_id,
+                    content: good_text,
+                    is_error: false,
+                }, Content::Image(image)] => {
+                    assert_eq!(bad_id, "image-0");
+                    assert!(bad_text.contains("[image omitted"), "{bad_text}");
+                    assert!(bad_text.contains(invalid), "{bad_text}");
+                    assert!(!bad_text.contains(STUB_PNG_B64), "诊断不得回显图片数据");
+                    assert_eq!(good_id, "image-1");
+                    assert_eq!(good_text, "Loaded image from stub");
+                    assert_eq!(image, &stub_image());
+                }
+                other => panic!("坏图片不占预算；合法图片应附在自己的结果后：{other:?}"),
+            }
+            assert!(events.iter().any(|event| matches!(event,
+                Event::ToolDone { id, is_error: true, .. } if id == "image-0"
+            )));
+            assert!(events.iter().any(|event| matches!(event,
+                Event::ToolDone { id, is_error: false, .. } if id == "image-1"
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_images_share_budget_and_preserve_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = temp_session(dir.path());
+        // 历史图片也占预算；本批四个并行调用只允许再保留两张。
+        session
+            .append(Message {
+                role: Role::User,
+                content: vec![Content::Image(stub_image())],
+                ts: 0,
+                usage: None,
+            })
+            .unwrap();
+        session
+            .append(Message::assistant(vec![Content::Text("seen".into())], None))
+            .unwrap();
+        let budget = 3 * stub_image().decoded_bytes();
+        let events = execute_image_batch(
+            &mut session,
+            &vec![serde_json::json!({}); PARALLEL_TOOL_LIMIT],
+            ImageSource {
+                peers: Some(tokio::sync::Barrier::new(PARALLEL_TOOL_LIMIT)),
+            },
+            budget,
+        )
+        .await;
+        let total: u64 = session
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                Content::Image(image) => Some(image.decoded_bytes()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(total, budget, "并行保留图片合计不得越过包含历史的总预算");
+        let mut blocks = session.messages.last().unwrap().content.iter().peekable();
+        let mut attached = 0;
+        for index in 0..PARALLEL_TOOL_LIMIT {
+            let id = format!("image-{index}");
+            let Some(Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }) = blocks.next()
+            else {
+                panic!("每个调用必须按原序保留一个工具结果");
+            };
+            assert_eq!(tool_use_id, &id);
+            assert!(!is_error);
+            if matches!(blocks.peek(), Some(Content::Image(_))) {
+                assert_eq!(blocks.next(), Some(&Content::Image(stub_image())));
+                assert!(!content.contains("image not attached"));
+                attached += 1;
+            } else {
+                assert!(content.contains("session image budget"), "{content}");
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ToolStart { id: event_id, .. } if event_id == &id
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ToolDone { id: event_id, is_error: false, .. } if event_id == &id
+                    ))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(attached, 2);
+        assert!(blocks.next().is_none());
     }
 }

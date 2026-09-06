@@ -63,7 +63,7 @@ impl Agent {
     ///    同单元全为 ReadOnly 且资源键互不相同，Serial 调用各自独立成单元；
     /// ③ 单元按原顺序串行执行，单元内调用以 [`PARALLEL_TOOL_LIMIT`] 有界并发。
     /// 每个 call 产出一个 ToolResult，顺序与 calls 一致；图片块受会话预算
-    /// [`SESSION_IMAGE_BUDGET`] 约束。
+    /// `image_budget` 约束（loop 使用 [`SESSION_IMAGE_BUDGET`]，测试注入小预算）。
     pub(super) async fn execute_calls(
         &self,
         session: &Session,
@@ -71,6 +71,7 @@ impl Agent {
         streamed: &AssistantStream,
         cancel: &CancellationToken,
         events: &mpsc::Sender<Event>,
+        image_budget: u64,
     ) -> Vec<Content> {
         let ctx = ToolCtx {
             cwd: session.header.cwd.clone(),
@@ -188,28 +189,27 @@ impl Agent {
                         out = self.tools.call(call, &ctx) => out,
                     };
                     // 图片预算（todo 13）：超限不附上，结果文本带可操作提示。
-                    // 图片校验（A01）：先过消息校验核心再进入结果；坏图片丢弃并
-                    // 转成可诊断的错误结果，不让 session 落盘失败、毒化下一轮。
+                    // 图片校验（A01）：先过消息校验核心再原子预留预算；坏图片
+                    // 不消耗后续调用的额度，丢弃并转成可诊断的错误结果。
                     let mut kept_image = None;
                     if let Some(img) = output.image.take() {
-                        match reserve_image_bytes(
-                            &image_used,
-                            img.decoded_bytes(),
-                            SESSION_IMAGE_BUDGET,
-                        ) {
-                            Ok(()) => match image_validation_note(call, &img) {
-                                None => kept_image = Some(img),
-                                Some(note) => {
-                                    output.text.push_str(
-                                        "\n\n[image omitted: tool image output failed \
-                                         validation and was not attached: ",
-                                    );
-                                    output.text.push_str(&note);
-                                    output.text.push(']');
-                                    output.is_error = true;
-                                }
-                            },
-                            Err(note) => output.text.push_str(&note),
+                        if let Some(note) = image_validation_note(call, &img) {
+                            output.text.push_str(
+                                "\n\n[image omitted: tool image output failed \
+                                 validation and was not attached: ",
+                            );
+                            output.text.push_str(&note);
+                            output.text.push(']');
+                            output.is_error = true;
+                        } else {
+                            match reserve_image_bytes(
+                                &image_used,
+                                img.decoded_bytes(),
+                                image_budget,
+                            ) {
+                                Ok(()) => kept_image = Some(img),
+                                Err(note) => output.text.push_str(&note),
+                            }
                         }
                     }
                     event::emit(

@@ -5,6 +5,7 @@
 //! - T1：非法 assistant 在副作用前被拒绝（零工具执行、零 PreToolUse/ToolStart
 //!   副作用），历史保持可校验；malformed JSON 仍走已有流程；坏图片转成可诊
 //!   断的错误结果；合法并行调用结果/事件与调用 ID 一一配对。
+//!   异常终止/不完整响应在工具执行前整批拒绝，失败及取消结果均可 resume。
 //! - T2：末尾 user 的会话经合并继续；七种中断/收尾各连跑两轮，第二轮成功且
 //!   `validate`/落盘一致。
 //! - T3：inventory、各 hook、maybe/force 压缩的等待均可取消（pending mock +
@@ -63,6 +64,8 @@ use instagent::ProviderError;
 
 /// 取消测试的硬超时：被取消的等待必须远早于此时限返回。
 const HARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // fake 件
@@ -476,6 +479,39 @@ fn assert_persisted(session: &Session) {
     assert_eq!(on_disk, session.messages, "落盘消息必须与内存一致");
 }
 
+/// 只在同步 Session 调用期间设置测试数据目录，返回 Result 后再由调用方断言。
+fn with_data_dir<T>(dir: &Path, action: impl FnOnce() -> T) -> T {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let previous = std::env::var_os("INSTAGENT_DATA_DIR");
+    std::env::set_var("INSTAGENT_DATA_DIR", dir);
+    let result = action();
+    match previous {
+        Some(value) => std::env::set_var("INSTAGENT_DATA_DIR", value),
+        None => std::env::remove_var("INSTAGENT_DATA_DIR"),
+    }
+    result
+}
+
+fn assert_resumable(session: &Session) {
+    assert_persisted(session);
+    let data = TempDir::new().unwrap();
+    let sessions = data.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join(format!("{}.jsonl", session.header.id));
+    std::fs::copy(&session.path, &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let resumed = with_data_dir(data.path(), || Session::resume(&session.header.id)).unwrap();
+    assert_eq!(
+        resumed.messages, session.messages,
+        "恢复不得丢弃消息或配对结果"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "完整会话无需 salvage"
+    );
+}
+
 /// 造 hooks 插件：每个事件一个独立脚本（走 `${PLUGIN_ROOT}` 展开）。
 fn hook_fixture(dir: &Path, event_scripts: &[(&str, &str)]) -> (Hooks, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -567,6 +603,236 @@ fn spawn_canceller(ready: PathBuf, token: CancellationToken) {
 // ---------------------------------------------------------------------------
 // T1 · 副作用前拒绝非法消息
 // ---------------------------------------------------------------------------
+
+fn counting_tool_hooks(dir: &Path) -> (Hooks, PathBuf) {
+    hook_fixture(
+        dir,
+        &[
+            (
+                "PreToolUse",
+                "echo ran >> \"$PLUGIN_ROOT/payloads/pre-count\"",
+            ),
+            (
+                "PostToolUse",
+                "echo ran >> \"$PLUGIN_ROOT/payloads/post-count\"",
+            ),
+            ("Stop", "echo ran >> \"$PLUGIN_ROOT/payloads/stop-count\""),
+        ],
+    )
+}
+
+fn side_effect_calls() -> Vec<StreamEvent> {
+    let mut events = tool_events(
+        "shell-call",
+        "shell",
+        r#"{"command":"echo ran >> shell-count"}"#,
+    );
+    events.extend(tool_events("probe-call", "probe", "{}"));
+    events
+}
+
+fn assert_no_tool_side_effects(probe: &Probe, dir: &Path, payloads: &Path, events: &[Event]) {
+    assert_eq!(probe.calls(), 0, "异常响应不得执行工具");
+    assert!(
+        !dir.join("shell-count").exists(),
+        "完整 shell call 也不得执行"
+    );
+    for name in ["pre-count", "post-count", "stop-count"] {
+        assert!(!payloads.join(name).exists(), "不得执行 {name} hook");
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::ToolStart { .. } | Event::ToolDone { .. })),
+        "未执行的调用不得发工具开始/完成事件"
+    );
+}
+
+/// 参数完整不代表响应正常：整批拒绝，配对落盘，不能由下一条成功响应掩盖失败。
+#[tokio::test]
+async fn abnormal_tool_responses_fail_before_any_side_effect_and_survive_resume() {
+    for (stop_reason, pending_tool, reason) in [
+        (Some(StopReason::MaxTokens), false, "MaxTokens"),
+        (Some(StopReason::Other), false, "Other"),
+        (None, false, "stream reached EOF before Done"),
+        (
+            Some(StopReason::ToolUse),
+            true,
+            "tool-use block ended before ToolUseEnd",
+        ),
+        (
+            Some(StopReason::EndTurn),
+            true,
+            "tool-use block ended before ToolUseEnd",
+        ),
+        (None, true, "stream reached EOF before Done"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let probe = Probe::new();
+        let (hooks, payloads) = counting_tool_hooks(dir.path());
+        let mut response = side_effect_calls();
+        if pending_tool {
+            response.push(StreamEvent::ToolUseStart {
+                id: "partial-call".into(),
+                name: "probe".into(),
+            });
+            response.push(StreamEvent::ToolUseDelta("{\"partial\":".into()));
+        }
+        if let Some(stop_reason) = stop_reason {
+            response.push(StreamEvent::Done {
+                usage: Usage::default(),
+                stop_reason,
+            });
+        }
+        let provider = MockProvider::new(vec![
+            scripted(response),
+            scripted(vec![StreamEvent::TextDelta("recovered".into()), done(2, 1)]),
+        ]);
+        let agent = test_agent(
+            provider.clone(),
+            vec![probe.clone()],
+            Some(hooks),
+            10,
+            100_000,
+        );
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "go", CancellationToken::new()).await;
+        let err = result.expect_err("异常工具响应必须立即失败");
+        assert!(err.to_string().contains(reason), "{stop_reason:?}: {err:#}");
+        assert_eq!(provider.calls(), 1, "不得自动请求下一条成功响应");
+        assert_no_tool_side_effects(&probe, dir.path(), &payloads, &events);
+        assert!(
+            events.iter().any(|event| matches!(
+                event, Event::Error(text) if text.contains(reason)
+            )),
+            "失败原因必须通过事件可见：{events:?}"
+        );
+        assert_eq!(session.messages.len(), 3);
+        let calls = session.messages[1].tool_uses();
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(calls.len(), if pending_tool { 3 } else { 2 });
+        assert_eq!(results.len(), calls.len());
+        for (call, (id, text, is_error)) in calls.iter().zip(&results) {
+            assert_eq!(&call.id, id);
+            assert!(*is_error);
+            assert!(text.contains("tool was not executed"), "{text}");
+            assert!(text.contains(reason), "{text}");
+        }
+        assert_resumable(&session);
+
+        // 只有调用方另起一次 run_turn 才能继续；先前的失败结果保留。
+        let (result, _) = run(&agent, &mut session, "retry", CancellationToken::new()).await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(tool_results(&session.messages[2]), results);
+        assert_resumable(&session);
+    }
+}
+
+#[tokio::test]
+async fn normal_tool_stop_reasons_execute_and_pair_results() {
+    for stop_reason in [StopReason::ToolUse, StopReason::EndTurn] {
+        let dir = TempDir::new().unwrap();
+        let probe = Probe::new();
+        let (hooks, payloads) = counting_tool_hooks(dir.path());
+        let mut response = side_effect_calls();
+        response.push(StreamEvent::Done {
+            usage: Usage::default(),
+            stop_reason,
+        });
+        let provider = MockProvider::new(vec![
+            scripted(response),
+            scripted(vec![StreamEvent::TextDelta("finished".into()), done(2, 1)]),
+        ]);
+        let agent = test_agent(
+            provider.clone(),
+            vec![probe.clone()],
+            Some(hooks),
+            10,
+            100_000,
+        );
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "go", CancellationToken::new()).await;
+        assert_eq!(result.unwrap(), TurnResult::Done);
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shell-count")).unwrap(),
+            "ran\n"
+        );
+        for (name, count) in [("pre-count", 2), ("post-count", 2), ("stop-count", 1)] {
+            let log = std::fs::read_to_string(payloads.join(name)).unwrap();
+            assert_eq!(log.lines().count(), count, "{name}");
+        }
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 2);
+        for ((id, _, is_error), expected) in results.iter().zip(["shell-call", "probe-call"]) {
+            assert_eq!(id, expected);
+            assert!(!is_error);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ToolStart { id: event_id, .. } if event_id == id
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ToolDone { id: event_id, is_error: false, .. } if event_id == id
+                    ))
+                    .count(),
+                1
+            );
+        }
+        assert_resumable(&session);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_abnormal_tool_responses_keep_interrupted_semantics() {
+    for stop_reason in [Some(StopReason::MaxTokens), Some(StopReason::Other), None] {
+        let dir = TempDir::new().unwrap();
+        let probe = Probe::new();
+        let token = CancellationToken::new();
+        let (hooks, payloads) = counting_tool_hooks(dir.path());
+        let mut response = side_effect_calls();
+        if let Some(stop_reason) = stop_reason {
+            response.push(StreamEvent::Done {
+                usage: Usage::default(),
+                stop_reason,
+            });
+        }
+        let provider = MockProvider::new(vec![scripted_then_cancel(response, &token)]);
+        let agent = test_agent(
+            provider.clone(),
+            vec![probe.clone()],
+            Some(hooks),
+            10,
+            100_000,
+        );
+        let mut session = temp_session(dir.path());
+
+        let (result, events) = run(&agent, &mut session, "go", token).await;
+        assert_eq!(result.unwrap(), TurnResult::Interrupted);
+        assert_eq!(provider.calls(), 1);
+        assert_no_tool_side_effects(&probe, dir.path(), &payloads, &events);
+        assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+        let results = tool_results(&session.messages[2]);
+        assert_eq!(results.len(), 2);
+        for ((id, text, is_error), expected) in results.iter().zip(["shell-call", "probe-call"]) {
+            assert_eq!(id, expected);
+            assert_eq!(text, INTERRUPTED_TEXT);
+            assert!(*is_error);
+        }
+        assert_resumable(&session);
+    }
+}
 
 /// 同一响应复用 ID：零工具执行、零 PreToolUse 副作用，历史可校验且可继续。
 #[tokio::test]
@@ -740,7 +1006,10 @@ async fn malformed_tool_json_still_gets_error_result_and_continues() {
     let provider = MockProvider::new(vec![
         scripted({
             let mut v = tool_events("t1", "probe", "{not json");
-            v.push(done(3, 1));
+            v.push(StreamEvent::Done {
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            });
             v
         }),
         scripted(vec![StreamEvent::TextDelta("sorry".into()), done(6, 1)]),
@@ -765,7 +1034,7 @@ async fn malformed_tool_json_still_gets_error_result_and_continues() {
     let results = tool_results(&session.messages[2]);
     assert!(results[0].2);
     assert!(results[0].1.contains("JSON"), "{}", results[0].1);
-    assert_persisted(&session);
+    assert_resumable(&session);
 
     let (result, _) = run(&agent, &mut session, "again", CancellationToken::new()).await;
     assert_eq!(result.unwrap(), TurnResult::Done);
@@ -1106,18 +1375,17 @@ async fn manual_compact_then_next_turn_continues() {
 /// resume 待回答的 user：落盘后恢复再跑，两轮一致。
 #[tokio::test]
 async fn resume_pending_user_then_turn_succeeds() {
-    // 本文件唯一碰 INSTAGENT_DATA_DIR 的用例（集成 binary 独立进程，
-    // 无其他线程竞争该变量）。
     let data = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    std::env::set_var("INSTAGENT_DATA_DIR", data.path());
-    let mut session = Session::create(cwd.path(), "mock", "mock-model").unwrap();
+    let mut session = with_data_dir(data.path(), || {
+        Session::create(cwd.path(), "mock", "mock-model")
+    })
+    .unwrap();
     session
         .append(Message::user_text("pending question".into()))
         .unwrap();
     let id = session.header.id.clone();
     let path = session.path.clone();
-    std::env::remove_var("INSTAGENT_DATA_DIR");
 
     let provider = MockProvider::new(vec![
         scripted(vec![StreamEvent::TextDelta("answered".into()), done(2, 1)]),
@@ -1132,9 +1400,7 @@ async fn resume_pending_user_then_turn_succeeds() {
     assert!(all_text(&session.messages[0]).contains("follow-up"));
 
     // resume 与内存一致；次轮照常成功。
-    std::env::set_var("INSTAGENT_DATA_DIR", data.path());
-    let resumed = Session::resume(&id).unwrap();
-    std::env::remove_var("INSTAGENT_DATA_DIR");
+    let resumed = with_data_dir(data.path(), || Session::resume(&id)).unwrap();
     assert_eq!(resumed.path, path);
     assert_eq!(resumed.messages, session.messages);
     instagent::message::validate(&resumed.messages).unwrap();
