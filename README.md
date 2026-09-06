@@ -60,6 +60,8 @@ instagent --help
 不读取 stdin。默认 `--output text` 流式输出模型文本；`--output json` 输出单个终态
 JSON 文档，包含 `status`、`session_id`、`output`、`usage` 和 `error`（schema 版本为 1）。
 工具事件、用量和诊断都走 stderr。`--timeout` 默认 600 秒，范围为 1–604800 秒（7 天）。
+直接任务、任务文件和模板展开结果均最多 1 MiB（UTF-8 字节）；模板超限明确失败，
+不会裁剪任务。文件工具、会话和插件组件的预算及拒绝行为见[使用说明](docs/usage.md)。
 
 退出码：完成 `0`，失败 `1`，参数错误 `2`，轮数耗尽 `3`，超时 `124`，
 SIGINT / SIGTERM 取消 `130`。`completed` 表示执行流程正常结束；业务结果由调用方
@@ -101,8 +103,9 @@ instagent run --plugin ./my-dev-plugin --command my-dev-plugin:review --args "�
 
 任务运行期间不自动更新插件。更新由部署流程显式调用 `plugin update`，
 配置、密钥和插件内容应在提交任务前准备好。
-provider、model 或所需密钥缺失会直接失败；可选插件组件（例如 MCP 连接失败）仍可能
-警告后降级运行。业务必须依赖的工具能力应由调用方或 Stop hook 验证。
+provider、model 缺失，或 provider 显式要求的密钥缺失、为空串或纯空白，会直接失败；
+可选插件组件（例如 MCP 连接失败）仍可能警告后降级运行。
+业务必须依赖的工具能力应由调用方或 Stop hook 验证。
 
 ## 插件开发指南
 
@@ -215,8 +218,20 @@ cargo test
 PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 cargo rustdoc --lib -- -D warnings
 cargo check --release --all-targets
+cargo +1.93.1 check --locked --all-targets
 ```
 
-无人值守回归使用离线假 provider，覆盖任务输入、JSON 结果、会话恢复、
-模板调用、轮数耗尽、取消、超时和子进程清理。实际 provider 接入可用上述
-`run` 示例验证；凭据在调用前注入，运行中不会出现配置向导。
+普通 `cargo test` 和 `scripts/ci.sh` 默认离线，即使继承了 `TOKEN_PLAN_API_KEY`
+也不会运行真实模型用例。离线假 provider 回归覆盖任务输入、JSON 结果、会话恢复、
+模板调用、轮数耗尽、取消、超时和子进程清理；liveplug 的 CLI/live 测试各自复制
+版本化输入到临时目录，hook 输出不写源码夹具。
+
+10 个真实模型用例默认显示为 `ignored`，只在预先注入有效凭据后显式运行：
+
+```bash
+cargo test --test live_e2e -- --ignored
+```
+
+显式运行缺少 `TOKEN_PLAN_API_KEY`、值为空或纯空白会立即失败。默认模型为
+`qwen3.6-flash`，可用 `INSTAGENT_LIVE_MODEL` 覆盖；ignored 不代表在线验证通过。
+最新实际通过数、历史线上超时与当前验证范围见[发布与校验记录](docs/release.md)。

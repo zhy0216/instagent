@@ -103,7 +103,10 @@ instagent run --command my-plugin:review --args "当前 diff" [选项]
 三个任务来源必须且只能指定一个：`-t, --task` 直接传文本，`--task-file` 读取
 普通 UTF-8 文件，`--command` 展开已启用插件的任务模板（§8.7）。文件路径相对于
 调用时的目录解析；空白任务、不可读文件、目录和非 UTF-8 内容会报错。
-`--task` 文本和 `--task-file` 内容最多 1 MiB。
+`--task` 文本、`--task-file` 内容和 `--command` 展开结果均最多 1 MiB
+（1,048,576 个 UTF-8 字节，恰好上限可用）。模板展开前检查完整结果大小；
+超限属于 `failed` / 退出码 `1`，不裁剪任务、不发起模型请求。
+新任务此时尚未创建会话，JSON 的 `session_id` 为 `null`；已恢复会话则保留其 id。
 不隐式读取 stdin，也不支持用 `--task-file -` 表示 stdin。
 
 | 选项 | 说明 |
@@ -287,6 +290,26 @@ provider、model、凭据和插件应在调用前准备好。系统提示要求 
 `chat`、REPL、斜杠命令分发和输入历史已移除。原 `/review 参数` 改成
 `run --command 插件名:review --args "参数"`；需要继续任务时重新调用 `run --resume`。
 
+### 5.1 文件工具与图片预算
+
+- `read` / `edit` 的输入文件最多 32 MiB（33,554,432 字节），`write` 内容和
+  `edit` 替换后的完整文件也最多 32 MiB，均包含恰好上限。write/edit 超限返回
+  工具错误，不发布新内容，旧文件字节和普通权限保持不变。
+- `read` 的 `line` 从 1 开始，默认最多显示 2000 行。预算按实际读取字节计算，
+  包含换行，长行也受限；不是只限制显示窗口。metadata 预检已超限时直接报错；
+  读取中增长越界时最多读取预算加 1 个探测字节，返回预算内的窗口内容，并提示
+  `stopped: file grew past ...`、总行数不完整，不把结果当作完整文件。
+  `edit` 的整读增长越界则报工具错误，不写回。
+- Unix 上覆盖已有普通文件的 `write` / `edit` 保留普通 rwx 权限（如 0755、0600），
+  不继承 setuid/setgid/sticky 位；新文件遵循 `0666 & umask`。同目录临时文件
+  排他创建，从 0600 开始写入，完成后设置最终权限再 rename，失败清理本次临时文件。
+  这不保证保留 ACL、扩展属性、属主或硬链接语义。
+- 写入拒绝最终目标为符号链接；中间目录链接和绝对路径仍按现有规则解析。
+  完整路径隔离由 sandbox 负责，同步本地 IO 的强制取消仍无保证。
+- 工具返回的图片先校验，再原子预留会话的 64 MiB 图片预算（按 base64 解码后
+  字节计）。非法图片不占用后续调用额度；超预算图片不附入历史，工具结果带提示。
+  这是格式/字节校验，不能当作完整图像解码或尺寸验证。
+
 ---
 
 ## 6. 会话管理
@@ -302,9 +325,21 @@ provider、model、凭据和插件应在调用前准备好。系统提示要求 
 - **续轮语义**：历史末尾为 user（摘要、未回答输入或 tool results）时，
   新输入合并追加到该消息并原子重写落盘；末尾为 assistant 才追加新 user
   消息。自动压缩、取消或失败后恢复都保持该不变量。
-- **读取预算**：header 64 KiB、单消息 96 MiB、总文件 256 MiB；超预算
-  报错并保留原文件，不截短用户数据。
-- 上下文过长时按 `compaction_threshold` 自动压缩，诊断写 stderr。
+- **读写共用预算**：header 64 KiB、单消息行 96 MiB、总文件 256 MiB。
+  按序列化后的 JSON UTF-8 字节计数，包含转义开销；行预算不含换行，总预算包含
+  换行和已有文件的实际长度。创建、追加批次和重写都必须符合恢复预算。
+- **写入拒绝**：预算超限或计数溢出时不提交该次写入，内存历史、原主文件和可用
+  备份保持原状，不自动裁剪历史或提高限额。执行因此失败；可恢复的是此前已提交的
+  记录，被拒绝的这批内容没有持久化。工具已执行的文件修改、命令等外部副作用
+  **不会随会话写入失败回滚**，重试前由调用方核对外部结果。
+- 上下文过长时按 `compaction_threshold` 自动压缩，诊断写 stderr。摘要必须是
+  非空文本并以 `EndTurn` 正常结束；长度截断、异常原因、工具事件、缺少完成事件
+  或完成后仍有事件都导致本次执行失败，压缩前主文件逐字节保持不变。压缩期间取消
+  不替换历史，终态仍按取消/超时处理。修正条件后可用 `run --resume <id> -t ...` 继续。
+- 压缩保留末尾未回答 user 的全部有序 Text/Image 块，包括恢复时追加的新任务；
+  摘要放在这些块前，图片不会改成 base64 摘要文本。末尾含 ToolResult 的消息仍随
+  成对历史参与摘要，不把工具结果拆成独立未回答任务。已回答历史中的图片只向
+  摘要器提供类型/大小占位说明。
 - 未指定 `--resume` 的 `run` 创建新会话；id 写入 stderr 和 JSON 结果，便于后续恢复。
 - 每次运行触发 `SessionStart` / `SessionEnd` 生命周期 hooks；不创建等待输入的空闲会话。
 
@@ -345,6 +380,11 @@ instagent plugin update my-plugin    # 只更新一个
 `run` 只加载现有插件，不进行自动更新。部署流程在执行任务前显式运行
 `plugin update`。安装参数 `--auto-update` 和已有安装元数据为兼容旧格式保留，
 不会使 headless 任务启动时自动拉取代码。
+
+本地复制前解析源路径和安装 staging 的目录关系（含既存符号链接）：源包含
+staging、位于 staging 内或两者相同都会明确拒绝，避免递归复制及清理源目录。
+正常从已安装的 `plugins/<name>` 目录重装仍可用；这不提供跨进程安装事务或全路径隔离。
+安装元数据 `.install.json` 的读取上限为 1 MiB；超限不修改元数据或已有安装。
 
 ### 7.3 查看 / 启用 / 禁用
 
@@ -562,8 +602,12 @@ instagent run --command groq-and-review:review --args "错误处理与测试覆�
 ```
 
 - 选择器必须包含 `插件名:模板名`，多插件同名模板互不覆盖。
-- `$ARGUMENTS` 展开为 `--args` 的原始文本，不解释为 shell 命令；省略时为空串。
-- 模板里没有 `$ARGUMENTS` 时，非空参数追加到正文末尾。
+- `$ARGUMENTS` 展开为 `--args` 去除首尾空白后的文本，保留内部内容，
+  不解释为 shell 命令；省略时为空串，所有占位符均替换。
+- 模板里没有 `$ARGUMENTS` 时，非空参数以两个换行分隔追加到正文末尾。
+- 模板文件最多 256 KiB；展开后的任务最多 1 MiB。展开前按占位符数量、
+  参数 UTF-8 字节数和追加换行计算完整大小，越界或计数溢出直接失败，
+  不分配超限展开结果、不截断；结果为空白也失败（§3）。
 - 解析失败的模板文件跳过；指定不存在或禁用插件的模板时报错。
 - 目录与 Markdown 格式沿用已有插件内容，模板展开后作为本次任务提交给 agent loop。
 
@@ -577,6 +621,23 @@ instagent run --command groq-and-review:review --args "错误处理与测试覆�
 - 配置里 `provider: groq` 可用；
 - `run --command groq-and-review:review --args "当前 diff"` 可用；
 - 每次调 `shell` 前 `guard.sh` 先跑。
+
+### 8.9 组件文件读取预算
+
+下列文件各最多 1 MiB。读取同一文件句柄的 metadata 后，reader 仍最多读
+上限加 1 字节并复检，文件增长不能绕过限制；超限诊断包含来源和预算，不回显正文。
+
+| 文件 | 超限/读取失败时的行为 |
+|---|---|
+| `plugin.json` | 发现时警告并跳过该插件；显式安装时失败 |
+| `mcp.json`（兼容 `.mcp.json`） | 诊断后跳过该插件的 MCP 配置，其余组件可继续 |
+| `dev.instagent/providers/*.json` | 注册表加载失败，任务初始化失败 |
+| `dev.instagent/hooks.json`（兼容 `hooks/hooks.json`） | hooks 加载失败，任务初始化失败 |
+| 安装目录的 `.install.json` | 按名字显式更新失败；列表的来源回退为 `manual`，批量更新跳过不可读元数据 |
+
+hooks 文件的 UTF-8/JSON 错误只报告来源、类别或位置；安装元数据的解析错误
+不回显可能含凭据的 `source` 内容。hooks 文件加载失败与脚本运行失败不同：
+`on_failure: allow` 的默认放行策略仅适用于已加载脚本的运行/决策失败（§8.5）。
 
 ---
 
@@ -627,6 +688,10 @@ instagent run --command groq-and-review:review --args "错误处理与测试覆�
 | `models` | 模型表（只用于上下文上限推导） |
 | `proxy` | `engine: proxy` 时必填，见下 |
 
+声明 `api_key_env` 即要求该环境变量可读且不是空串或纯空白（包括 Unicode 空白）；
+不满足时在引擎构造期失败，不发模型请求。诊断只含 provider 与变量名，不包含密钥原值。
+合法非空值原样保留；未声明 `api_key_env` 的 provider 继续支持无密钥接入。
+
 `proxy` 引擎（拉起一个本地进程当 OpenAI 兼容服务）：
 
 ```json
@@ -675,9 +740,17 @@ instagent run --command groq-and-review:review --args "错误处理与测试覆�
 
 - 单 SSE 事件 1 MiB、单响应文本 8 MiB、累计工具参数 8 MiB、单响应最多
   256 个工具调用；超限终止流并报有界诊断（不回显原始载荷）。
-- 缺少 `[DONE]` 且无非空 `finish_reason` 的 EOF 报结构化错误，不执行
-  pending 工具调用；已收到非空 `finish_reason` 的流按正常完成处理。
-  极大 usage 按饱和转换，不回绕成小值绕过压缩阈值。
+- 缺少 `[DONE]` 且无非空 `finish_reason` 的 EOF 报结构化错误；非空
+  `finish_reason` 可以完成传输，但 agent 仍检查终止原因和工具块完整性。
+  `length`（`MaxTokens`）、未知原因或不完整响应以 `failed` / `1` 结束，
+  即使参数完整也不会执行该响应中的工具、PreToolUse/PostToolUse hooks 或发 ToolStart。
+- 完整工具响应接受 `ToolUse`，并兼容 `EndTurn`；无工具的最终答案必须是非空文本
+  且以 `EndTurn` 结束。正常完整响应中单个 JSON 参数损坏仍反馈为工具错误，
+  不执行该调用，可由模型在后续轮次纠正。
+- 异常响应中可校验的助手消息会与每个工具调用对应的错误结果批量保存（受 §6
+  会话预算约束），便于恢复；消息结构非法则不提交该响应。不能用下一轮正常回答
+  将本次异常改报成功；取消仍按 `cancelled` / `130` 处理。
+- 极大 usage 按饱和转换，不回绕成小值绕过压缩阈值。摘要响应另按 §6 的完整性要求检查。
 
 ---
 
@@ -718,3 +791,8 @@ instagent run --command groq-and-review:review --args "错误处理与测试覆�
 ```bash
 bash scripts/ci.sh    # fmt / clippy / cargo test / python 回归 / rustdoc / release smoke / --help
 ```
+
+默认回归使用离线假 provider；继承 `TOKEN_PLAN_API_KEY` 也不会启动 10 个 ignored
+真实模型用例。显式在线命令为 `cargo test --test live_e2e -- --ignored`，要求提前注入
+非空白凭据，否则立即失败。CLI/live 的 liveplug 输出各在独占临时副本中。
+实际执行数、ignored 数及在线验证状态分开记录，见[发布与校验记录](release.md)。
