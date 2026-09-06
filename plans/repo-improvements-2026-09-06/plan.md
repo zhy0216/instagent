@@ -143,3 +143,38 @@ cargo test
 ## 交接状态
 
 本方案及队列用于后续执行。目前未实现业务变更、未提交计划、未启动 Herdr 协调器。提交/启动前重新检查 git status；仅当除本计划目录外没有未提交内容，或用户另有明确处理指令时继续。阶段结果不得写成业务任务已完成。
+
+## 执行结果（2026-09-06）
+
+本节替代前述规划阶段的“未提交/未启动”交接状态。用户已提交方案与队列至 `892dcfd7585ac0c47dafdde022f06de4242b6f5e`，并自行移出原有夹具输出；执行从该干净的 `main` 开始。10 个 todo 全部完成、分别归档到 `todos/done/`，每项保留一个实现提交，以串行 rebase、独立复核与校验、`git merge --ff-only` 合入 `main`。实际合入顺序为 03 → 02 → 01 → 05 → 04 → 06 → 08 → 09 → 07 → 10。
+
+所有任务均由 Herdr 启动 Codex `gpt-6-astra`，显式传入 `--dangerously-bypass-approvals-and-sandbox`；实际推理强度如下。每个表中提交均在 rebase 后由协调器亲自执行仓库级校验，完整 CI 包含 fmt、clippy、Rust/Python 测试、rustdoc、release check 和 CLI help，MSRV 使用 `cargo +1.93.1 check --locked --all-targets`。
+
+| 归档 todo | 合入 commit | Codex 推理强度 | 协调器校验证据 |
+| --- | --- | --- | --- |
+| [01-agent-completion.md](todos/done/01-agent-completion.md) | `6f8270343718139a4f8ea28786e4e3d077952aec` | max | fmt / clippy / test 全通过；611 实际离线通过；10 门控返回 |
+| [02-compaction-integrity.md](todos/done/02-compaction-integrity.md) | `26f3486fd3ef713d41a84bb25643f7c5bfbb9137` | max | fmt / clippy / test 全通过；606 实际离线通过；10 门控返回 |
+| [03-file-tool-io.md](todos/done/03-file-tool-io.md) | `a388155a6b553a8c805b94912a92b29ce8f9e1bd` | xhigh | fmt / clippy / test 全通过；600 实际离线通过；10 门控返回 |
+| [04-session-write-budgets.md](todos/done/04-session-write-budgets.md) | `24810c816743974375f099887e40c56831d4dfba` | max | fmt / clippy / test 全通过；637 实际离线通过；10 门控返回 |
+| [05-plugin-input-limits.md](todos/done/05-plugin-input-limits.md) | `f31ba3c315807fc1b7ec68c5f429f5ce9ea8cbb9` | max | fmt / clippy / test 全通过；625 实际离线通过；10 门控返回 |
+| [06-local-install-integrity.md](todos/done/06-local-install-integrity.md) | `e9c308b1008ec511ad973744f182aff9e022e1a1` | xhigh | fmt / clippy / test 全通过；647 实际离线通过；10 门控返回 |
+| [07-template-input-budget.md](todos/done/07-template-input-budget.md) | `dd382aae6fb86c113ba73041ab8ac85ed0020457` | max | fmt / clippy / test 全通过；662 passed；10 ignored |
+| [08-provider-required-key.md](todos/done/08-provider-required-key.md) | `88021a55b579f2c168c9bb5573539fae0995f377` | xhigh | fmt / clippy / test 全通过；651 实际离线通过；10 门控返回 |
+| [09-live-test-isolation.md](todos/done/09-live-test-isolation.md) | `152923a98f9e8ae63fe43e4a11481b332f0cc379` | xhigh | fmt / clippy / test 全通过；653 passed；10 ignored |
+| [10-docs-and-validation.md](todos/done/10-docs-and-validation.md) | `ab2d89088eaef64e73fabf6d2d6445ff489307ae` | xhigh | 完整 CI + MSRV 全通过；662 passed；10 ignored |
+
+01–06、08 的 `test` 使用 `env -u TOKEN_PLAN_API_KEY cargo test`，当时旧 live harness 的 10 个门控返回不计入实际离线测试。09 的集成校验同样移除进程凭据，但已明确显示 10 ignored；07 及 10 使用普通 `cargo test`。所有计数仅汇总各测试目标最终结果，不重复计算 lib 测试启动的子 harness。
+
+最终集成态：Rust 662 passed、10 ignored、0 failed（lib 527、bin 11、agent_continuation 24、cli_e2e 53、live 离线 2、mcp_e2e 15、provider_proxy 15、session_recovery 11、tool_inventory 4；doc-test 0）；Python 11 项通过；rustdoc、release check、CLI help 与 Rust 1.93.1 MSRV 全通过。`cargo-audit` 未安装，按现有策略跳过，未安装全局工具或改动依赖/扫描豁免。每项具体行为回归和工作分支采样记录见上表归档文件；协调器原始校验日志保存在本机 `/tmp/instagent-herdr-20260906-qupwTc/NN-validate-*.log`，其中 `NN` 为任务编号。
+
+09 的独立补充验收：仅向测试进程注入假非空 key，默认 `cargo test --test live_e2e` 为 2 passed / 10 ignored；移除 key 后显式 `--ignored` 按预期退出 101，10 个用例均立即报告缺少凭据。这是负向验收通过，不是在线模型通过。本轮未重试真实模型，规划阶段的线上超时证据仍有效，原因未进一步归因。
+
+执行中处理及记录了以下情况：
+
+- 旧 CLI 模板测试会让 SessionStart 写入源码 liveplug。07 在其原有 `tests/cli_e2e.rs` 白名单内改为只复制 9 个版本化输入，09 负责 live 测试副本；二者组合的全量测试不再产生源码输出。07 合入前各校验新生成的单个已知文件按授权精确处理，记录见相关归档。用户原始备份 `/tmp/instagent-hook-out-20260906-9kg222l8/liveplug-hook-out` 保持原位，未删除或移回。
+- 04 首次实现校验曾有两个 proxy 计数断言失败；其后的隔离 15/15、完整复跑和协调器集成态校验均通过。10 的前两次完整 CI 均在 `cancelled_restart_candidate_is_reaped` 初始启动计数断言失败（2 != 1）；隔离目标 15/15 通过，用户恢复执行后的第三次完整 CI 通过，随后由协调器独立验证。04 与 10 采样的具体用例不同，原因均未确定；通过不代表已修复根因，详见 04/10 归档及 `docs/release.md`。保留波动记录，不无证据归因。
+- 协调器首次独立 CI 另在 `timeout_during_mcp_initialization_reaps_process_group` 等待 `startup.sh.pid` 时失败（CLI 52 passed / 1 failed）；保留该采样及后续复验结果，不将其直接归因为 proxy 波动。原始日志为 `10-validate-first-failed.log`。
+- 10 隔离 CLI 53/53 通过后的完整复验又在 `cancelled_clone_kills_process_group` 缺失 `grandchild.pid` 失败（lib 526 passed / 1 failed），该用例隔离复验通过；完整日志与可能的测试同步窗口见 10 归档，尚不构成确认根因。协调器随后在 `48305f7` 独立完整 CI/MSRV 均通过，最终任务提交另经上表对应独立门槛验证。
+- rebase 冲突仅涉及队列 README 的相邻任务状态，解决时保留已合入状态与当前任务更新；实现内容未因冲突改写。
+
+无 blocked、deferred 或未完成执行项。RM01–RM10 保持原 roadmap 范围，不属于本轮执行队列。没有新增或升级依赖/feature，没有修改 `src/lib.rs` 模块树、旧 `todos/done/` 归档或版本化源码夹具；未 push、创建 PR 或部署。10 个任务 agent 均正常退出，本轮 Herdr workspace、worktree 和任务分支全部清理；原协调器及用户已有 workspace 保留。收尾只更新本计划的执行记录与队列交接状态，提交前再次执行根 AGENTS 要求的 fmt、clippy 和普通 cargo test。

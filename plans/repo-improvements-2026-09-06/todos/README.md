@@ -53,5 +53,5 @@ default_agent: codex
 
 基线原样 cargo test 的 10 个 live 用例均在 180 秒超时，离线全量 586 个实际 Rust 测试和 11 个 Python 测试通过。09 合入前只对测试进程使用 `env -u TOKEN_PLAN_API_KEY cargo test`；之后普通测试必须默认离线。在线验证按需显式运行，无法访问远端就记录未验证，不反复重试掩盖错误。
 
-当前计划文件尚未提交、执行未启动。仓库已有未跟踪的 `tests/fixtures/liveplug/.hook-out/`，在本轮开始前就存在。必须遵守 auto-dev 的 dirty-worktree 检查：不得提交、stash、忽略或删除该目录；用户给出明确处理指令或自行处理完后，重新检查，仅提交本计划，再启动协调器。当前 `HERDR_ENV=1` 已确认，实际 agent/模型参数须启动前检查。
+队列已全部执行并归档。执行起点为用户已提交的 `892dcfd`，开始时 main 干净；原有 `.hook-out` 已由用户备份至 `/tmp/instagent-hook-out-20260906-9kg222l8/liveplug-hook-out`，本轮未删除或移回。所有任务经 Herdr / Codex gpt-6-astra 显式 YOLO 启动，按上表推理强度执行；独立复核、串行 rebase、仓库级校验和 ff-only 合入完成，任务资源全部清理。最终 662 项 Rust 离线测试与 11 项 Python 测试通过，10 项 live ignored，真实模型本轮未重试；扩展 CI 和 MSRV 通过。完整提交映射、校验证据及执行中观察见 [方案执行结果](../plan.md)。
 
