@@ -138,6 +138,85 @@ impl Sandbox {
     fn sessions_dir(&self) -> PathBuf {
         self.data.path().join("sessions")
     }
+
+    /// Only versioned liveplug inputs enter a fresh sandbox; .hook-out and other
+    /// generated files are never copied. fs::copy preserves executable scripts.
+    fn copy_liveplug_fixture(&self, source: &Path) -> PathBuf {
+        let root = self.cwd.path().join("liveplug");
+        std::fs::create_dir(&root).unwrap();
+        for relative in [
+            "plugin.json",
+            "dev.instagent/commands/greet.md",
+            "dev.instagent/hooks.json",
+            "dev.instagent/tools/echoer.json",
+            "scripts/echoer.sh",
+            "scripts/guard.sh",
+            "scripts/post_tool_use.sh",
+            "scripts/session_start.sh",
+            "skills/secret/SKILL.md",
+        ] {
+            let destination = root.join(relative);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(source.join(relative), &destination).unwrap();
+        }
+        root
+    }
+}
+
+#[test]
+fn liveplug_copy_excludes_generated_files_and_preserves_script_permissions() {
+    let source_sandbox = Sandbox::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liveplug");
+    let source = source_sandbox.copy_liveplug_fixture(&fixture);
+    std::fs::create_dir(source.join(".hook-out")).unwrap();
+    std::fs::write(source.join(".hook-out/session_start.json"), "old output").unwrap();
+    std::fs::write(source.join("unversioned.txt"), "not fixture input").unwrap();
+
+    let destination_sandbox = Sandbox::new();
+    let destination = destination_sandbox.copy_liveplug_fixture(&source);
+    assert!(!destination.join(".hook-out").exists());
+    assert!(!destination.join("unversioned.txt").exists());
+    for script in [
+        "echoer.sh",
+        "guard.sh",
+        "post_tool_use.sh",
+        "session_start.sh",
+    ] {
+        let relative = Path::new("scripts").join(script);
+        assert_eq!(
+            std::fs::read(destination.join(&relative)).unwrap(),
+            std::fs::read(source.join(&relative)).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |root: &Path| {
+                std::fs::metadata(root.join(&relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_ne!(mode(&source) & 0o111, 0);
+            assert_eq!(mode(&destination), mode(&source));
+        }
+    }
+    std::fs::create_dir(destination.join(".hook-out")).unwrap();
+    std::fs::write(
+        destination.join(".hook-out/session_start.json"),
+        "new output",
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join(".hook-out/session_start.json")).unwrap(),
+        "old output"
+    );
+    drop(source_sandbox);
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read_to_string(destination.join(".hook-out/session_start.json")).unwrap(),
+        "new output"
+    );
 }
 
 /// 跑完拿输出：进程组 + `kill_on_drop(true)`（仓库约定），整体超时兜底。
@@ -234,6 +313,24 @@ fn terminal_json(out: &Output, status: &str, exit_code: i32) -> serde_json::Valu
         );
     }
     value
+}
+
+fn assert_request_task(request: &wiremock::Request, task: &str) {
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    let tasks: Vec<_> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0]["content"]
+            .as_str()
+            .is_some_and(|content| content == task),
+        "provider must receive the exact {} UTF-8 task bytes",
+        task.len()
+    );
 }
 
 fn session_messages(sandbox: &Sandbox, id: &str) -> Vec<instagent::message::Message> {
@@ -738,6 +835,35 @@ async fn task_file_loads_utf8_and_rejects_missing_blank_or_nonregular_input() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn task_file_byte_limit_is_inclusive_and_preserves_original_text() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let task_path = sandbox.cwd.path().join("task.md");
+    let task = format!(" {} ", "é".repeat((1024 * 1024 - 2) / 2));
+    std::fs::write(&task_path, format!("{task}x")).unwrap();
+    let out = output(sandbox.cmd(&["run", "--task-file", "task.md", "--output", "json"])).await;
+    let result = terminal_json(&out, "failed", 1);
+    assert!(result["session_id"].is_null());
+    assert_eq!(result["output"], "");
+    assert!(result["usage"].is_null());
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("1 MiB input limit"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(!sandbox.sessions_dir().exists());
+
+    std::fs::write(&task_path, &task).unwrap();
+    let out = output(sandbox.cmd(&["run", "--task-file", "task.md", "--output", "json"])).await;
+    terminal_json(&out, "completed", 0);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_request_task(&requests[0], &task);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn task_file_fifo_is_rejected_without_opening_a_reader() {
@@ -778,8 +904,10 @@ async fn plugin_task_template_expands_arguments_and_unknown_template_fails() {
     let server = MockServer::start().await;
     mount_chat_completions(&server).await;
     sandbox.install_fake_provider(&server.uri());
-    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liveplug");
-    let plugin = plugin.to_str().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liveplug");
+    let plugin_root = sandbox.copy_liveplug_fixture(&fixture);
+    let plugin = plugin_root.to_str().unwrap();
+    let args = " \tTEMPLATE_菠萝\n$(touch template-dollar-marker); `touch template-backtick-marker` \"$HOME\" *\r\n";
     let out = output(sandbox.cmd(&[
         "run",
         "--plugin",
@@ -787,17 +915,17 @@ async fn plugin_task_template_expands_arguments_and_unknown_template_fails() {
         "--command",
         "liveplug:greet",
         "--args",
-        "TEMPLATE_菠萝",
+        args,
         "--output",
         "json",
     ]))
     .await;
     terminal_json(&out, "completed", 0);
     let request = &server.received_requests().await.unwrap()[0];
-    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-    let messages = body["messages"].to_string();
-    assert!(messages.contains("TEMPLATE_菠萝"), "{messages}");
-    assert!(!messages.contains("$ARGUMENTS"), "{messages}");
+    assert_request_task(request, &format!("只回复一个单词：{}", args.trim()));
+    assert!(!sandbox.cwd.path().join("template-dollar-marker").exists());
+    assert!(!sandbox.cwd.path().join("template-backtick-marker").exists());
+    assert!(plugin_root.join(".hook-out/session_start.json").is_file());
     for command in ["liveplug:missing", "greet", "missing:greet"] {
         let out = output(sandbox.cmd(&[
             "run",
@@ -809,9 +937,115 @@ async fn plugin_task_template_expands_arguments_and_unknown_template_fails() {
             "json",
         ]))
         .await;
-        terminal_json(&out, "failed", 1);
+        let result = terminal_json(&out, "failed", 1);
+        assert!(result["session_id"].is_null());
+        assert_eq!(result["output"], "");
+        assert!(result["usage"].is_null());
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown task template"));
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn task_template_expansion_obeys_byte_budget_before_session_start() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    write_hook_plugin(
+        sandbox.agents.path(),
+        "budget",
+        "SessionStart",
+        "echo started > \"${PLUGIN_ROOT}/session-started\"",
+    );
+    let plugin = sandbox.agents.path().join("plugins/budget");
+    let commands = plugin.join("dev.instagent/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    let args = "é".repeat(512);
+    let at_limit = "$ARGUMENTS".repeat(1024);
+    for template in [format!("!{at_limit}"), "$ARGUMENTS".repeat(2048)] {
+        std::fs::write(commands.join("expand.md"), template).unwrap();
+        let out = output(sandbox.cmd(&[
+            "run",
+            "--command",
+            "budget:expand",
+            "--args",
+            &args,
+            "--output",
+            "json",
+        ]))
+        .await;
+        let result = terminal_json(&out, "failed", 1);
+        assert!(result["session_id"].is_null());
+        assert_eq!(result["output"], "");
+        assert!(result["usage"].is_null());
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("1048576 byte input budget"), "{error}");
+        assert!(!error.contains(&args[..64]));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(&args[..64]));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let sessions = sandbox.sessions_dir();
+        assert!(!sessions.exists() || std::fs::read_dir(sessions).unwrap().next().is_none());
+        assert!(!plugin.join("session-started").exists());
+    }
+
+    std::fs::write(commands.join("expand.md"), at_limit).unwrap();
+    let out = output(sandbox.cmd(&[
+        "run",
+        "--command",
+        "budget:expand",
+        "--args",
+        &args,
+        "--output",
+        "json",
+    ]))
+    .await;
+    terminal_json(&out, "completed", 0);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_request_task(&requests[0], &"é".repeat(1024 * 1024 / 2));
+    assert!(plugin.join("session-started").is_file());
+}
+
+#[tokio::test]
+async fn empty_task_templates_fail_before_session_or_model_request() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+    sandbox.install_fake_provider(&server.uri());
+    let plugin = sandbox.agents.path().join("plugins/empty");
+    write_minimal_plugin_source(&plugin, "empty");
+    let commands = plugin.join("dev.instagent/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    for template in ["$ARGUMENTS", " \n\t"] {
+        std::fs::write(commands.join("task.md"), template).unwrap();
+        for args in ["", " \n\t"] {
+            let out = output(sandbox.cmd(&[
+                "run",
+                "--command",
+                "empty:task",
+                "--args",
+                args,
+                "--output",
+                "json",
+            ]))
+            .await;
+            let result = terminal_json(&out, "failed", 1);
+            assert!(result["session_id"].is_null());
+            assert_eq!(result["output"], "");
+            assert!(result["usage"].is_null());
+            assert!(result["error"]
+                .as_str()
+                .unwrap()
+                .contains("task must not be empty"));
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let sessions = sandbox.sessions_dir();
+    assert!(!sessions.exists() || std::fs::read_dir(sessions).unwrap().next().is_none());
 }
 
 #[tokio::test]

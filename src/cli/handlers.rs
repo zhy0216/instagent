@@ -191,7 +191,7 @@ async fn execute(
                 let name = args.command.as_deref().context("task input is required")?;
                 let template = rt.task_templates.iter().find(|template| template.name == name)
                     .with_context(|| format!("unknown task template `{name}`; use plugin:name from an enabled plugin"))?;
-                instagent::commands::expand(template, args.args.as_deref().unwrap_or(""))
+                instagent::commands::expand_bounded(template, args.args.as_deref().unwrap_or(""))?
             }
         };
         if task.trim().is_empty() {
@@ -498,6 +498,21 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
 mod tests {
     use super::*;
     use crate::cli::fixtures::Env;
+
+    #[test]
+    fn direct_task_byte_limit_is_inclusive_and_preserves_original_text() {
+        // Exercise --task in process: OS argv limits can be smaller than 1 MiB.
+        let task = format!(" {} ", "é".repeat((1024 * 1024 - 2) / 2));
+        let mut args = RunArgs {
+            task: Some(task.clone()),
+            ..RunArgs::default()
+        };
+        assert_eq!(read_task(&args).unwrap().as_deref(), Some(task.as_str()));
+        args.task.as_mut().unwrap().push('x');
+        let error = read_task(&args).unwrap_err().to_string();
+        assert!(error.contains("1 MiB input limit"), "{error}");
+        assert!(!error.contains(&task));
+    }
 
     #[test]
     fn sessions_list_rows_and_rm() {
