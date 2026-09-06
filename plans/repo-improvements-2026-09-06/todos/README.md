@@ -16,7 +16,7 @@ default_agent: codex
 | --- | --- | --- | --- | --- | --- |
 | [01-agent-completion.md](01-agent-completion.md) | P1 | hard | codex（inherit） | gpt-6-astra / max | 异常工具响应零副作用；有效图片才记账 |
 | [02-compaction-integrity.md](02-compaction-integrity.md) | P1 | hard | codex（inherit） | gpt-6-astra / max | 拒绝截断摘要、保留恢复后的全部最新输入 |
-| [03-file-tool-io.md](03-file-tool-io.md) | P1 | medium | codex（inherit） | gpt-6-astra / xhigh | 原子写保留权限；edit/read 实际字节预算 |
+| [03-file-tool-io.md](done/03-file-tool-io.md) | P1 | medium | codex（inherit） | gpt-6-astra / xhigh | 已完成：原子写保留权限；edit/read 实际字节预算 |
 | [04-session-write-budgets.md](04-session-write-budgets.md) | P1 | hard | codex（inherit） | gpt-6-astra / max | 会话写入不能突破自己的恢复预算 |
 | [05-plugin-input-limits.md](05-plugin-input-limits.md) | P2 | hard | codex（inherit） | gpt-6-astra / max | 四类组件文件实际有界读取与来源诊断 |
 | [06-local-install-integrity.md](06-local-install-integrity.md) | P1 | medium | codex（inherit） | gpt-6-astra / xhigh | 拒绝安装源/staging 重叠；限制安装元数据 |
@@ -31,7 +31,7 @@ default_agent: codex
 
 1. [01-agent-completion.md](01-agent-completion.md) — 待执行。依赖：无。
 2. [02-compaction-integrity.md](02-compaction-integrity.md) — 待执行。依赖：无。
-3. [03-file-tool-io.md](03-file-tool-io.md) — 待执行。依赖：无。
+3. [03-file-tool-io.md](done/03-file-tool-io.md) — 已完成。依赖：无。
 4. [04-session-write-budgets.md](04-session-write-budgets.md) — 待执行。依赖：无。
 5. [05-plugin-input-limits.md](05-plugin-input-limits.md) — 待执行。依赖：无。
 6. [06-local-install-integrity.md](06-local-install-integrity.md) — 待执行。依赖：无。

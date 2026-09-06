@@ -18,6 +18,7 @@
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -32,7 +33,7 @@ pub const READ_DEFAULT_LIMIT: u32 = 2000;
 /// read / edit 拒绝超过此字节数的文件。
 pub const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
 
-/// write 拒绝超过此字节数的内容（计划 R9：write 不再接受无界模型内容）。
+/// write / edit 拒绝超过此字节数的结果内容。
 pub const MAX_WRITE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// read 循环中取消检查的行间隔（上界 = 4096 行或剩余字节上限的读取时间）。
@@ -157,37 +158,81 @@ fn read_file_sync(
         Err(e) => return fail(e),
     };
 
+    read_window(file, full, line, limit, cancel, MAX_READ_BYTES)
+}
+
+fn read_window(
+    reader: impl Read,
+    full: &Path,
+    line: Option<u32>,
+    limit: Option<u32>,
+    cancel: &CancellationToken,
+    byte_limit: u64,
+) -> ToolOutput {
+    // Take 必须在 BufReader 内侧，连预读也不能越过预算 + 1 个探测字节。
+    let mut reader = BufReader::new(reader.take(byte_limit.saturating_add(1)));
     let start = line.unwrap_or(1) as usize - 1;
     let count = limit.unwrap_or(READ_DEFAULT_LIMIT) as usize;
     let mut text = String::new();
     let mut total = 0usize;
     let mut bytes_seen = 0u64;
     let mut grew_past_limit = false;
-    for (i, line) in BufReader::new(file).lines().enumerate() {
-        if i % READ_CANCEL_CHECK_LINES == 0 && cancel.is_cancelled() {
+    let mut buf = Vec::new();
+    loop {
+        if total.is_multiple_of(READ_CANCEL_CHECK_LINES) && cancel.is_cancelled() {
             return cancelled_output(full);
         }
-        let file_line = match line {
-            Ok(line) => line,
-            Err(e) => return fail(e),
+        buf.clear();
+        let read = match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                return ToolOutput::err(format!("Failed to read {}: {e}", full.display()));
+            }
         };
-        total = i + 1;
-        bytes_seen = bytes_seen.saturating_add(file_line.len() as u64 + 1);
+        let remaining = byte_limit - bytes_seen;
+        if read as u64 > remaining {
+            grew_past_limit = true;
+            buf.truncate(remaining as usize);
+        }
+        bytes_seen += buf.len() as u64;
+        if buf.is_empty() {
+            break; // 仅探测到预算外的字节，不虚构新的一行。
+        }
+        // 与 lines() 一样剥除 LF / CRLF；无换行的末行按实际字节记账。
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        let file_line = match std::str::from_utf8(&buf) {
+            Ok(line) => line,
+            Err(e) if grew_past_limit && e.error_len().is_none() => {
+                // 预算截断的 UTF-8 尾字符不属于非法文件；只输出完整字符。
+                std::str::from_utf8(&buf[..e.valid_up_to()]).expect("validated UTF-8 prefix")
+            }
+            Err(_) => {
+                return ToolOutput::err(format!(
+                    "Failed to read {}: not valid UTF-8 (binary file?)",
+                    full.display()
+                ));
+            }
+        };
+        let i = total;
+        total += 1;
         if i >= start && i - start < count {
             text.push_str(&format!("{:>4}: {}\n", i + 1, file_line));
         }
-        // metadata/read 增长竞态：metadata 预检通过后文件又增长时及时止损，
-        // 不把无界增长的行一直数下去。
-        if bytes_seen > MAX_READ_BYTES {
-            grew_past_limit = true;
+        if grew_past_limit {
             break;
         }
     }
 
-    if total == 0 {
+    if total == 0 && !grew_past_limit {
         return ToolOutput::ok(format!("{}: (file is empty)", full.display()));
     }
-    if start >= total {
+    if start >= total && !grew_past_limit {
         return ToolOutput::err(format!(
             "Line {} is past end of file ({total} lines total)",
             start + 1
@@ -195,7 +240,7 @@ fn read_file_sync(
     }
     if grew_past_limit {
         text.push_str(&format!(
-            "... (stopped: file grew past {MAX_READ_BYTES} bytes during read; total line count is incomplete)\n"
+            "... (stopped: file grew past {byte_limit} bytes during read; total line count is incomplete)\n"
         ));
     } else if total > start + count {
         text.push_str(&format!("... ({} more lines)\n", total - start - count));
@@ -216,22 +261,96 @@ fn reject_symlink(full: &Path) -> Option<ToolOutput> {
 
 /// 同目录临时文件 + rename 原子替换，失败路径清理临时文件。
 /// 跨设备 rename 会失败，所以临时文件不放系统临时目录。
+/// 仅保留 Unix 普通 rwx 位，不保留特殊位、ACL、扩展属性、属主或硬链接语义。
 fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
-    let Some(name) = full.file_name() else {
-        return std::fs::write(full, content);
-    };
-    let tmp = full.with_file_name(format!(
-        "{}.{}.tmp",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    match std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, full)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+    atomic_write_with(full, |file, permissions| {
+        file.write_all(content.as_bytes())?;
+        // 完整内容写入后才设置最终权限，权限设置失败不得发布。
+        file.set_permissions(permissions)
+    })
+}
+
+/// prepare 在私有文件描述符上完成写入和权限设置，成功后才发布。
+fn atomic_write_with(
+    full: &Path,
+    prepare: impl FnOnce(&mut std::fs::File, std::fs::Permissions) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if full.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write target must have a file name",
+        ));
     }
+    let tmp = full.with_file_name(format!(".instagent-{}.tmp", uuid::Uuid::new_v4()));
+    // 只有排他创建成功后才拥有临时路径；碰撞时不覆盖也不清理他人的文件。
+    let mut file = create_private_file(&tmp)?;
+    let result = (|| {
+        #[cfg(unix)]
+        let permissions = replacement_permissions(full)?;
+        #[cfg(not(unix))]
+        let permissions = file.metadata()?.permissions();
+        prepare(&mut file, permissions)?;
+        std::fs::rename(&tmp, full)
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn replacement_permissions(full: &Path) -> std::io::Result<std::fs::Permissions> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(full) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::other("Refusing to write through symlink"));
+        }
+        Ok(meta) if meta.is_file() => {
+            return Ok(std::fs::Permissions::from_mode(
+                meta.permissions().mode() & 0o777,
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // 新文件仍遵循普通 create 的 0666 & umask。不能通过临时改进程 umask
+    // 来获取它（会影响其他线程），也不能让写入中的内容短暂暴露默认权限。
+    // 私有目录内的空探针只用于取得默认 mode；实际内容始终写在同目录 0600 文件中。
+    let dir = full.with_file_name(format!(".instagent-{}.mode", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let probe = dir.join("mode");
+    let result = (|| {
+        // 即使 umask 屏蔽了 owner 位，也允许在私有目录中创建探针。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        Ok(std::fs::Permissions::from_mode(
+            file.metadata()?.permissions().mode() & 0o777,
+        ))
+    })();
+    let cleanup = match std::fs::remove_file(&probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    };
+    let remove_dir = std::fs::remove_dir(&dir);
+    result.and_then(|permissions| cleanup.and(remove_dir).map(|()| permissions))
 }
 
 /// 建父目录，原子覆盖写。内容有 [`MAX_WRITE_BYTES`] 上限（计划 R9）。
@@ -325,8 +444,17 @@ fn edit_file_sync(
 }
 
 /// 唯一精确匹配才替换（搬运 goose developer/edit.rs:157 `string_replace`，
-/// 加了 before 为空的显式拒绝）。
+/// 加了 before 为空的显式拒绝与替换后的字节预算）。
 pub fn string_replace(content: &str, before: &str, after: &str) -> Result<String, String> {
+    string_replace_capped(content, before, after, MAX_WRITE_BYTES)
+}
+
+fn string_replace_capped(
+    content: &str,
+    before: &str,
+    after: &str,
+    byte_limit: u64,
+) -> Result<String, String> {
     if before.is_empty() {
         return Err("`before` must not be empty (use write to create/replace files)".to_string());
     }
@@ -344,7 +472,10 @@ pub fn string_replace(content: &str, before: &str, after: &str) -> Result<String
             msg.push_str(&format!("\n\nFile preview:\n```\n{preview}\n```"));
             Err(msg)
         }
-        1 => Ok(content.replacen(before, after, 1)),
+        1 => {
+            replacement_len(content.len(), before.len(), after.len(), byte_limit)?;
+            Ok(content.replacen(before, after, 1))
+        }
         n => {
             let mut msg = format!(
                 "Found {n} matches. Please provide more context to identify a unique match:\n"
@@ -366,6 +497,19 @@ pub fn string_replace(content: &str, before: &str, after: &str) -> Result<String
             Err(msg)
         }
     }
+}
+
+fn replacement_len(
+    content_len: usize,
+    before_len: usize,
+    after_len: usize,
+    byte_limit: u64,
+) -> Result<usize, String> {
+    content_len
+        .checked_sub(before_len)
+        .and_then(|len| len.checked_add(after_len))
+        .filter(|len| *len as u64 <= byte_limit)
+        .ok_or_else(|| format!("Replacement content too large (limit {byte_limit} bytes)"))
 }
 
 /// 搬运 goose developer/edit.rs `count_lines_before`。
@@ -434,6 +578,376 @@ mod tests {
         ToolCtx {
             cwd: dir.to_path_buf(),
             cancel: CancellationToken::new(),
+        }
+    }
+
+    struct MeasuredReader<R> {
+        inner: R,
+        bytes_read: u64,
+        chunk_size: usize,
+    }
+
+    impl<R: Read> Read for MeasuredReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(self.chunk_size);
+            let n = self.inner.read(&mut buf[..len])?;
+            self.bytes_read += n as u64;
+            Ok(n)
+        }
+    }
+
+    fn read_fixture(bytes: &[u8], byte_limit: u64, chunk_size: usize) -> ToolOutput {
+        let mut reader = MeasuredReader {
+            inner: std::io::Cursor::new(bytes),
+            bytes_read: 0,
+            chunk_size,
+        };
+        let out = read_window(
+            &mut reader,
+            Path::new("fixture"),
+            None,
+            None,
+            &CancellationToken::new(),
+            byte_limit,
+        );
+        assert!(reader.bytes_read <= byte_limit + 1);
+        out
+    }
+
+    #[test]
+    fn read_long_line_stops_at_budget_plus_one() {
+        let bytes = vec![b'x'; 4096];
+        let mut reader = MeasuredReader {
+            inner: std::io::Cursor::new(bytes),
+            bytes_read: 0,
+            chunk_size: usize::MAX,
+        };
+        let out = read_window(
+            &mut reader,
+            Path::new("fixture"),
+            None,
+            None,
+            &CancellationToken::new(),
+            8,
+        );
+        assert_eq!(reader.bytes_read, 9);
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            out.text,
+            "   1: xxxxxxxx\n... (stopped: file grew past 8 bytes during read; total line count is incomplete)\n"
+        );
+    }
+
+    #[test]
+    fn read_growth_after_metadata_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        let file = std::fs::File::open(&path).unwrap();
+        // 确定性地在预检和读取之间增长，不依赖 sleep 或并发时序。
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"bbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        let mut reader = MeasuredReader {
+            inner: file,
+            bytes_read: 0,
+            chunk_size: 3,
+        };
+        let out = read_window(
+            &mut reader,
+            &path,
+            Some(2),
+            Some(1),
+            &CancellationToken::new(),
+            8,
+        );
+        assert_eq!(reader.bytes_read, 9);
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.starts_with("   2: bbbbbb\n"), "{}", out.text);
+        assert!(out.text.contains("total line count is incomplete"));
+    }
+
+    #[test]
+    fn read_counts_exact_bytes_and_preserves_line_endings() {
+        for (input, expected) in [
+            ("", "fixture: (file is empty)"),
+            ("abc", "   1: abc\n"),
+            ("ab\n", "   1: ab\n"),
+            ("a\r\nb", "   1: a\n   2: b\n"),
+            ("a\r", "   1: a\r\n"),
+            ("\n\n", "   1: \n   2: \n"),
+            ("é界", "   1: é界\n"),
+        ] {
+            for extra_budget in [0, 1] {
+                for chunk in [1, usize::MAX] {
+                    let out =
+                        read_fixture(input.as_bytes(), input.len() as u64 + extra_budget, chunk);
+                    assert!(!out.is_error, "{}", out.text);
+                    assert_eq!(out.text, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_distinguishes_utf8_cut_at_budget_from_invalid_input() {
+        for chunk in [1, usize::MAX] {
+            for budget in [3, 4] {
+                let out = read_fixture("é界".as_bytes(), budget, chunk);
+                assert!(!out.is_error, "{}", out.text);
+                assert!(out.text.starts_with("   1: é\n"), "{}", out.text);
+                assert!(out.text.contains("file grew past"));
+            }
+            for input in [&b"a\xe7\x95"[..], &b"a\xff\nx"[..]] {
+                let out = read_fixture(input, input.len() as u64, chunk);
+                assert!(out.is_error);
+                assert!(out.text.contains("not valid UTF-8"), "{}", out.text);
+            }
+            let out = read_fixture(b"a\xffbbbbbbbb", 4, chunk);
+            assert!(out.is_error);
+            assert!(out.text.contains("not valid UTF-8"), "{}", out.text);
+        }
+    }
+
+    #[test]
+    fn read_does_not_invent_lines_or_eof_beyond_budget() {
+        for start in [1, 3] {
+            let out = read_window(
+                &b"a\nb\nc\n"[..],
+                Path::new("fixture"),
+                Some(start),
+                Some(1),
+                &CancellationToken::new(),
+                4,
+            );
+            assert!(!out.is_error, "{}", out.text);
+            assert!(!out.text.contains("   3:"));
+            assert!(!out.text.contains("more lines"));
+            assert!(out.text.contains("total line count is incomplete"));
+        }
+        let out = read_window(
+            &b"a\nb"[..],
+            Path::new("fixture"),
+            Some(3),
+            None,
+            &CancellationToken::new(),
+            3,
+        );
+        assert!(out.is_error);
+        assert_eq!(out.text, "Line 3 is past end of file (2 lines total)");
+    }
+
+    #[test]
+    fn read_precancelled_does_not_read_any_bytes() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut reader = MeasuredReader {
+            inner: std::io::Cursor::new(b"content"),
+            bytes_read: 0,
+            chunk_size: usize::MAX,
+        };
+        let out = read_window(&mut reader, Path::new("fixture"), None, None, &cancel, 4);
+        assert_eq!(reader.bytes_read, 0);
+        assert!(out.is_error);
+        assert!(out.text.contains("cancelled"));
+    }
+
+    #[test]
+    fn replacement_budget_counts_utf8_and_handles_length_changes() {
+        assert_eq!(
+            string_replace_capped("a界z", "界", "éé", 6).unwrap(),
+            "aééz"
+        );
+        assert!(string_replace_capped("a界z", "界", "éé", 5)
+            .unwrap_err()
+            .contains("too large"));
+        assert_eq!(string_replace_capped("a界z", "界", "", 2).unwrap(), "az");
+        assert_eq!(string_replace_capped("a界z", "界", "x", 3).unwrap(), "axz");
+        assert_eq!(
+            string_replace_capped("a界z", "界", "字", 5).unwrap(),
+            "a字z"
+        );
+        assert!(string_replace_capped("old old", "old", "new", 1)
+            .unwrap_err()
+            .contains("Found 2 matches"));
+        assert!(string_replace_capped("old", "missing", "new", 1)
+            .unwrap_err()
+            .contains("No match found"));
+        assert!(string_replace_capped("old", "", "new", 1)
+            .unwrap_err()
+            .contains("must not be empty"));
+        assert!(replacement_len(usize::MAX, 1, 2, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_checks_real_write_budget_before_changing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("boundary.txt");
+        let content = "old".to_string() + &"x".repeat(MAX_WRITE_BYTES as usize - 5);
+        assert_eq!(content.len(), 33_554_430);
+        std::fs::write(&file, &content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // 原始复现：old -> larger 产生 33,554,433 字节；UTF-8 也按字节检查。
+        for after in ["larger", "界界"] {
+            let out = edit_file(&file, "old", after, &ctx(dir.path())).await;
+            assert!(out.is_error);
+            assert!(out.text.contains("too large"), "{}", out.text);
+            assert_eq!(std::fs::read(&file).unwrap(), content.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                    0o600
+                );
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+        let out = edit_file(&file, "old", "large", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), MAX_WRITE_BYTES);
+        // 刚好上限的产物仍可再次 edit，删除后恢复原大小。
+        let out = edit_file(&file, "large", "old", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(std::fs::read(&file).unwrap(), content.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_and_edit_preserve_only_ordinary_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        for mode in [0o755, 0o600, 0o6755, 0o7755] {
+            for edit in [false, true] {
+                std::fs::write(&file, "original").unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+                assert_eq!(
+                    std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                    mode
+                );
+                let out = if edit {
+                    edit_file(&file, "original", "updated", &ctx(dir.path())).await
+                } else {
+                    write_file(&file, "updated", &ctx(dir.path())).await
+                };
+                assert!(!out.is_error, "{}", out.text);
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "updated");
+                assert_eq!(
+                    std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                    mode & 0o777
+                );
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_file_permissions_match_normal_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let normal = dir.path().join("normal");
+        let atomic = dir.path().join("atomic");
+        std::fs::write(&normal, "normal").unwrap();
+        let expected = std::fs::metadata(&normal).unwrap().permissions().mode() & 0o777;
+        let out = write_file(&atomic, "content", &ctx(dir.path())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            std::fs::metadata(&atomic).unwrap().permissions().mode() & 0o7777,
+            expected
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_file_is_private_and_exclusive_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("collision.tmp");
+        let mut file = create_private_file(&tmp).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o7077, 0);
+        file.write_all(b"keep").unwrap();
+        assert_eq!(
+            create_private_file(&tmp).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"keep");
+        let link = dir.path().join("link.tmp");
+        std::os::unix::fs::symlink(&tmp, &link).unwrap();
+        assert!(create_private_file(&link).is_err());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"keep");
+        assert!(link.is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_preparation_failures_preserve_original_and_clean_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original");
+        std::fs::write(&path, "original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for kind in [
+            std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = atomic_write_with(&path, |file, permissions| {
+                assert_eq!(file.metadata()?.permissions().mode() & 0o7077, 0);
+                assert_eq!(permissions.mode(), 0o755);
+                file.write_all(b"partial content")?;
+                // 确定性模拟写入中断 / 发布前 chmod 失败。
+                Err(std::io::Error::new(kind, "injected preparation failure"))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_rename_failure_keeps_target_and_cleans_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("directory");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), "original").unwrap();
+        let out = write_file(&target, "replacement", &ctx(dir.path())).await;
+        assert!(out.is_error);
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_match_errors_keep_bytes_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "old old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for before in ["", "missing", "old"] {
+            let out = edit_file(&path, before, "new", &ctx(dir.path())).await;
+            assert!(out.is_error);
+            assert_eq!(std::fs::read(&path).unwrap(), b"old old");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
     }
 
@@ -615,7 +1129,10 @@ mod tests {
         let out = edit_file(&link, "secret", "owned", &ctx(dir.path())).await;
         assert!(out.is_error);
         assert!(out.text.contains("symlink"), "{}", out.text);
+        // atomic 层获取发布权限失败也必须清理已创建的私有临时文件。
+        assert!(atomic_write(&link, "owned").is_err());
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "secret\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[tokio::test]
