@@ -11,6 +11,7 @@
 //! note（todo 08 / R13）。provider JSON 读取有大小上限（[`MAX_PROVIDER_JSON_BYTES`]）。
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,17 +41,56 @@ const PROVIDERS_DIR: &str = "providers";
 /// 超限文件在装载边界拒绝，避免坏输入拖垮解析与错误输出。
 pub const MAX_PROVIDER_JSON_BYTES: u64 = 1024 * 1024;
 
-/// 带大小上限读 provider JSON：超限报错指出文件、实际大小与上限。
+/// metadata 只做预检；同一文件句柄的实际读取也限制到上限 + 1 字节。
 fn read_provider_json(path: &Path) -> Result<String> {
-    let size = std::fs::metadata(path)
-        .with_context(|| format!("read {}", path.display()))?
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "read {} (provider JSON, {MAX_PROVIDER_JSON_BYTES} byte limit)",
+            path.display()
+        )
+    })?;
+    let size = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "read {} (provider JSON, {MAX_PROVIDER_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })?
         .len();
+    read_provider_json_from(path, file, size)
+}
+
+fn read_provider_json_from(path: &Path, reader: impl Read, metadata_size: u64) -> Result<String> {
     anyhow::ensure!(
-        size <= MAX_PROVIDER_JSON_BYTES,
-        "provider file {} is too large: {size} bytes exceeds the {MAX_PROVIDER_JSON_BYTES} byte limit",
+        metadata_size <= MAX_PROVIDER_JSON_BYTES,
+        "provider file {} is too large: {metadata_size} bytes exceeds the {MAX_PROVIDER_JSON_BYTES} byte limit",
         path.display()
     );
-    std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_PROVIDER_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "read {} (provider JSON, {MAX_PROVIDER_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PROVIDER_JSON_BYTES,
+        "provider file {} is too large: at least {} bytes exceed the {MAX_PROVIDER_JSON_BYTES} byte limit",
+        path.display(),
+        bytes.len()
+    );
+    String::from_utf8(bytes)
+        .map_err(|err| err.utf8_error())
+        .with_context(|| {
+            format!(
+                "provider file {} is not valid UTF-8 ({MAX_PROVIDER_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })
 }
 
 /// 一个 provider 定义 + 它的来源插件（覆盖与消歧的依据）。
@@ -675,6 +715,104 @@ mod tests {
             message.contains(&MAX_PROVIDER_JSON_BYTES.to_string()),
             "{message}"
         );
+    }
+
+    #[test]
+    fn provider_byte_limit_is_inclusive_and_file_order_is_preserved() {
+        let data = TempDir::new().unwrap();
+        let p = plugin(data.path().join("p"), "p", PluginSource::User);
+        write_provider(
+            &p,
+            "z.json",
+            &def_json("alpha", "openai", "https://a.test/v1"),
+        );
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "name": "zeta", "engine": "openai", "base_url": "https://z.test/v1",
+            "description": "边界🙂 test-only-provider-secret"
+        }))
+        .unwrap();
+        bytes.resize(MAX_PROVIDER_JSON_BYTES as usize, b' ');
+        let path = p.root.join(NAMESPACE).join(PROVIDERS_DIR).join("a.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let set = PluginSet {
+            plugins: vec![p],
+            skipped: vec![],
+        };
+        let registry = ProviderRegistry::from_plugins_at(&set, data.path()).unwrap();
+        let order: Vec<_> = registry
+            .entries
+            .iter()
+            .map(|e| e.def.name.as_str())
+            .collect();
+        assert_eq!(order, ["zeta", "alpha"], "按文件名排序，与创建顺序无关");
+        assert_eq!(registry.names(), ["alpha", "zeta"]);
+
+        // 健康来源仍在，但一个 provider 文件超限就必须按现有策略整体报错。
+        bytes.push(b' ');
+        std::fs::write(&path, bytes).unwrap();
+        let err = ProviderRegistry::from_plugins_at(&set, data.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("provider file"), "{msg}");
+        assert!(msg.contains(&MAX_PROVIDER_JSON_BYTES.to_string()), "{msg}");
+        assert!(msg.contains("byte limit"), "{msg}");
+        assert!(!msg.contains("test-only-provider-secret"), "{msg}");
+    }
+
+    #[test]
+    fn provider_reader_limits_growth_after_metadata_precheck() {
+        let path = Path::new("/plugins/demo/dev.instagent/providers/svc.json");
+        let text = r#"{"name":"svc","description":"增长🙂"}"#;
+        assert_eq!(
+            read_provider_json_from(path, text.as_bytes(), 0).unwrap(),
+            text
+        );
+
+        let mut bytes = b"test-only-provider-secret".to_vec();
+        bytes.push(0xff);
+        bytes.resize(MAX_PROVIDER_JSON_BYTES as usize + 32, b' ');
+        for (metadata_size, expected_read) in [
+            (0, MAX_PROVIDER_JSON_BYTES + 1),
+            (MAX_PROVIDER_JSON_BYTES, MAX_PROVIDER_JSON_BYTES + 1),
+            (MAX_PROVIDER_JSON_BYTES + 1, 0),
+        ] {
+            let mut reader = std::io::Cursor::new(&bytes);
+            let err = read_provider_json_from(path, &mut reader, metadata_size).unwrap_err();
+            assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("provider file"), "{msg}");
+            assert!(msg.contains(&MAX_PROVIDER_JSON_BYTES.to_string()), "{msg}");
+            assert!(msg.contains("byte limit"), "{msg}");
+            assert!(!msg.contains("UTF-8"), "超限先于编码校验：{msg}");
+            assert!(!msg.contains("test-only-provider-secret"), "{msg}");
+            assert!(msg.len() < 512, "{msg}");
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_provider_is_fatal_without_echoing_contents() {
+        let data = TempDir::new().unwrap();
+        let p = plugin(data.path().join("p"), "p", PluginSource::User);
+        write_provider(
+            &p,
+            "a.json",
+            &def_json("healthy", "openai", "https://h.test/v1"),
+        );
+        let path = p.root.join(NAMESPACE).join(PROVIDERS_DIR).join("bad.json");
+        std::fs::write(&path, b"test-only-provider-secret\xff").unwrap();
+        let set = PluginSet {
+            plugins: vec![p],
+            skipped: vec![],
+        };
+        let err = ProviderRegistry::from_plugins_at(&set, data.path()).unwrap_err();
+        for msg in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("provider file"), "{msg}");
+            assert!(msg.contains("UTF-8"), "{msg}");
+            assert!(msg.contains(&MAX_PROVIDER_JSON_BYTES.to_string()), "{msg}");
+            assert!(!msg.contains("test-only-provider-secret"), "{msg}");
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -171,18 +172,58 @@ pub fn read_manifest(dir: &Path) -> crate::Result<PluginManifest> {
     validate_manifest(manifest, &path)
 }
 
-/// 带硬上限的 manifest 读取：先查 metadata 再读，超限错误指出路径与上限。
+/// metadata 只做预检；同一文件句柄的实际读取也限制到上限 + 1 字节。
 fn read_bounded(path: &Path) -> crate::Result<String> {
-    let size = fs::metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to read {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
+            path.display()
+        )
+    })?;
+    let size = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "Failed to stat {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
+                path.display()
+            )
+        })?
         .len();
-    if size > MAX_MANIFEST_BYTES {
+    read_bounded_from(path, file, size)
+}
+
+fn read_bounded_from(path: &Path, reader: impl Read, metadata_size: u64) -> crate::Result<String> {
+    if metadata_size > MAX_MANIFEST_BYTES {
         bail!(
-            "{}: plugin manifest is {size} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
+            "{}: plugin manifest is {metadata_size} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
             path.display()
         );
     }
-    fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "Failed to read {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        bail!(
+            "{}: plugin manifest is at least {} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
+            path.display(),
+            bytes.len()
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| err.utf8_error())
+        .with_context(|| {
+            format!(
+                "{}: plugin manifest is not valid UTF-8 ({MAX_MANIFEST_BYTES} byte limit)",
+                path.display()
+            )
+        })
 }
 
 /// 字段级校验（类型形状 + 跨字段约束），通过后产出类型化 manifest。
@@ -847,6 +888,71 @@ mod tests {
         let msg = error_of(&manifest_json(r#""description":5"#));
         assert!(msg.contains("plugin.json"), "{msg}");
         assert!(msg.contains("plugin `demo`"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_byte_limit_is_inclusive() {
+        let mut bytes =
+            manifest_json(r#""description":"边界🙂 test-only-manifest-secret""#).into_bytes();
+        bytes.resize(MAX_MANIFEST_BYTES as usize, b' ');
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plugin.json");
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_manifest(dir.path()).unwrap().name, "demo");
+
+        // 仍是合法 JSON，只多一个空格；必须先报预算错误。
+        bytes.push(b' ');
+        fs::write(&path, bytes).unwrap();
+        let err = read_manifest(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("plugin manifest"), "{msg}");
+        assert!(msg.contains(&MAX_MANIFEST_BYTES.to_string()), "{msg}");
+        assert!(msg.contains("byte limit"), "{msg}");
+        assert!(!msg.contains("test-only-manifest-secret"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_reader_limits_growth_after_metadata_precheck() {
+        let path = Path::new("/plugins/demo/plugin.json");
+        let text = manifest_json(r#""description":"增长🙂""#);
+        assert_eq!(read_bounded_from(path, text.as_bytes(), 0).unwrap(), text);
+
+        let mut bytes = b"test-only-manifest-secret".to_vec();
+        bytes.push(0xff);
+        bytes.resize(MAX_MANIFEST_BYTES as usize + 32, b' ');
+        for (metadata_size, expected_read) in [
+            (0, MAX_MANIFEST_BYTES + 1),
+            (MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES + 1),
+            (MAX_MANIFEST_BYTES + 1, 0),
+        ] {
+            let mut reader = std::io::Cursor::new(&bytes);
+            let err = read_bounded_from(path, &mut reader, metadata_size).unwrap_err();
+            assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("plugin manifest"), "{msg}");
+            assert!(msg.contains(&MAX_MANIFEST_BYTES.to_string()), "{msg}");
+            assert!(msg.contains("byte limit"), "{msg}");
+            assert!(!msg.contains("UTF-8"), "超限先于编码校验：{msg}");
+            assert!(!msg.contains("test-only-manifest-secret"), "{msg}");
+            assert!(msg.len() < 512, "{msg}");
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_manifest_has_source_without_contents() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plugin.json");
+        fs::write(&path, b"test-only-manifest-secret\xff").unwrap();
+        let err = read_manifest(dir.path()).unwrap_err();
+        for msg in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("plugin manifest"), "{msg}");
+            assert!(msg.contains("UTF-8"), "{msg}");
+            assert!(msg.contains(&MAX_MANIFEST_BYTES.to_string()), "{msg}");
+            assert!(!msg.contains("test-only-manifest-secret"), "{msg}");
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //!   命令、原因的 warning。
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -44,6 +45,8 @@ use crate::subprocess::ProcessGroupChild;
 
 /// 默认超时 30s（§2.7）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// hooks.json 单次读取硬上限（1 MiB），在解析或注册 hook 前拒绝超限文件。
+pub const MAX_HOOKS_JSON_BYTES: u64 = 1024 * 1024;
 /// 每路输出收集硬上限：hook 决策载荷很小，64 KiB 足够；超限杀整个进程组，
 /// 截断状态经 `crate::subprocess::BoundedOutput::truncated` 上报（todo 06 / R3）。
 pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
@@ -318,10 +321,17 @@ fn load_plugin_hooks(out: &mut Hooks, plugin: &Plugin) -> crate::Result<()> {
     let Some(path) = hooks_file_path(plugin) else {
         return Ok(());
     };
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed: HooksFile =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let text = read_hooks_json(&path)?;
+    // serde 的字段类型 / 枚举错误可能回显原值；仅报告类别与位置，不携带正文。
+    let parsed: HooksFile = serde_json::from_str(&text).map_err(|err| {
+        anyhow::anyhow!(
+            "parsing {}: invalid hooks JSON ({:?} error at line {}, column {})",
+            path.display(),
+            err.classify(),
+            err.line(),
+            err.column()
+        )
+    })?;
     let declared = declared_env(plugin);
     if !declared.is_empty() {
         out.plugin_env
@@ -335,6 +345,62 @@ fn load_plugin_hooks(out: &mut Hooks, plugin: &Plugin) -> crate::Result<()> {
         register_event_groups(&mut out.entries, plugin, &path, event, groups);
     }
     Ok(())
+}
+
+/// 两个 hooks.json 位置共用预算；metadata 预检之后仍限制实际读取字节数。
+fn read_hooks_json(path: &Path) -> crate::Result<String> {
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "reading {} (hooks JSON, {MAX_HOOKS_JSON_BYTES} byte limit)",
+            path.display()
+        )
+    })?;
+    let size = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "reading {} (hooks JSON, {MAX_HOOKS_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })?
+        .len();
+    read_hooks_json_from(path, file, size)
+}
+
+fn read_hooks_json_from(
+    path: &Path,
+    reader: impl Read,
+    metadata_size: u64,
+) -> crate::Result<String> {
+    anyhow::ensure!(
+        metadata_size <= MAX_HOOKS_JSON_BYTES,
+        "hooks file {} is too large: {metadata_size} bytes exceed the {MAX_HOOKS_JSON_BYTES} byte limit",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_HOOKS_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "reading {} (hooks JSON, {MAX_HOOKS_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_HOOKS_JSON_BYTES,
+        "hooks file {} is too large: at least {} bytes exceed the {MAX_HOOKS_JSON_BYTES} byte limit",
+        path.display(),
+        bytes.len()
+    );
+    String::from_utf8(bytes)
+        .map_err(|err| err.utf8_error())
+        .with_context(|| {
+            format!(
+                "hooks file {} is not valid UTF-8 ({MAX_HOOKS_JSON_BYTES} byte limit)",
+                path.display()
+            )
+        })
 }
 
 /// manifest loading：注册一个事件下的全部 matcher 组。非法正则 → 跳过整条
@@ -993,6 +1059,162 @@ mod tests {
     }
 
     // ---- 加载与展开 ----
+
+    #[test]
+    fn missing_hooks_files_are_healthy() {
+        let h = harness();
+        let plugin = h.plugin("p");
+        let hooks = Hooks::load(&plugin_set(&[&plugin])).unwrap();
+        assert!(hooks.entries.is_empty());
+        assert!(hooks.plugin_env.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hooks_at_byte_limit_load_and_run_from_both_paths() {
+        for draft in [false, true] {
+            let h = harness();
+            let plugin = h.plugin("p");
+            h.script(
+                &plugin,
+                "mark.sh",
+                "printf '%s' '边界🙂' > \"$PLUGIN_ROOT/ran\"",
+            );
+            let mut bytes = hooks_json(
+                "PreToolUse",
+                r#"[{"hooks":[{"command":"\"${PLUGIN_ROOT}/mark.sh\""}]}]"#,
+            )
+            .into_bytes();
+            bytes.resize(MAX_HOOKS_JSON_BYTES as usize, b' ');
+            h.hooks_file(&plugin, std::str::from_utf8(&bytes).unwrap(), draft);
+            let hooks = Hooks::load(&plugin_set(&[&plugin])).unwrap();
+            assert_eq!(hooks.entries.len(), 1);
+            assert_eq!(
+                hooks.run(&tool_ctx(HookEvent::PreToolUse)).await,
+                HookDecision::Allow
+            );
+            assert_eq!(
+                std::fs::read_to_string(plugin.join("ran")).unwrap(),
+                "边界🙂"
+            );
+        }
+    }
+
+    #[test]
+    fn hooks_reader_limits_growth_after_metadata_precheck() {
+        let path = Path::new("/plugins/demo/dev.instagent/hooks.json");
+        let text = r#"{"hooks":{},"description":"增长🙂"}"#;
+        assert_eq!(
+            read_hooks_json_from(path, text.as_bytes(), 0).unwrap(),
+            text
+        );
+
+        let mut bytes = b"test-only-hooks-secret".to_vec();
+        bytes.push(0xff);
+        bytes.resize(MAX_HOOKS_JSON_BYTES as usize + 32, b' ');
+        for (metadata_size, expected_read) in [
+            (0, MAX_HOOKS_JSON_BYTES + 1),
+            (MAX_HOOKS_JSON_BYTES, MAX_HOOKS_JSON_BYTES + 1),
+            (MAX_HOOKS_JSON_BYTES + 1, 0),
+        ] {
+            let mut reader = std::io::Cursor::new(&bytes);
+            let err = read_hooks_json_from(path, &mut reader, metadata_size).unwrap_err();
+            assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("hooks file"), "{msg}");
+            assert!(msg.contains(&MAX_HOOKS_JSON_BYTES.to_string()), "{msg}");
+            assert!(msg.contains("byte limit"), "{msg}");
+            assert!(!msg.contains("UTF-8"), "超限先于编码校验：{msg}");
+            assert!(!msg.contains("test-only-hooks-secret"), "{msg}");
+            assert!(msg.len() < 512, "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_hooks_fail_before_parsing_registration_or_execution() {
+        for draft in [false, true] {
+            // 合法 JSON、语法错误、非法 UTF-8 均应先被实际字节预算拒绝。
+            for first_byte in [b'{', b'!', 0xff] {
+                let h = harness();
+                let plugin = h.plugin_with("p", r#"{"env":["UNUSED_HOOK_ENV"]}"#);
+                h.script(&plugin, "mark.sh", "touch \"$PLUGIN_ROOT/ran\"");
+                let mut bytes = serde_json::to_vec(&json!({
+                    "secret": "test-only-hooks-secret",
+                    "hooks": {"PreToolUse": [{"hooks": [{"command": "\"${PLUGIN_ROOT}/mark.sh\""}]}]}
+                }))
+                .unwrap();
+                bytes.resize(MAX_HOOKS_JSON_BYTES as usize + 1, b' ');
+                bytes[0] = first_byte;
+                h.hooks_file(&plugin, "{}", draft);
+                if !draft {
+                    // 规范文件坏了也不能回退到这份健康草案配置。
+                    h.hooks_file(&plugin, "{}", true);
+                }
+                let set = plugin_set(&[&plugin]);
+                let path = hooks_file_path(&set.plugins[0]).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+
+                let mut hooks = Hooks::default();
+                let err = load_plugin_hooks(&mut hooks, &set.plugins[0]).unwrap_err();
+                let msg = format!("{err:#}");
+                assert!(msg.contains(&path.display().to_string()), "{msg}");
+                assert!(msg.contains("hooks file"), "{msg}");
+                assert!(msg.contains(&MAX_HOOKS_JSON_BYTES.to_string()), "{msg}");
+                assert!(msg.contains("byte limit"), "{msg}");
+                assert!(!msg.contains("parsing") && !msg.contains("UTF-8"), "{msg}");
+                assert!(!msg.contains("test-only-hooks-secret"), "{msg}");
+                assert!(!msg.contains("mark.sh"), "{msg}");
+                assert!(msg.len() < 512, "{msg}");
+                assert!(hooks.entries.is_empty() && hooks.plugin_env.is_empty());
+                assert_eq!(
+                    hooks.run(&tool_ctx(HookEvent::PreToolUse)).await,
+                    HookDecision::Allow
+                );
+                assert!(!plugin.join("ran").exists());
+                assert!(
+                    Hooks::load(&set).is_err(),
+                    "加载错误仍须上报，不能 fail-open"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_hooks_utf8_and_json_are_fatal_without_echoing_contents() {
+        let secret = "test-only-hooks-secret";
+        let invalid_enum = json!({"hooks": {"Stop": [{"hooks": [{
+            "command": "true", "on_failure": secret.repeat(1000)
+        }]}]}})
+        .to_string();
+        for draft in [false, true] {
+            let h = harness();
+            let plugin = h.plugin("p");
+            h.hooks_file(&plugin, "{}", draft);
+            let set = plugin_set(&[&plugin]);
+            let path = hooks_file_path(&set.plugins[0]).unwrap();
+            for (bytes, expected) in [
+                ([secret.as_bytes(), b"\xff"].concat(), "UTF-8"),
+                (
+                    format!(r#"{{"secret":"{secret}","hooks":"#).into_bytes(),
+                    "parsing",
+                ),
+                (format!(r#"{{"hooks":"{secret}"}}"#).into_bytes(), "parsing"),
+                (invalid_enum.as_bytes().to_vec(), "parsing"),
+            ] {
+                std::fs::write(&path, bytes).unwrap();
+                let err = Hooks::load(&set).unwrap_err();
+                for msg in [format!("{err:#}"), format!("{err:?}")] {
+                    assert!(msg.contains(&path.display().to_string()), "{msg}");
+                    assert!(msg.contains(expected), "{msg}");
+                    assert!(!msg.contains(secret), "{msg}");
+                    assert!(msg.len() < 1024, "{msg}");
+                    if expected == "parsing" {
+                        assert!(msg.contains("line") && msg.contains("column"), "{msg}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn namespace_path_wins_draft_path_is_fallback() {

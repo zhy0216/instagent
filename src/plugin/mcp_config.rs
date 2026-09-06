@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -134,18 +135,58 @@ pub fn load_servers(plugin: &Plugin, plugin_data: &Path) -> crate::Result<Vec<Mc
         .collect()
 }
 
-/// 带硬上限的配置文件读取：先查 metadata 再读，超限错误指出路径与上限。
+/// metadata 只做预检；同一文件句柄的实际读取也限制到上限 + 1 字节。
 fn read_bounded(path: &Path) -> crate::Result<String> {
-    let size = fs::metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to read {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
+            path.display()
+        )
+    })?;
+    let size = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "Failed to stat {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
+                path.display()
+            )
+        })?
         .len();
-    if size > MAX_MCP_CONFIG_BYTES {
+    read_bounded_from(path, file, size)
+}
+
+fn read_bounded_from(path: &Path, reader: impl Read, metadata_size: u64) -> crate::Result<String> {
+    if metadata_size > MAX_MCP_CONFIG_BYTES {
         bail!(
-            "{}: mcp config is {size} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
+            "{}: mcp config is {metadata_size} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
             path.display()
         );
     }
-    fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_MCP_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "Failed to read {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_MCP_CONFIG_BYTES {
+        bail!(
+            "{}: mcp config is at least {} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
+            path.display(),
+            bytes.len()
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| err.utf8_error())
+        .with_context(|| {
+            format!(
+                "{}: mcp config is not valid UTF-8 ({MAX_MCP_CONFIG_BYTES} byte limit)",
+                path.display()
+            )
+        })
 }
 
 /// 返回 (配置文件路径, 是否草案 `.mcp.json`)；两者都不存在时 `None`。
@@ -550,6 +591,80 @@ mod tests {
         let err = load(dir.path(), data.path()).unwrap_err();
         assert!(err.to_string().contains("Failed to parse"), "{err}");
         assert!(err.to_string().contains("mcp.json"), "{err}");
+    }
+
+    #[test]
+    fn config_byte_limit_is_inclusive_for_both_paths() {
+        for filename in ["mcp.json", ".mcp.json"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let data = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(filename);
+            let mut bytes = br#"{"mcpServers":{
+                "zeta":{"type":"stdio","command":"srv","args":["test-only-mcp-secret"]},
+                "alpha":{"type":"stdio","command":"srv"}}}"#
+                .to_vec();
+            bytes.resize(MAX_MCP_CONFIG_BYTES as usize, b' ');
+            fs::write(&path, &bytes).unwrap();
+            let servers = load(dir.path(), data.path()).unwrap();
+            let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["alpha", "zeta"]);
+
+            bytes.push(b' ');
+            fs::write(&path, bytes).unwrap();
+            let err = load(dir.path(), data.path()).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("mcp config"), "{msg}");
+            assert!(msg.contains(&MAX_MCP_CONFIG_BYTES.to_string()), "{msg}");
+            assert!(msg.contains("byte limit"), "{msg}");
+            assert!(!msg.contains("test-only-mcp-secret"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn config_reader_limits_growth_after_metadata_precheck() {
+        let path = Path::new("/plugins/demo/mcp.json");
+        let text = r#"{"mcpServers":{},"description":"增长🙂"}"#;
+        assert_eq!(read_bounded_from(path, text.as_bytes(), 0).unwrap(), text);
+
+        let mut bytes = b"test-only-mcp-secret".to_vec();
+        bytes.push(0xff);
+        bytes.resize(MAX_MCP_CONFIG_BYTES as usize + 32, b' ');
+        for (metadata_size, expected_read) in [
+            (0, MAX_MCP_CONFIG_BYTES + 1),
+            (MAX_MCP_CONFIG_BYTES, MAX_MCP_CONFIG_BYTES + 1),
+            (MAX_MCP_CONFIG_BYTES + 1, 0),
+        ] {
+            let mut reader = std::io::Cursor::new(&bytes);
+            let err = read_bounded_from(path, &mut reader, metadata_size).unwrap_err();
+            assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("mcp config"), "{msg}");
+            assert!(msg.contains(&MAX_MCP_CONFIG_BYTES.to_string()), "{msg}");
+            assert!(msg.contains("byte limit"), "{msg}");
+            assert!(!msg.contains("UTF-8"), "超限先于编码校验：{msg}");
+            assert!(!msg.contains("test-only-mcp-secret"), "{msg}");
+            assert!(msg.len() < 512, "{msg}");
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_config_has_source_without_contents() {
+        for filename in ["mcp.json", ".mcp.json"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let data = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(filename);
+            fs::write(&path, b"test-only-mcp-secret\xff").unwrap();
+            let err = load(dir.path(), data.path()).unwrap_err();
+            for msg in [format!("{err:#}"), format!("{err:?}")] {
+                assert!(msg.contains(&path.display().to_string()), "{msg}");
+                assert!(msg.contains("mcp config"), "{msg}");
+                assert!(msg.contains("UTF-8"), "{msg}");
+                assert!(msg.contains(&MAX_MCP_CONFIG_BYTES.to_string()), "{msg}");
+                assert!(!msg.contains("test-only-mcp-secret"), "{msg}");
+            }
+        }
     }
 
     #[test]
