@@ -2,9 +2,10 @@
 //!
 //! Sandbox 骨架复制自 `tests/cli_e2e.rs`：tempdir 三变量隔离 +
 //! `env!("CARGO_BIN_EXE_instagent")` 真进程 + 进程组/`kill_on_drop`/整体超时
-//! 兜底；真 API 比 wiremock 慢一个量级，单测试超时放宽到 180s。每个测试
-//! 开头检查 `TOKEN_PLAN_API_KEY`：缺失则打 skip 后返回，离线 `cargo test`
-//! 依旧全绿。断言只查随机标记词（MANGO_77 这类）与结构标记（`usage:`、
+//! 兜底；真 API 比 wiremock 慢一个量级，单测试超时放宽到 180s。10 个在线
+//! 用例均为 ignored，显式运行：`cargo test --test live_e2e -- --ignored`。
+//! 显式运行要求非空 `TOKEN_PLAN_API_KEY`；普通测试只验证离线夹具隔离。
+//! 在线断言只查随机标记词（MANGO_77 这类）与结构标记（`usage:`、
 //! `session `、`▶`），prompt 命令式写死，从不查自然语言措辞（防 flake）。
 //! 结构标记按 ADR 0003 D4 契约定位：答案文本在 stdout，`usage:` /
 //! `session ` / `▶` 等诊断全在 stderr。
@@ -19,6 +20,8 @@ use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
 
+use instagent::hooks::{HookContext, HookDecision, HookEvent, Hooks};
+use instagent::plugin::{manifest::read_manifest, Plugin, PluginSet, PluginSource};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_instagent");
@@ -29,14 +32,12 @@ const PLUGIN_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.
 const LIVE_BASE_URL: &str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_LIVE_MODEL: &str = "qwen3.6-flash";
 
-/// 真模型门控：每个测试开头先过这一关。
-fn has_key() -> bool {
-    if std::env::var("TOKEN_PLAN_API_KEY").is_ok() {
-        true
-    } else {
-        eprintln!("skip: TOKEN_PLAN_API_KEY not set");
-        false
-    }
+/// 显式请求在线测试时，缺失、空串和纯空白凭据必须失败，不能假报通过。
+fn require_key() {
+    assert!(
+        std::env::var("TOKEN_PLAN_API_KEY").is_ok_and(|key| !key.trim().is_empty()),
+        "TOKEN_PLAN_API_KEY must be set to a non-empty value for explicitly requested live tests"
+    );
 }
 
 /// 默认 `qwen3.6-flash`，可被 `INSTAGENT_LIVE_MODEL` 覆盖。
@@ -48,25 +49,52 @@ fn live_config_yaml(model: &str, extra: &str) -> String {
     format!("provider: live\nmodel: {model}\nmax_tokens: 1024\n{extra}")
 }
 
-fn liveplug_fixture() -> PathBuf {
+/// 只复制版本化输入；明确排除 `.hook-out`、日志、缓存等所有运行输出。
+/// 增加夹具输入时同步此清单，不递归复制整个源码目录。
+const LIVEPLUG_FILES: &[&str] = &[
+    "plugin.json",
+    "dev.instagent/commands/greet.md",
+    "dev.instagent/hooks.json",
+    "dev.instagent/tools/echoer.json",
+    "scripts/echoer.sh",
+    "scripts/guard.sh",
+    "scripts/post_tool_use.sh",
+    "scripts/session_start.sh",
+    "skills/secret/SKILL.md",
+];
+
+fn liveplug_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liveplug")
 }
 
-/// 每测试一个沙箱：三变量目录 + 独立 cwd，全部 tempdir（同 `cli_e2e.rs`）。
+fn copy_liveplug_fixture(source: &Path, destination: &Path) {
+    for relative in LIVEPLUG_FILES {
+        let target = destination.join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        // fs::copy 复制字节和权限，保留脚本执行位；不用共享文件或硬链接。
+        std::fs::copy(source.join(relative), target).unwrap();
+    }
+}
+
+/// 每测试一个沙箱：三变量目录 + 独立 cwd + 私有 liveplug，全部 tempdir。
 struct Sandbox {
     config: TempDir,
     data: TempDir,
     agents: TempDir,
     cwd: TempDir,
+    liveplug: TempDir,
 }
 
 impl Sandbox {
     fn new() -> Self {
+        let liveplug = TempDir::new().unwrap();
+        copy_liveplug_fixture(&liveplug_source(), liveplug.path());
         Self {
             config: TempDir::new().unwrap(),
             data: TempDir::new().unwrap(),
             agents: TempDir::new().unwrap(),
             cwd: TempDir::new().unwrap(),
+            liveplug,
         }
     }
 
@@ -145,6 +173,172 @@ fn session_id_of(stderr: &str) -> String {
         .to_string()
 }
 
+// ---- 离线夹具回归：不创建 provider，不读取凭据，不访问模型 ----
+
+fn fixture_snapshot(root: &Path) -> Vec<(Vec<u8>, std::fs::Permissions)> {
+    LIVEPLUG_FILES
+        .iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::metadata(path).unwrap().permissions(),
+            )
+        })
+        .collect()
+}
+
+fn fixture_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let relative = PathBuf::from(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            paths.extend(
+                fixture_paths(&entry.path())
+                    .into_iter()
+                    .map(|path| relative.join(path)),
+            );
+        }
+        paths.push(relative);
+    }
+    paths.sort();
+    paths
+}
+
+fn fixture_hooks(sandbox: &Sandbox) -> Hooks {
+    let root = sandbox.liveplug.path();
+    let mut plugins = PluginSet::default();
+    plugins.plugins.push(Plugin {
+        manifest: read_manifest(root).unwrap(),
+        root: root.to_path_buf(),
+        source: PluginSource::Cli,
+    });
+    Hooks::load(&plugins).unwrap()
+}
+
+fn assert_hook_payload(root: &Path, filename: &str, context: &HookContext) {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".hook-out").join(filename)).unwrap())
+            .unwrap();
+    assert_eq!(payload, serde_json::to_value(context).unwrap());
+}
+
+#[tokio::test]
+async fn liveplug_sandboxes_isolate_hooks_and_cleanup() {
+    let source = liveplug_source();
+    let source_snapshot = fixture_snapshot(&source);
+    let source_paths = fixture_paths(&source);
+    let first = Sandbox::new();
+    let second = Sandbox::new();
+    let first_root = first.liveplug.path().to_path_buf();
+    let second_root = second.liveplug.path().to_path_buf();
+    assert_ne!(first_root, second_root);
+    assert_ne!(first_root, source);
+    assert_ne!(second_root, source);
+    assert_eq!(fixture_snapshot(&first_root), source_snapshot);
+    assert_eq!(fixture_snapshot(&second_root), source_snapshot);
+    assert!(!first_root.join(".hook-out").exists());
+    assert!(!second_root.join(".hook-out").exists());
+
+    // 加载真实 hooks.json 并执行有执行位的真实脚本；Hooks::run 内部使用
+    // ProcessGroupChild（进程组 + kill_on_drop），无模型参与。
+    let first_hooks = fixture_hooks(&first);
+    let second_hooks = fixture_hooks(&second);
+    for (event, filename) in [
+        (HookEvent::SessionStart, "session_start.json"),
+        (HookEvent::PostToolUse, "post_tool_use.json"),
+    ] {
+        let first_context = HookContext::new(event, "FIRST_SANDBOX_31")
+            .with_tool(
+                "shell",
+                Some(serde_json::json!({"command": "echo FIRST_31"})),
+            )
+            .with_working_dir(first.cwd.path());
+        let second_context = HookContext::new(event, "SECOND_SANDBOX_77")
+            .with_tool(
+                "shell",
+                Some(serde_json::json!({"command": "echo SECOND_77"})),
+            )
+            .with_working_dir(second.cwd.path());
+        let (first_decision, second_decision) = tokio::join!(
+            first_hooks.run(&first_context),
+            second_hooks.run(&second_context)
+        );
+        assert_eq!(first_decision, HookDecision::Allow);
+        assert_eq!(second_decision, HookDecision::Allow);
+        // 两边都运行完才检查完整载荷，避免先读后覆盖掩盖串写。
+        assert_hook_payload(&first_root, filename, &first_context);
+        assert_hook_payload(&second_root, filename, &second_context);
+    }
+
+    // 副本也不能通过硬链接共享输入文件。
+    std::fs::write(first_root.join("plugin.json"), "{}").unwrap();
+    assert_eq!(fixture_snapshot(&second_root), source_snapshot);
+    let second_post = std::fs::read(second_root.join(".hook-out/post_tool_use.json")).unwrap();
+    drop(first);
+    assert!(
+        !first_root.exists(),
+        "TempDir 应清理本 Sandbox 的夹具和输出"
+    );
+    assert_eq!(
+        std::fs::read(second_root.join(".hook-out/post_tool_use.json")).unwrap(),
+        second_post,
+        "销毁另一个 Sandbox 不得删除或改写存活 Sandbox 的输出"
+    );
+
+    // 另一个 Sandbox 销毁后，存活副本仍能运行写入 hook 和 guard。
+    let context = HookContext::new(HookEvent::SessionStart, "SECOND_STILL_ALIVE")
+        .with_working_dir(second.cwd.path());
+    assert_eq!(second_hooks.run(&context).await, HookDecision::Allow);
+    assert_hook_payload(&second_root, "session_start.json", &context);
+    let guard_context = HookContext::new(HookEvent::PreToolUse, "SECOND_STILL_ALIVE")
+        .with_tool(
+            "shell",
+            Some(serde_json::json!({"command": "echo forbidden_marker"})),
+        )
+        .with_working_dir(second.cwd.path());
+    assert!(matches!(
+        second_hooks.run(&guard_context).await,
+        HookDecision::Block(reason) if reason.contains("blocked by liveplug guard")
+    ));
+    drop(second);
+    assert!(!second_root.exists());
+    assert_eq!(fixture_snapshot(&source), source_snapshot);
+    assert_eq!(fixture_paths(&source), source_paths, "源码夹具不得新增输出");
+}
+
+#[test]
+fn liveplug_copy_excludes_runtime_outputs() {
+    // 在临时副本模拟旧输出；源码目录（包括已有 .hook-out）始终只读。
+    let source = Sandbox::new();
+    let inputs = fixture_snapshot(source.liveplug.path());
+    let input_paths = fixture_paths(source.liveplug.path());
+    let outputs = [
+        ".hook-out/session_start.json",
+        "run.log",
+        "scripts/debug.log",
+        "dev.instagent/output.json",
+        "skills/secret/.cache/run.txt",
+    ];
+    for relative in outputs {
+        let path = source.liveplug.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "OLD_OUTPUT_19").unwrap();
+    }
+    let destination = TempDir::new().unwrap();
+    copy_liveplug_fixture(source.liveplug.path(), destination.path());
+    assert_eq!(fixture_snapshot(destination.path()), inputs);
+    assert_eq!(fixture_paths(destination.path()), input_paths);
+    for relative in outputs {
+        assert_eq!(
+            std::fs::read_to_string(source.liveplug.path().join(relative)).unwrap(),
+            "OLD_OUTPUT_19",
+            "复制不得清理输入目录中的既有输出"
+        );
+    }
+}
+
 const SHELL_ECHO_MANGO: &str = "用 shell 工具执行命令 echo MANGO_77，并把命令输出原样报告。";
 const REPLY_OK_ONLY: &str = "只回复两个字母 OK，不要输出任何其他内容。";
 
@@ -152,10 +346,9 @@ const REPLY_OK_ONLY: &str = "只回复两个字母 OK，不要输出任何其他
 
 /// a1：`run -t` 最简一轮——回复（stdout）+ `usage:`（stderr）+ `session <id>`（stderr）。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_a1_run_simple_reply() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
 
@@ -173,10 +366,9 @@ async fn live_a1_run_simple_reply() {
 
 /// a2：auto 模式真工具调用——shell 执行 echo，输出链含标记词。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_a2_run_shell_tool() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
 
@@ -192,10 +384,9 @@ async fn live_a2_run_shell_tool() {
 
 /// b1：a2 产生会话后——`sessions list` / jsonl header / `sessions rm`。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_b1_sessions_list_read_rm() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
     let model = live_model();
@@ -238,10 +429,9 @@ async fn live_b1_sessions_list_read_rm() {
 
 /// b2：独立批次记住暗号，`run --resume last` 恢复后读回。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_b2_run_remember_resume() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
 
@@ -272,10 +462,9 @@ async fn live_b2_run_remember_resume() {
 
 /// e1：`INSTAGENT_MODEL` 覆盖 config 里故意写错的模型名（§4.2）。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_e1_env_model_override() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
     sandbox.write_config_yaml(&live_config_yaml("no-such-model-e1", ""));
@@ -295,13 +484,12 @@ async fn live_e1_env_model_override() {
 
 /// d1：command tool——`liveplug__echoer` 回显标记词（工具名拼法 §9.4）。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_d1_plugin_command_tool() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    let plugin = liveplug_fixture().display().to_string();
+    let plugin = sandbox.liveplug.path().display().to_string();
 
     let out = output(sandbox.cmd(&[
         "run",
@@ -321,13 +509,12 @@ async fn live_d1_plugin_command_tool() {
 
 /// d2：PreToolUse guard exit 2 阻止——模型收到 is_error 后继续完成不挂死。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_d2_plugin_hook_blocks_shell() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    let plugin = liveplug_fixture().display().to_string();
+    let plugin = sandbox.liveplug.path().display().to_string();
 
     let out = output(sandbox.cmd(&[
         "run",
@@ -347,15 +534,14 @@ async fn live_d2_plugin_hook_blocks_shell() {
 /// d3：hooks 载荷落盘——标记文件存在且 PostToolUse 载荷含 `tool_name`。
 ///
 /// hooks 环境白名单不含 `PLUGIN_DATA`（src/hooks.rs），01 的脚本落盘
-/// `${PLUGIN_ROOT}/.hook-out/`，即夹具目录下。
+/// `${PLUGIN_ROOT}/.hook-out/`，即当前 Sandbox 的私有夹具目录下。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_d3_plugin_hook_payloads() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    let plugin = liveplug_fixture().display().to_string();
+    let plugin = sandbox.liveplug.path().display().to_string();
 
     let out = output(sandbox.cmd(&[
         "run",
@@ -367,7 +553,7 @@ async fn live_d3_plugin_hook_payloads() {
     .await;
     assert_ok(&out, "d3 hook payloads");
 
-    let hook_out = liveplug_fixture().join(".hook-out");
+    let hook_out = sandbox.liveplug.path().join(".hook-out");
     let session_start = hook_out.join("session_start.json");
     let post_tool_use = hook_out.join("post_tool_use.json");
     assert!(
@@ -377,19 +563,16 @@ async fn live_d3_plugin_hook_payloads() {
     let post = std::fs::read_to_string(&post_tool_use)
         .unwrap_or_else(|e| panic!("PostToolUse 载荷应落盘 {post_tool_use:?}: {e}"));
     assert!(post.contains("tool_name"), "{post}");
-    // 夹具目录保持干净（并发测试会再写，各自脚本自带 mkdir -p）。
-    let _ = std::fs::remove_dir_all(&hook_out);
 }
 
 /// d4：skill——问暗号，模型经 skill 索引 + `load_skill` 回复 KIWI_55（§9.6）。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_d4_plugin_skill() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    let plugin = liveplug_fixture().display().to_string();
+    let plugin = sandbox.liveplug.path().display().to_string();
 
     let out = output(sandbox.cmd(&[
         "run",
@@ -406,13 +589,12 @@ async fn live_d4_plugin_skill() {
 
 /// d5：任务模板展开 `$ARGUMENTS`，回复提及该词（§9.7）。
 #[tokio::test]
+#[ignore = "requires TOKEN_PLAN_API_KEY; run explicitly with --ignored"]
 async fn live_d5_plugin_task_template() {
-    if !has_key() {
-        return;
-    }
+    require_key();
     let sandbox = Sandbox::new();
     sandbox.install_live_provider();
-    let plugin = liveplug_fixture().display().to_string();
+    let plugin = sandbox.liveplug.path().display().to_string();
 
     let out = output(sandbox.cmd(&[
         "run",
