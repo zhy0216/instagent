@@ -163,7 +163,10 @@ pub(crate) fn is_install_internal_dir(name: &std::ffi::OsStr) -> bool {
 /// 同名插件重复 install 即覆盖更新。
 pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<Plugin> {
     let now = crate::message::now_ts();
-    let staging = Staging::new()?;
+    let staging = Staging::for_source(match source {
+        InstallSource::Path(path) => Some(path),
+        InstallSource::GitUrl(_) => None,
+    })?;
     let commit = match source {
         InstallSource::GitUrl(url) => {
             if url.trim().is_empty() {
@@ -466,22 +469,70 @@ mod acquire {
 
 /// manifest/metadata persistence：`.install.json` 的读写（原子私有写入）。
 mod metadata {
+    use std::io::Read;
     use std::path::Path;
 
+    use anyhow::bail;
     use anyhow::Context;
 
     use super::InstallInfo;
     use super::INSTALL_METADATA;
 
+    pub(super) const INSTALL_INFO_MAX_BYTES: u64 = 1024 * 1024;
+
     pub(super) fn read_install_info(dir: &Path) -> crate::Result<InstallInfo> {
+        read_install_info_with_limit(dir, INSTALL_INFO_MAX_BYTES)
+    }
+
+    pub(super) fn read_install_info_with_limit(
+        dir: &Path,
+        limit: u64,
+    ) -> crate::Result<InstallInfo> {
         let path = dir.join(INSTALL_METADATA);
-        let text = std::fs::read_to_string(&path).with_context(|| {
+        let file = std::fs::File::open(&path).with_context(|| {
             format!(
-                "plugin at {} has no {INSTALL_METADATA} and cannot be updated",
-                dir.display()
+                "open install metadata {} (required for update)",
+                path.display()
             )
         })?;
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+        let size = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        read_install_info_from(file, &path, size, limit)
+    }
+
+    // Reader 层仍限制实际字节数，不能只信打开后取得的 metadata 长度。
+    pub(super) fn read_install_info_from(
+        reader: impl Read,
+        path: &Path,
+        size: u64,
+        limit: u64,
+    ) -> crate::Result<InstallInfo> {
+        let too_large = || format!("install metadata {} exceeds {limit} bytes", path.display());
+        if size > limit {
+            bail!(too_large());
+        }
+        let mut bytes = Vec::new();
+        reader
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read install metadata {}", path.display()))?;
+        if bytes.len() as u64 > limit {
+            bail!(too_large());
+        }
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("install metadata {} is not UTF-8", path.display()))?;
+        // serde 的类型错误可能包含输入字符串（例如错误类型的 source）。
+        // 只保留位置，不把原始错误或可能含凭据的正文放入 error chain。
+        serde_json::from_str(text).map_err(|err| {
+            anyhow::anyhow!(
+                "parse install metadata {}: invalid JSON or fields at line {} column {}",
+                path.display(),
+                err.line(),
+                err.column()
+            )
+        })
     }
 
     pub(super) fn write_install_info(dir: &Path, info: &InstallInfo) -> crate::Result<()> {
@@ -498,6 +549,7 @@ mod metadata {
 
 /// staging/copy：staging 目录（同盘 rename 前提）与本地复制树的 symlink 契约。
 mod staging {
+    use std::path::Component;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -525,7 +577,16 @@ mod staging {
 
     impl Staging {
         pub(super) fn new() -> crate::Result<Self> {
-            let parent = agents_dir()?.join(STAGING_DIR_NAME);
+            Self::for_source(None)
+        }
+
+        pub(super) fn for_source(source: Option<&Path>) -> crate::Result<Self> {
+            let parent = resolve_directory(&agents_dir()?.join(STAGING_DIR_NAME))?;
+            if let Some(source) = source {
+                // 检查整个 staging 父目录：重叠源也不能被后续过期清理删除。
+                // 普通 plugins/<name> 与之不重叠，仍允许从已安装目录重装。
+                reject_overlap(source, &parent)?;
+            }
             std::fs::create_dir_all(&parent)?;
             cleanup_stale_staging(&parent, SystemTime::now());
             Ok(Self {
@@ -541,6 +602,55 @@ mod staging {
         pub(super) fn cleanup_ok(&self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// 逐段解析既存目录及 symlink；尚未创建的后缀按目录组件处理。
+    /// 不能先折叠 `..`，否则 `alias/..` 会按链接名而非链接目标计算。
+    fn resolve_directory(path: &Path) -> crate::Result<PathBuf> {
+        let absolute = std::path::absolute(path)?;
+        let mut resolved = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                _ => {
+                    resolved.push(component);
+                    match std::fs::symlink_metadata(&resolved) {
+                        Ok(_) => {
+                            resolved = resolved
+                                .canonicalize()
+                                .with_context(|| format!("resolve directory {}", path.display()))?;
+                            if !resolved.is_dir() {
+                                bail!("not a directory: {}", path.display());
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(err)
+                                .with_context(|| format!("resolve directory {}", path.display()))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub(super) fn reject_overlap(source: &Path, dest: &Path) -> crate::Result<()> {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("resolve plugin source {}", source.display()))?;
+        let dest = resolve_directory(dest)?;
+        if dest.starts_with(&source) || source.starts_with(&dest) {
+            bail!(
+                "plugin source {} overlaps install staging {}; recursive copy is not allowed",
+                source.display(),
+                dest.display()
+            );
+        }
+        Ok(())
     }
 
     impl Drop for Staging {
@@ -580,17 +690,21 @@ mod staging {
     /// 借道指向源树外的文件（如 `~/.ssh`）；非目录非文件的特殊文件（fifo、
     /// socket、设备）同样拒绝。
     pub(super) fn copy_tree(source: &Path, dest: &Path) -> crate::Result<()> {
-        copy_tree_at(source, dest, true)
+        reject_overlap(source, dest)?;
+        copy_tree_at(source, dest, 0)
     }
 
-    fn copy_tree_at(source: &Path, dest: &Path, top_level: bool) -> crate::Result<()> {
+    fn copy_tree_at(source: &Path, dest: &Path, depth: usize) -> crate::Result<()> {
+        // 回归用例只用浅层树；保护失效时也不能递归到平台路径长度错误。
+        #[cfg(test)]
+        assert!(depth <= 8, "recursive copy exceeded test depth budget");
         std::fs::create_dir_all(dest)?;
         for entry in
             std::fs::read_dir(source).with_context(|| format!("read {}", source.display()))?
         {
             let entry = entry?;
             let name = entry.file_name();
-            if name == ".git" || (top_level && name == INSTALL_METADATA) {
+            if name == ".git" || (depth == 0 && name == INSTALL_METADATA) {
                 continue;
             }
             let file_type = entry.file_type()?;
@@ -602,7 +716,7 @@ mod staging {
             }
             let target = dest.join(name);
             if file_type.is_dir() {
-                copy_tree_at(&entry.path(), &target, false)?;
+                copy_tree_at(&entry.path(), &target, depth + 1)?;
             } else if file_type.is_file() {
                 std::fs::copy(entry.path(), &target)?;
             } else {
@@ -928,6 +1042,328 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
         dir
+    }
+
+    // 快照只检查浅层测试树；出现递归 staging 时立即失败，不遍历到平台路径上限。
+    fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                assert!(relative.components().count() <= 8, "unexpected tree depth");
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    snapshot.insert(relative, None);
+                    pending.push(path);
+                } else {
+                    assert!(kind.is_file());
+                    snapshot.insert(relative, Some(std::fs::read(path).unwrap()));
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn sample_install_info() -> InstallInfo {
+        InstallInfo {
+            source: "file:///missing/metadata-test-secret".into(),
+            commit: Some("abc123".into()),
+            installed_at: 1,
+            last_update_check: None,
+            auto_update: true,
+        }
+    }
+
+    #[test]
+    fn local_install_rejects_source_containing_agents_without_changes() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "2.0.0");
+        let agents = src.join("agents");
+        std::env::set_var("INSTAGENT_AGENTS_DIR", &agents);
+        let old = agents.join("plugins/alpha");
+        write_plugin(&old, "alpha", "1.0.0");
+        write_install_info(&old, &sample_install_info()).unwrap();
+        let backup = agents.join("plugins/.replaced-other-recover");
+        write_plugin(&backup, "other", "1.0.0");
+        write_install_info(&backup, &sample_install_info()).unwrap();
+        let stale = agents.join(".tmp-install/stale");
+        write_plugin(&stale, "stale", "1.0.0");
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - STAGING_MAX_AGE * 2)
+            .unwrap();
+        let before = tree_snapshot(&src);
+
+        let err = install(
+            &InstallSource::Path(src.clone()),
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps install staging"),
+            "{err:#}"
+        );
+        assert!(!err.to_string().contains("too long"));
+        assert_eq!(tree_snapshot(&src), before);
+    }
+
+    #[test]
+    fn copy_tree_rejects_equal_ancestor_and_descendant_destinations() {
+        let base = TempDir::new().unwrap();
+        let src = base.path().join("source");
+        write_plugin(&src, "alpha", "1.0.0");
+        let nested = src.join("agents/.tmp-install/stage");
+        std::fs::create_dir_all(&nested).unwrap();
+        let before = tree_snapshot(base.path());
+        for (source, dest) in [(&src, &src), (&src, &nested), (&nested, &src)] {
+            let err = copy_tree(source, dest).unwrap_err();
+            assert!(
+                err.to_string().contains("overlaps install staging"),
+                "{err:#}"
+            );
+            assert_eq!(tree_snapshot(base.path()), before);
+        }
+        let missing = src.join("missing/../new/stage");
+        let err = copy_tree(&src, &missing).unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps install staging"),
+            "{err:#}"
+        );
+        assert_eq!(tree_snapshot(base.path()), before);
+    }
+
+    #[test]
+    fn local_install_rejects_sources_inside_staging_before_cleanup() {
+        let env = isolated();
+        let parent = env.agents.path().join(".tmp-install");
+        let source = parent.join("old-source");
+        write_plugin(&source, "alpha", "1.0.0");
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_modified(SystemTime::now() - STAGING_MAX_AGE * 2)
+            .unwrap();
+        let before = tree_snapshot(env.agents.path());
+        for source in [parent, source] {
+            let err =
+                install(&InstallSource::Path(source), &InstallOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("overlaps install staging"),
+                "{err:#}"
+            );
+            assert_eq!(tree_snapshot(env.agents.path()), before);
+        }
+    }
+
+    #[test]
+    fn local_install_handles_relative_paths_missing_parents_and_reinstall() {
+        let _env = isolated();
+        // 不改变进程 cwd；相对路径夹具由 TempDir 独占并自动清理。
+        let cwd = std::env::current_dir().unwrap();
+        let base = TempDir::new_in(&cwd).unwrap();
+        let relative = base.path().strip_prefix(&cwd).unwrap();
+        let src = relative.join("source");
+        write_plugin(&src, "alpha", "1.0.0");
+        let nested_agents = src.join("missing/../agents");
+        std::env::set_var("INSTAGENT_AGENTS_DIR", &nested_agents);
+        let before = tree_snapshot(base.path());
+        let err = install(
+            &InstallSource::Path(src.clone()),
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps install staging"),
+            "{err:#}"
+        );
+        assert_eq!(tree_snapshot(base.path()), before);
+
+        // 源和安装根是普通兄弟目录，组件名称共有前缀也不算祖先关系。
+        let agents = relative.join("source-agents");
+        std::env::set_var("INSTAGENT_AGENTS_DIR", &agents);
+        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let installed_manifest = std::fs::read(plugin.root.join("plugin.json")).unwrap();
+        // 顶层旧 metadata 不复制；重装从新选项生成 metadata。
+        let reinstalled = install(
+            &InstallSource::Path(plugin.root.clone()),
+            &InstallOptions { auto_update: true },
+        )
+        .unwrap();
+        assert_eq!(reinstalled.root, plugin.root);
+        assert_eq!(
+            std::fs::read(plugin.root.join("plugin.json")).unwrap(),
+            installed_manifest
+        );
+        let info = read_install_info(&plugin.root).unwrap();
+        assert_eq!(info.source, plugin.root.display().to_string());
+        assert!(info.auto_update);
+        assert!(std::fs::read_dir(agents.join(".tmp-install"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_install_resolves_source_and_staging_aliases_before_creation() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        std::fs::create_dir_all(src.join("child")).unwrap();
+        let alias = env.data.path().join("alias");
+        std::os::unix::fs::symlink(src.join("child"), &alias).unwrap();
+        let before = tree_snapshot(&src);
+        for (source, agents) in [
+            (alias.join(".."), src.join("agents")),
+            (src.clone(), alias.join("../agents")),
+        ] {
+            std::env::set_var("INSTAGENT_AGENTS_DIR", &agents);
+            let err =
+                install(&InstallSource::Path(source), &InstallOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("overlaps install staging"),
+                "{err:#}"
+            );
+            assert_eq!(tree_snapshot(&src), before);
+        }
+        // 安装根在外部，但既存 staging 父目录链接回源，也必须拒绝。
+        std::env::set_var("INSTAGENT_AGENTS_DIR", env.agents.path());
+        std::os::unix::fs::symlink(&src, env.agents.path().join(".tmp-install")).unwrap();
+        let err = install(
+            &InstallSource::Path(src.clone()),
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps install staging"),
+            "{err:#}"
+        );
+        assert_eq!(tree_snapshot(&src), before);
+    }
+
+    #[test]
+    fn install_metadata_enforces_small_byte_budget_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let info = sample_install_info();
+        let bytes = serde_json::to_vec(&info).unwrap();
+        std::fs::write(dir.path().join(INSTALL_METADATA), &bytes).unwrap();
+        let limit = bytes.len() as u64;
+        for budget in [limit, limit + 1] {
+            assert_eq!(
+                metadata::read_install_info_with_limit(dir.path(), budget).unwrap(),
+                info
+            );
+        }
+        let err = metadata::read_install_info_with_limit(dir.path(), limit - 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err:#}");
+        assert!(!format!("{err:#}").contains("metadata-test-secret"));
+        assert_eq!(
+            std::fs::read(dir.path().join(INSTALL_METADATA)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn install_metadata_bounds_reads_after_preflight_growth() {
+        use std::io::{Seek, Write};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(INSTALL_METADATA);
+        let bytes = serde_json::to_vec(&sample_install_info()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let size = reader.metadata().unwrap().len();
+        // 在同一打开文件完成预检后确定性增长，不依赖调度竞争。
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b' '; 64])
+            .unwrap();
+        let err = metadata::read_install_info_from(&mut reader, &path, size, size).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err:#}");
+        assert_eq!(reader.stream_position().unwrap(), size + 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size + 64);
+    }
+
+    #[test]
+    fn install_metadata_distinguishes_missing_encoding_and_parse_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(INSTALL_METADATA);
+        let err = read_install_info(dir.path()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(err.to_string().contains(&path.display().to_string()));
+        let secret = "metadata-test-secret";
+        for (bytes, expected) in [
+            (b"\xffmetadata-test-secret".to_vec(), "not UTF-8"),
+            (
+                format!(r#"{{"source":"{secret}","installed_at":"{secret}"}}"#).into_bytes(),
+                "parse install metadata",
+            ),
+            (
+                format!(r#"{{"source":"{secret}""#).into_bytes(),
+                "parse install metadata",
+            ),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let err = read_install_info(dir.path()).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(!message.contains(secret), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn invalid_install_metadata_preserves_update_list_and_backup_behavior() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let backup = env.agents.path().join("plugins/.replaced-other-recover");
+        write_plugin(&backup, "other", "1.0.0");
+        write_install_info(&backup, &sample_install_info()).unwrap();
+        let path = plugin.root.join(INSTALL_METADATA);
+        let mut bytes = serde_json::to_vec(&sample_install_info()).unwrap();
+        bytes.resize(metadata::INSTALL_INFO_MAX_BYTES as usize, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            read_install_info(&plugin.root).unwrap(),
+            sample_install_info()
+        );
+        bytes.push(b' ');
+        for (bytes, expected) in [
+            (bytes, "exceeds 1048576 bytes"),
+            (b"\xffmetadata-test-secret".to_vec(), "not UTF-8"),
+            (
+                br#"{"source":"metadata-test-secret""#.to_vec(),
+                "parse install metadata",
+            ),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let before = tree_snapshot(env.agents.path());
+            let err = update("alpha").unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(!message.contains("metadata-test-secret"), "{message}");
+            assert!(metadata::mark_last_update_check(&plugin.root, 100).is_err());
+            assert!(auto_update_all(AUTO_UPDATE_INTERVAL_SECS * 2)
+                .unwrap()
+                .is_empty());
+            let items = list(env.agents.path()).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].plugin.manifest.name, "alpha");
+            assert!(items[0].install_info.is_none());
+            assert!(show(env.agents.path(), "alpha")
+                .unwrap()
+                .install_info
+                .is_none());
+            assert_eq!(tree_snapshot(env.agents.path()), before);
+        }
     }
 
     #[test]
@@ -1497,16 +1933,43 @@ mod tests {
         let src = env.data.path().join("linksrc");
         write_plugin(&src, "alpha", "1.0.0");
         std::fs::create_dir_all(src.join("skills")).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", src.join("escape")).unwrap();
-        std::os::unix::fs::symlink("/tmp", src.join("skills/dirlink")).unwrap();
+        let file = env.config.path().join("external");
+        std::fs::write(&file, b"external").unwrap();
+        for (target, link) in [
+            (file.as_path(), src.join("filelink")),
+            (env.config.path(), src.join("dirlink")),
+            (file.as_path(), src.join("skills/filelink")),
+            (env.config.path(), src.join("skills/dirlink")),
+        ] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let err = install(
+                &InstallSource::Path(src.clone()),
+                &InstallOptions::default(),
+            )
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("symlink"), "{message}");
+            assert!(message.contains(&link.display().to_string()), "{message}");
+            assert!(
+                !env.agents.path().join("plugins").join("alpha").exists(),
+                "rejected install must not create the target"
+            );
+            std::fs::remove_file(link).unwrap();
+        }
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_rejects_special_files() {
+        let env = isolated();
+        let src = local_plugin(&env, "alpha", "1.0.0");
+        let socket = src.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let err = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("symlink"), "{message}");
-        assert!(
-            !env.agents.path().join("plugins").join("alpha").exists(),
-            "rejected install must not create the target"
-        );
+        assert!(message.contains("non-regular file"), "{message}");
+        assert!(message.contains(&socket.display().to_string()), "{message}");
+        assert!(!env.agents.path().join("plugins/alpha").exists());
     }
 
     // ---- fake git：超时 / 取消 / 输出洪泛 / 失败回显 的进程组回收 ----
