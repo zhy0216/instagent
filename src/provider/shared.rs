@@ -107,8 +107,8 @@ fn engine_kind_name(kind: EngineKind) -> &'static str {
     }
 }
 
-/// 共享构造骨架：校验 engine 种类与 base_url、按 `api_key_env` 读密钥、
-/// 按 `timeout_seconds` 建 client。
+/// 共享构造骨架：校验 engine 种类与 base_url、按 `api_key_env` 读非空白密钥、
+/// 按 `timeout_seconds` 建 client。合法密钥保留原值，未声明变量则支持无密钥。
 pub fn engine_parts(def: &ProviderDef, kind: EngineKind) -> crate::Result<(String, HttpClient)> {
     anyhow::ensure!(
         def.engine == kind,
@@ -123,7 +123,10 @@ pub fn engine_parts(def: &ProviderDef, kind: EngineKind) -> crate::Result<(Strin
     );
     let api_key = match def.api_key_env.as_deref() {
         Some(var) => std::env::var(var)
-            .with_context(|| format!("provider {} requires env var {var}", def.name))?,
+            // VarError::NotUnicode 携带原始值，不能保留在诊断错误链中。
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .with_context(|| format!("provider {} requires non-blank env var {var}", def.name))?,
         None => String::new(),
     };
     let timeout = Duration::from_secs(

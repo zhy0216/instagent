@@ -698,6 +698,38 @@ mod tests {
         tu::mount_once(server, "/v1/chat/completions", response).await;
     }
 
+    /// 只在同步构造作用域持锁；退出（含 panic）时恢复专用测试变量。
+    struct ApiKeyEnv {
+        previous: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ApiKeyEnv {
+        const VAR: &str = "INSTAGENT_TEST_REQUIRED_PROVIDER_API_KEY";
+
+        fn new(value: Option<&std::ffi::OsStr>) -> Self {
+            let guard = crate::config::lock_env();
+            let env = Self {
+                previous: std::env::var_os(Self::VAR),
+                _guard: guard,
+            };
+            match value {
+                Some(value) => std::env::set_var(Self::VAR, value),
+                None => std::env::remove_var(Self::VAR),
+            }
+            env
+        }
+    }
+
+    impl Drop for ApiKeyEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(Self::VAR, value),
+                None => std::env::remove_var(Self::VAR),
+            }
+        }
+    }
+
     // ---- 怪癖 1~4：请求侧格式化 ----
 
     #[test]
@@ -1560,11 +1592,13 @@ mod tests {
     async fn wiremock_no_key_omits_authorization() {
         let server = MockServer::start().await;
         mount_once(&server, sse_body("data: [DONE]\n\n")).await;
-        let provider = provider_at(&format!("{}/v1", server.uri()), "");
+        let provider = OpenAiProvider::new(&def(Some(&format!("{}/v1", server.uri())))).unwrap();
+        assert!(provider.api_key.is_empty());
         let messages = vec![Message::user_text("hi".into())];
         let mut stream = provider.stream(request(&messages, &[])).await.unwrap();
         collect(&mut stream).await.unwrap();
         let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
         assert!(!received[0].headers.contains_key("authorization"));
     }
 
@@ -1734,7 +1768,7 @@ mod tests {
     // ---- 构造函数 ----
 
     #[test]
-    fn new_validates_engine_base_url_and_reads_env_key() {
+    fn new_validates_engine_and_base_url() {
         let mut proxy = def(Some("https://x.invalid/v1"));
         proxy.engine = EngineKind::Proxy;
         assert!(OpenAiProvider::new(&proxy)
@@ -1745,27 +1779,132 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing base_url"));
+    }
 
-        const VAR: &str = "INSTAGENT_TEST_09_API_KEY";
-        std::env::remove_var(VAR);
+    #[tokio::test]
+    async fn required_env_key_rejects_missing_and_blank_without_http() {
+        let server = MockServer::start().await;
+        let mut with_key = def(Some(&format!("{}/v1", server.uri())));
+        with_key.api_key_env = Some(ApiKeyEnv::VAR.to_string());
+
+        let cases = [
+            Some(""),
+            None,
+            Some(" "),
+            Some("\t"),
+            Some("\r\n"),
+            Some(" \t\r\n\u{000b}\u{000c}"),
+            Some("\u{00a0}\u{2003}\u{3000}"),
+        ];
+        for value in cases {
+            let err = {
+                let _env = ApiKeyEnv::new(value.map(std::ffi::OsStr::new));
+                OpenAiProvider::new(&with_key).unwrap_err()
+            };
+            let expected = format!(
+                "provider test-openai requires non-blank env var {}",
+                ApiKeyEnv::VAR
+            );
+            assert_eq!(err.to_string(), expected);
+            assert_eq!(format!("{err:#}"), expected);
+            assert!(format!("{err:?}").starts_with(&expected));
+            assert_eq!(err.chain().count(), 1);
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_env_key_non_unicode_error_does_not_expose_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let value = std::ffi::OsStr::from_bytes(b"sk-invalid-utf8-secret\xff");
+        let _env = ApiKeyEnv::new(Some(value));
         let mut with_key = def(Some("https://x.invalid/v1"));
-        with_key.api_key_env = Some(VAR.to_string());
-        // 契约（ADR 0003 D1）：声明了 api_key_env 而环境变量未设置 → 构造失败，
-        // 错误带 provider 名与变量名，且不含任何密钥值。
-        let err = OpenAiProvider::new(&with_key).unwrap_err().to_string();
-        assert!(err.contains("test-openai"), "{err}");
-        assert!(err.contains(VAR), "{err}");
+        with_key.api_key_env = Some(ApiKeyEnv::VAR.to_string());
+        let err = OpenAiProvider::new(&with_key).unwrap_err();
+        let expected = format!(
+            "provider test-openai requires non-blank env var {}",
+            ApiKeyEnv::VAR
+        );
+        assert_eq!(format!("{err:#}"), expected);
+        let debug = format!("{err:?}");
+        assert!(debug.starts_with(&expected));
+        assert!(!debug.contains("sk-invalid-utf8-secret"));
+        assert_eq!(err.chain().count(), 1);
+    }
 
-        std::env::set_var(VAR, "sk-from-env");
+    #[test]
+    fn required_env_key_preserves_nonblank_value() {
+        const KEY: &str = " \tsk-required-provider-secret\t ";
+        let _env = ApiKeyEnv::new(Some(std::ffi::OsStr::new(KEY)));
+        let mut with_key = def(Some("https://x.invalid/v1"));
+        with_key.api_key_env = Some(ApiKeyEnv::VAR.to_string());
         let provider = OpenAiProvider::new(&with_key).unwrap();
-        std::env::remove_var(VAR);
-        assert_eq!(provider.api_key, "sk-from-env");
+        assert_eq!(provider.api_key, KEY);
         assert_eq!(provider.name(), "test-openai");
+        assert_eq!(
+            provider.request_headers()["authorization"],
+            format!("Bearer {KEY}")
+        );
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("sk-required-provider-secret"));
+    }
 
-        // 无 api_key_env：空密钥，不发 Authorization。
-        let keyless = OpenAiProvider::new(&def(Some("http://localhost:11434/v1"))).unwrap();
-        assert!(keyless.api_key.is_empty());
-        assert!(!keyless.request_headers().contains_key("authorization"));
+    #[tokio::test]
+    async fn required_env_key_authenticates_without_leaking_into_body_debug_or_errors() {
+        // 不依赖 sk- 前缀；密钥只来自声明的环境变量，覆盖同名自定义鉴权头。
+        const KEY: &str = "required-provider-test-secret";
+        let server = MockServer::start().await;
+        mount_once(&server, sse_body("data: [DONE]\n\n")).await;
+        let provider = {
+            let _env = ApiKeyEnv::new(Some(std::ffi::OsStr::new(KEY)));
+            let mut with_key = def(Some(&format!("{}/v1", server.uri())));
+            with_key.api_key_env = Some(ApiKeyEnv::VAR.to_string());
+            with_key
+                .headers
+                .insert("authorization".into(), "Bearer overridden-test-key".into());
+            OpenAiProvider::new(&with_key).unwrap()
+        };
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(KEY));
+
+        let messages = vec![Message::user_text("hi".into())];
+        let mut stream = provider.stream(request(&messages, &[])).await.unwrap();
+        collect(&mut stream).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].headers["authorization"],
+            format!("Bearer {KEY}")
+        );
+        assert!(!received[0].url.as_str().contains(KEY));
+        assert!(!String::from_utf8_lossy(&received[0].body).contains(KEY));
+        for (name, value) in &received[0].headers {
+            if name != "authorization" {
+                assert!(!value.to_str().unwrap().contains(KEY));
+            }
+        }
+
+        server.reset().await;
+        mount_once(
+            &server,
+            ResponseTemplate::new(401).set_body_string(format!("Authorization: Bearer {KEY}")),
+        )
+        .await;
+        let err = provider
+            .stream(request(&messages, &[]))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ProviderError::Auth));
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains(KEY));
+            assert!(!rendered.to_ascii_lowercase().contains("authorization"));
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

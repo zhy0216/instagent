@@ -21,7 +21,7 @@ default_agent: codex
 | [05-plugin-input-limits.md](done/05-plugin-input-limits.md) | P2 | hard | codex（inherit） | gpt-6-astra / max | 已完成：四类组件文件实际有界读取与来源诊断 |
 | [06-local-install-integrity.md](done/06-local-install-integrity.md) | P1 | medium | codex（inherit） | gpt-6-astra / xhigh | 已完成：拒绝安装源/staging 重叠；限制安装元数据 |
 | [07-template-input-budget.md](07-template-input-budget.md) | P2 | hard | codex（inherit） | gpt-6-astra / max | 模板展开前预算与 CLI 终态回归 |
-| [08-provider-required-key.md](08-provider-required-key.md) | P2 | medium | codex（inherit） | gpt-6-astra / xhigh | 显式必需凭据拒绝空串与空白 |
+| [08-provider-required-key.md](done/08-provider-required-key.md) | P2 | medium | codex（inherit） | gpt-6-astra / xhigh | 已完成：显式必需凭据拒绝空串与空白；构造诊断不泄露原值 |
 | [09-live-test-isolation.md](09-live-test-isolation.md) | P1 | medium | codex（inherit） | gpt-6-astra / xhigh | live 显式 opt-in、每测试独占插件夹具 |
 | [10-docs-and-validation.md](10-docs-and-validation.md) | P2 | medium | codex（inherit） | gpt-6-astra / xhigh | 集成后同步用户契约和完整验证记录 |
 
@@ -36,7 +36,7 @@ default_agent: codex
 5. [05-plugin-input-limits.md](done/05-plugin-input-limits.md) — 已完成。依赖：无。
 6. [06-local-install-integrity.md](done/06-local-install-integrity.md) — 已完成。依赖：无。
 7. [07-template-input-budget.md](07-template-input-budget.md) — 待执行。依赖：无。
-8. [08-provider-required-key.md](08-provider-required-key.md) — 待执行。依赖：无。
+8. [08-provider-required-key.md](done/08-provider-required-key.md) — 已完成并归档，离线校验通过。依赖：无。
 9. [09-live-test-isolation.md](09-live-test-isolation.md) — 待执行。依赖：无。
 10. [10-docs-and-validation.md](10-docs-and-validation.md) — 待执行。
     依赖 01-agent-completion、02-compaction-integrity、03-file-tool-io、04-session-write-budgets、05-plugin-input-limits、06-local-install-integrity、07-template-input-budget、08-provider-required-key、09-live-test-isolation。
