@@ -1,4 +1,4 @@
-//! 会话 IO 恢复集成测试（todo 02：S01–S04 端到端验收）。
+//! 会话 IO 恢复集成测试（读取、写入预算与失败后恢复的端到端验收）。
 //!
 //! 只用公开 API（`Session` / `Message` / `Content`），临时目录 +
 //! `INSTAGENT_DATA_DIR` 隔离；文件内串行（静态锁），不碰真实目录、不改
@@ -80,6 +80,107 @@ fn hand_session(sandbox: &Sandbox, id: &str) -> Session {
         messages: Vec::new(),
         path,
     }
+}
+
+fn snapshot_files(sandbox: &Sandbox) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fs::read_dir(sandbox.sessions_dir())
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let raw = fs::read(&path).unwrap();
+            (path, raw)
+        })
+        .collect()
+}
+
+#[test]
+fn default_header_write_budget_rejects_create_and_rewrite_then_allows_retry() {
+    let sandbox = Sandbox::new();
+    // 11 KiB 的 NUL 文本经 JSON 转义成为 66 KiB，超过默认 64 KiB header。
+    let oversized = format!("private-budget-marker{}", "\0".repeat(11 * 1024));
+    let err = Session::create(sandbox.dir.path(), &oversized, "m").unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("line 1") && err.contains("budget"), "{err}");
+    assert!(!err.contains("private-budget-marker"), "{err}");
+    assert!(Session::list().unwrap().is_empty());
+
+    let mut session = Session::create(sandbox.dir.path(), "p", "m").unwrap();
+    session.append(user("old")).unwrap();
+    session.rewrite(vec![user("kept")]).unwrap();
+    let old_header = session.header.clone();
+    let old_messages = session.messages.clone();
+    let before = snapshot_files(&sandbox);
+    session.header.provider = oversized;
+    let err = session.rewrite(vec![user("rejected")]).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("line 1") && err.contains("budget"), "{err}");
+    assert!(!err.contains("private-budget-marker"), "{err}");
+    assert_eq!(snapshot_files(&sandbox), before);
+    assert_eq!(session.messages, old_messages);
+    let resumed = Session::resume(&session.header.id).unwrap();
+    assert_eq!(resumed.header, old_header);
+    assert_eq!(resumed.messages, old_messages);
+
+    session.header = old_header;
+    session.rewrite(vec![user("retry")]).unwrap();
+    session.append(assistant("ok")).unwrap();
+    let resumed = Session::resume(&session.header.id).unwrap();
+    assert_eq!(resumed.header, session.header);
+    assert_eq!(resumed.messages, session.messages);
+}
+
+#[test]
+fn create_append_batch_rewrite_and_append_round_trip_escaped_utf8() {
+    let sandbox = Sandbox::new();
+    let text = "文本😀\"\\\n\r\t\0";
+    let mut session = Session::create(sandbox.dir.path(), "provider-文本", "m").unwrap();
+    session.append(user(text)).unwrap();
+    session
+        .append_batch(vec![
+            Message::assistant(
+                vec![Content::ToolUse {
+                    id: "call".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": text}),
+                }],
+                None,
+            ),
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    tool_use_id: "call".into(),
+                    content: text.into(),
+                    is_error: false,
+                }],
+                ts: 2,
+                usage: None,
+            },
+            assistant(text),
+        ])
+        .unwrap();
+    let old_raw = fs::read(&session.path).unwrap();
+    session = Session::resume(&session.header.id).unwrap();
+    assert_eq!(fs::read(&session.path).unwrap(), old_raw);
+    assert_eq!(session.messages.len(), 4);
+    assert_eq!(text_of(&session.messages[0]), text);
+
+    session
+        .rewrite(vec![user(text), assistant("summary accepted")])
+        .unwrap();
+    let backup = fs::read_dir(sandbox.sessions_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(".bak.jsonl"))
+        .unwrap();
+    assert_eq!(fs::read(backup).unwrap(), old_raw);
+    session
+        .append_batch(vec![user(text), assistant(text)])
+        .unwrap();
+    let before = snapshot_files(&sandbox);
+    let resumed = Session::resume(&session.header.id).unwrap();
+    assert_eq!(resumed.header, session.header);
+    assert_eq!(resumed.messages, session.messages);
+    assert_eq!(snapshot_files(&sandbox), before);
 }
 
 // T1：含假密钥的 header 错误只带路径/行号/约束，不回显原文。

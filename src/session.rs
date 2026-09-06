@@ -18,6 +18,9 @@
 //!   `DEFAULT_LIMITS`），超行/总预算即拒绝打开，原文件字节保持原状，不借
 //!   salvage 删除超预算内容；错误只带路径 / 行号 / 约束，不回显行原文
 //!   （假密钥不进 stderr）。
+//! - 写入共享恢复预算：按序列化 JSON UTF-8 字节计数，行预算不含换行，
+//!   总预算包含换行及追加前的实际文件长度；超限不提交、不裁剪历史，也不
+//!   改动可用备份。拒绝会话写入不代表已执行工具的外部副作用被回滚。
 //! - resume salvage（S02）：正文坏 UTF-8 / 坏 JSON / 违反不变量的尾部保留合法
 //!   前缀并**物理写回**主 JSONL；有效最后一行缺换行同样规范化写回，保证之后
 //!   的 append 不粘连；header 损坏仍明确报错、不 salvage。
@@ -66,7 +69,8 @@ const TMP_SUFFIX: &str = ".jsonl.tmp";
 /// 每个会话最多保留的 `.bak.jsonl` 份数（R10：备份有界）。
 const MAX_BACKUPS: usize = 5;
 
-/// 读取预算（plan §预算默认）。测试可注入小值避免制造百 MB fixture。
+/// 读写共用预算（plan §预算默认）。行预算不含换行，总预算包含换行。
+/// 测试可注入小值避免制造百 MB fixture；公开入口始终使用默认值。
 #[derive(Clone, Copy, Debug)]
 struct ReadLimits {
     header_bytes: usize,
@@ -126,8 +130,6 @@ impl Session {
     /// 新建会话（uuid v4，写 header 行）。sessions 目录 0700、文件 0600
     /// （unix）；header 落盘 sync。
     pub fn create(cwd: &Path, provider: &str, model: &str) -> crate::Result<Session> {
-        let dir = Self::sessions_dir()?;
-        ensure_sessions_dir(&dir)?;
         let header = SessionHeader {
             id: Uuid::new_v4().to_string(),
             created: crate::message::now_ts(),
@@ -135,17 +137,7 @@ impl Session {
             provider: provider.to_string(),
             model: model.to_string(),
         };
-        let path = session_path(&dir, &header.id)?;
-        let mut file = create_private(&path)
-            .with_context(|| format!("create session file {}", path.display()))?;
-        writeln!(file, "{}", serde_json::to_string(&header)?)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(Session {
-            header,
-            messages: Vec::new(),
-            path,
-        })
+        create_with_limits(header, DEFAULT_LIMITS)
     }
 
     /// 全量读回（默认预算 `DEFAULT_LIMITS`）。id 先过
@@ -210,23 +202,31 @@ impl Session {
     /// 成批追加消息（供一次性提交 assistant + tool results；S03）。
     ///
     /// 步骤：预序列化全部新消息（失败 → 零落盘、内存不变）→ 扩展候选历史并
-    /// 经 `message::validate_for_append` 统一校验核心 → 记录原文件长度后逐行
-    /// 追加 + flush。校验失败 → 零落盘；检测到的写 / flush 失败 → 文件回退到
-    /// 原长度且内存保持旧状态；回退也失败 → 错误明确要求重新恢复（再 resume
-    /// 走 salvage），不报成功。错误只带会话 id / 消息索引 / 约束，不回显消息
+    /// 经 `message::validate_for_append` 统一校验核心 → 记录原文件长度并校验
+    /// 总预算后逐行追加 + flush。校验失败 → 零落盘；检测到的写 / flush 失败
+    /// → 文件回退到原长度且内存保持旧状态；回退也失败 → 错误明确要求重新
+    /// 恢复（再 resume 走 salvage），不报成功。错误只带会话 id / 消息索引 / 约束，不回显消息
     /// 原文。只承诺已检测 IO 错误的回退，不宣称主机掉电时的事务原子性。
     pub fn append_batch(&mut self, messages: Vec<Message>) -> crate::Result<()> {
+        self.append_batch_with_limits(messages, DEFAULT_LIMITS)
+    }
+
+    fn append_batch_with_limits(
+        &mut self,
+        messages: Vec<Message>,
+        limits: ReadLimits,
+    ) -> crate::Result<()> {
         let start = self.messages.len();
         let mut lines = Vec::with_capacity(messages.len());
+        let mut batch_bytes = 0;
         for (offset, message) in messages.iter().enumerate() {
-            let line = serde_json::to_string(message).with_context(|| {
-                format!(
-                    "serialize message {} for session {}",
-                    start + offset,
-                    self.header.id
-                )
-            })?;
-            lines.push(line);
+            lines.push(serialize_line(
+                message,
+                &self.path,
+                start + offset + 2,
+                limits,
+                &mut batch_bytes,
+            )?);
         }
         if lines.is_empty() {
             return Ok(());
@@ -239,7 +239,7 @@ impl Session {
                     self.header.id
                 )
             })
-            .and_then(|()| append_lines(&self.path, &lines));
+            .and_then(|()| append_lines(&self.path, &lines, batch_bytes, limits));
         if committed.is_err() {
             self.messages.truncate(start);
         }
@@ -270,12 +270,85 @@ impl Session {
     /// 压缩用原子重写（`16` 调用）：委托 `atomic_replace`（私有临时文件 +
     /// sync + 时间戳备份 + rename + 失败清理 + 父目录同步）。
     pub fn rewrite(&mut self, messages: Vec<Message>) -> crate::Result<()> {
+        self.rewrite_with_limits(messages, DEFAULT_LIMITS)
+    }
+
+    fn rewrite_with_limits(
+        &mut self,
+        messages: Vec<Message>,
+        limits: ReadLimits,
+    ) -> crate::Result<()> {
         message::validate(&messages)
             .with_context(|| format!("validate rewritten session {}", self.header.id))?;
-        atomic_replace(&self.path, &self.header, &messages)?;
+        atomic_replace(&self.path, &self.header, &messages, limits)?;
         self.messages = messages;
         Ok(())
     }
+}
+
+/// 先序列化并验证 header，再创建主文件；写入失败时清理本次新会话。
+fn create_with_limits(header: SessionHeader, limits: ReadLimits) -> crate::Result<Session> {
+    let dir = Session::sessions_dir()?;
+    let path = session_path(&dir, &header.id)?;
+    let mut total = 0;
+    let line = serialize_line(&header, &path, 1, limits, &mut total)?;
+    ensure_sessions_dir(&dir)?;
+    let mut file =
+        create_private(&path).with_context(|| format!("create session file {}", path.display()))?;
+    let written = writeln!(file, "{line}")
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    if let Err(err) = written {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(err).with_context(|| format!("write new session file {}", path.display()));
+    }
+    Ok(Session {
+        header,
+        messages: Vec::new(),
+        path,
+    })
+}
+
+/// 累计的是实际文件字节（包括每行末尾的 LF）；溢出与超限同样拒绝。
+fn checked_write_total(total: u64, added: u64, path: &Path, budget: u64) -> crate::Result<u64> {
+    total
+        .checked_add(added)
+        .filter(|&bytes| bytes <= budget)
+        .with_context(|| {
+            format!(
+                "session file {} exceeds the {budget}-byte total write budget; refusing to write",
+                path.display()
+            )
+        })
+}
+
+/// 只保留已通过预算校验的 JSON 行；不使用 Message 文本长度估算转义开销。
+fn serialize_line<T: Serialize>(
+    value: &T,
+    path: &Path,
+    num: usize,
+    limits: ReadLimits,
+    total: &mut u64,
+) -> crate::Result<String> {
+    let line = serde_json::to_string(value)
+        .with_context(|| format!("serialize line {num} of session {}", path.display()))?;
+    let budget = if num == 1 {
+        limits.header_bytes
+    } else {
+        limits.line_bytes
+    };
+    if line.len() > budget {
+        bail!(
+            "line {num} of {} exceeds the {budget}-byte line budget; refusing to write",
+            path.display()
+        );
+    }
+    let bytes = u64::try_from(line.len())?
+        .checked_add(1)
+        .context("session line byte count overflow; refusing to write")?;
+    *total = checked_write_total(*total, bytes, path, limits.total_bytes)?;
+    Ok(line)
 }
 
 /// session id 安全文件名白名单（S1 / ADR 0003 D6）：只允许 UUID 形态的字符
@@ -428,20 +501,20 @@ fn resume_with_limits(id: &str, limits: ReadLimits) -> crate::Result<Session> {
     let (messages, dropped, unterminated) =
         salvage_body(&mut reader, limits, &mut read_total, &path)?;
     if dropped > 0 {
+        atomic_replace(&path, &header, &messages, limits)
+            .with_context(|| format!("repair salvaged session {}", path.display()))?;
         eprintln!(
             "warning: session {}: dropped {dropped} unrecoverable line(s), kept {} message(s)",
             path.display(),
             messages.len()
         );
-        atomic_replace(&path, &header, &messages)
-            .with_context(|| format!("repair salvaged session {}", path.display()))?;
     } else if !header_terminated || unterminated {
+        atomic_replace(&path, &header, &messages, limits)
+            .with_context(|| format!("repair salvaged session {}", path.display()))?;
         eprintln!(
             "warning: session {}: normalized missing trailing newline before further appends",
             path.display()
         );
-        atomic_replace(&path, &header, &messages)
-            .with_context(|| format!("repair salvaged session {}", path.display()))?;
     }
     Ok(Session {
         header,
@@ -638,8 +711,13 @@ fn write_batch_to<T: AppendTarget>(
 }
 
 /// 把预序列化行追加到主文件：拒绝 symlink（与读取路径同一判定）；记录原长
-/// 度；检测到的写 / flush 失败回退文件长度。
-fn append_lines(path: &Path, lines: &[String]) -> crate::Result<()> {
+/// 度并校验已有文件加本批次的总预算；检测到的写 / flush 失败回退文件长度。
+fn append_lines(
+    path: &Path,
+    lines: &[String],
+    batch_bytes: u64,
+    limits: ReadLimits,
+) -> crate::Result<()> {
     let meta = fs::symlink_metadata(path)
         .with_context(|| format!("open session file for append {}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -648,28 +726,37 @@ fn append_lines(path: &Path, lines: &[String]) -> crate::Result<()> {
             path.display()
         );
     }
-    let old_len = meta.len();
     let mut file = OpenOptions::new()
         .append(true)
         .open(path)
         .with_context(|| format!("open session file for append {}", path.display()))?;
+    let old_len = file
+        .metadata()
+        .with_context(|| format!("stat session file for append {}", path.display()))?
+        .len();
+    checked_write_total(old_len, batch_bytes, path, limits.total_bytes)?;
     write_batch_to(&mut file, old_len, lines)
         .with_context(|| format!("append to session file {}", path.display()))
 }
 
 /// 原子重写主 JSONL（rewrite 与 salvage 修复共用）：header+消息写随机后缀
-/// 私有临时文件（flush + sync_all），临时文件创建后任意写 / flush / sync 失败
-/// 都清理临时文件；旧主文件复制为带时间戳备份（从创建起 0600，best-effort，
-/// 失败只警告）；rename 覆盖主文件，失败清理临时文件并报错；成功后尽力同步
-/// 父目录（unix，best-effort）。
-fn atomic_replace(path: &Path, header: &SessionHeader, messages: &[Message]) -> crate::Result<()> {
+/// 私有临时文件（flush + sync_all），临时文件创建后任意预算 / 写 / flush / sync
+/// 失败都清理临时文件，不触碰主文件与备份。全部通过后才复制旧主文件为带
+/// 时间戳备份（从创建起 0600，best-effort，失败只警告）；rename 覆盖主文件，
+/// 失败清理临时文件并报错；成功后尽力同步父目录（unix，best-effort）。
+fn atomic_replace(
+    path: &Path,
+    header: &SessionHeader,
+    messages: &[Message],
+    limits: ReadLimits,
+) -> crate::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("session");
     let tmp_path = dir.join(format!("{stem}.{}{TMP_SUFFIX}", Uuid::new_v4()));
-    if let Err(err) = write_replacement(&tmp_path, header, messages) {
+    if let Err(err) = write_replacement(&tmp_path, header, messages, limits) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err).with_context(|| format!("write temp session file {}", tmp_path.display()));
     }
@@ -700,12 +787,16 @@ fn write_replacement(
     tmp_path: &Path,
     header: &SessionHeader,
     messages: &[Message],
+    limits: ReadLimits,
 ) -> crate::Result<()> {
+    let mut total = 0;
+    let line = serialize_line(header, tmp_path, 1, limits, &mut total)?;
     let mut file = create_private(tmp_path)
         .with_context(|| format!("create temp file {}", tmp_path.display()))?;
-    writeln!(file, "{}", serde_json::to_string(header)?)?;
-    for message in messages {
-        writeln!(file, "{}", serde_json::to_string(message)?)?;
+    writeln!(file, "{line}")?;
+    for (index, message) in messages.iter().enumerate() {
+        let line = serialize_line(message, tmp_path, index + 2, limits, &mut total)?;
+        writeln!(file, "{line}")?;
     }
     file.flush()?;
     file.sync_all()?;
@@ -901,6 +992,394 @@ mod tests {
             line_bytes: line,
             total_bytes: total,
         }
+    }
+
+    const BUDGET_TEXT: &str = "budget-private-文本😀\"\\\n\u{0000}";
+
+    fn snapshot_files(dir: &tempfile::TempDir) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fs::read_dir(dir.path().join(SESSIONS_SUBDIR))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn exact_limits(header: &SessionHeader, messages: &[Message]) -> ReadLimits {
+        let header_bytes = serde_json::to_vec(header).unwrap().len();
+        let lengths: Vec<usize> = messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .collect();
+        limits(
+            header_bytes,
+            lengths.iter().copied().max().unwrap_or(0),
+            (header_bytes + 1 + lengths.iter().map(|len| len + 1).sum::<usize>()) as u64,
+        )
+    }
+
+    fn assert_budget_error(err: anyhow::Error, constraint: &str) {
+        let err = format!("{err:#}");
+        assert!(err.contains("budget"), "{err}");
+        assert!(err.contains(constraint), "{err}");
+        assert!(!err.contains("budget-private"), "{err}");
+        assert!(!err.contains(BUDGET_TEXT), "{err}");
+        assert!(err.len() < 2000, "{err}");
+    }
+
+    #[test]
+    fn create_checks_exact_header_and_total_budgets_before_creating_file() {
+        let (dir, _guard) = temp_data_dir();
+        let header = SessionHeader {
+            id: "create-budget".into(),
+            created: 1,
+            cwd: dir.path().to_path_buf(),
+            provider: BUDGET_TEXT.into(),
+            model: "m".into(),
+        };
+        let exact = exact_limits(&header, &[]);
+        let path = session_path(&dir.path().join(SESSIONS_SUBDIR), &header.id).unwrap();
+        for (over, constraint) in [
+            (
+                ReadLimits {
+                    header_bytes: exact.header_bytes - 1,
+                    ..exact
+                },
+                "line 1",
+            ),
+            (
+                ReadLimits {
+                    total_bytes: exact.total_bytes - 1,
+                    ..exact
+                },
+                "total",
+            ),
+        ] {
+            assert_budget_error(
+                create_with_limits(header.clone(), over).unwrap_err(),
+                constraint,
+            );
+            assert!(
+                !path.exists(),
+                "a rejected create must leave no session file"
+            );
+            assert!(Session::list().unwrap().is_empty());
+
+            // header 刚好到行限额；单独的 LF 仍占总预算的一字节。
+            let session = create_with_limits(header.clone(), exact).unwrap();
+            assert_eq!(fs::read(&path).unwrap().len() as u64, exact.total_bytes);
+            assert_eq!(
+                resume_with_limits(&header.id, exact).unwrap().header,
+                header
+            );
+            assert_eq!(Session::resume(&header.id).unwrap().header, header);
+            assert!(session.messages.is_empty());
+            Session::remove(&header.id).unwrap();
+            assert!(snapshot_files(&dir).is_empty());
+        }
+    }
+
+    #[test]
+    fn append_checks_serialized_lines_and_total_before_committing_any_of_the_batch() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        session.append(msg(Role::User, "old")).unwrap();
+        let batch = vec![msg(Role::Assistant, "ok"), msg(Role::User, BUDGET_TEXT)];
+        let mut candidate = session.messages.clone();
+        candidate.extend(batch.clone());
+        let exact = exact_limits(&session.header, &candidate);
+        let before = snapshot_files(&dir);
+        let old_messages = session.messages.clone();
+        for (over, constraint) in [
+            (
+                ReadLimits {
+                    line_bytes: exact.line_bytes - 1,
+                    ..exact
+                },
+                "line 4",
+            ),
+            (
+                ReadLimits {
+                    total_bytes: exact.total_bytes - 1,
+                    ..exact
+                },
+                "total",
+            ),
+        ] {
+            assert_budget_error(
+                session
+                    .append_batch_with_limits(batch.clone(), over)
+                    .unwrap_err(),
+                constraint,
+            );
+            assert_eq!(snapshot_files(&dir), before);
+            assert_eq!(session.messages, old_messages);
+        }
+
+        session.append_batch_with_limits(batch, exact).unwrap();
+        assert_eq!(
+            fs::metadata(&session.path).unwrap().len(),
+            exact.total_bytes
+        );
+        assert_eq!(
+            resume_with_limits(&session.header.id, exact)
+                .unwrap()
+                .messages,
+            candidate
+        );
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            candidate
+        );
+    }
+
+    #[test]
+    fn small_appends_include_prior_batches_and_newlines_in_the_total_budget() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        let first = msg(Role::User, "a");
+        let second = msg(Role::Assistant, "b");
+        let last = msg(Role::User, "c");
+        let candidate = vec![first.clone(), second.clone(), last.clone()];
+        let exact = exact_limits(&session.header, &candidate);
+        for message in [first, second] {
+            session
+                .append_batch_with_limits(vec![message], exact)
+                .unwrap();
+            // 每批之后重新恢复，不能依赖 Session 内持久缓存估算当前文件大小。
+            session = resume_with_limits(&session.header.id, exact).unwrap();
+        }
+        let before = snapshot_files(&dir);
+        let old_messages = session.messages.clone();
+        let mut over = last.clone();
+        over.content = vec![Content::Text("cc".into())];
+        assert_budget_error(
+            session
+                .append_batch_with_limits(vec![over], exact)
+                .unwrap_err(),
+            "total",
+        );
+        assert_eq!(snapshot_files(&dir), before);
+        assert_eq!(session.messages, old_messages);
+
+        session.append_batch_with_limits(vec![last], exact).unwrap();
+        assert_eq!(
+            fs::metadata(&session.path).unwrap().len(),
+            exact.total_bytes
+        );
+        assert_eq!(
+            resume_with_limits(&session.header.id, exact)
+                .unwrap()
+                .messages,
+            candidate
+        );
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            candidate
+        );
+    }
+
+    #[test]
+    fn append_total_uses_actual_existing_file_bytes() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        // 旧文件中的空白行不进入内存历史，但仍然必须计入追加总预算。
+        let mut old_raw = fs::read(&session.path).unwrap();
+        old_raw.extend_from_slice(b"  \n\n");
+        fs::write(&session.path, &old_raw).unwrap();
+        let accepted = msg(Role::User, "a");
+        let exact = ReadLimits {
+            total_bytes: (old_raw.len() + serde_json::to_vec(&accepted).unwrap().len() + 1) as u64,
+            ..limits(1024, 1024, 1024)
+        };
+        let mut rejected = accepted.clone();
+        rejected.content = vec![Content::Text("aa".into())];
+        assert_budget_error(
+            session
+                .append_batch_with_limits(vec![rejected], exact)
+                .unwrap_err(),
+            "total",
+        );
+        assert_eq!(fs::read(&session.path).unwrap(), old_raw);
+        assert!(session.messages.is_empty());
+        session
+            .append_batch_with_limits(vec![accepted.clone()], exact)
+            .unwrap();
+        let written = fs::read(&session.path).unwrap();
+        assert_eq!(written.len() as u64, exact.total_bytes);
+        assert_eq!(
+            resume_with_limits(&session.header.id, exact)
+                .unwrap()
+                .messages,
+            vec![accepted]
+        );
+        assert_eq!(fs::read(&session.path).unwrap(), written);
+    }
+
+    #[test]
+    fn rewrite_budget_refusals_preserve_memory_main_and_all_usable_backups() {
+        let (dir, _guard) = temp_data_dir();
+        for constraint in ["header", "line", "total"] {
+            let mut session = sample_session(&dir);
+            session.append(msg(Role::User, "initial")).unwrap();
+            for index in 0..MAX_BACKUPS {
+                session
+                    .rewrite(vec![msg(Role::User, &format!("old-{index}"))])
+                    .unwrap();
+            }
+            assert_eq!(backups_of(&dir, &session.header.id).len(), MAX_BACKUPS);
+            session.header.provider = BUDGET_TEXT.into();
+            let candidate = vec![msg(Role::User, "new"), msg(Role::Assistant, BUDGET_TEXT)];
+            let exact = exact_limits(&session.header, &candidate);
+            let mut over = exact;
+            let expected = match constraint {
+                "header" => {
+                    over.header_bytes -= 1;
+                    "line 1"
+                }
+                "line" => {
+                    over.line_bytes -= 1;
+                    "line 3"
+                }
+                "total" => {
+                    over.total_bytes -= 1;
+                    "total"
+                }
+                _ => unreachable!(),
+            };
+            let before = snapshot_files(&dir);
+            let old_messages = session.messages.clone();
+            let old_header = session.header.clone();
+            assert_budget_error(
+                session
+                    .rewrite_with_limits(candidate.clone(), over)
+                    .unwrap_err(),
+                expected,
+            );
+            // 全目录逐字节比较也验证备份未新增/覆盖/淘汰，临时文件已清理。
+            assert_eq!(snapshot_files(&dir), before);
+            assert_eq!(session.messages, old_messages);
+            assert_eq!(session.header, old_header);
+            assert_eq!(
+                Session::resume(&session.header.id).unwrap().messages,
+                old_messages
+            );
+
+            session
+                .rewrite_with_limits(candidate.clone(), exact)
+                .unwrap();
+            let written = fs::read(&session.path).unwrap();
+            assert_eq!(written.len() as u64, exact.total_bytes);
+            let resumed = resume_with_limits(&session.header.id, exact).unwrap();
+            assert_eq!(resumed.messages, candidate);
+            assert_eq!(resumed.header, session.header);
+            assert_eq!(
+                Session::resume(&session.header.id).unwrap().messages,
+                candidate
+            );
+            assert_eq!(fs::read(&session.path).unwrap(), written);
+        }
+    }
+
+    #[test]
+    fn salvage_normalization_cannot_write_past_the_same_total_budget() {
+        let (dir, _guard) = temp_data_dir();
+        for with_message in [false, true] {
+            let mut session = sample_session(&dir);
+            if with_message {
+                session.append(msg(Role::User, BUDGET_TEXT)).unwrap();
+            }
+            let exact = exact_limits(&session.header, &session.messages);
+            let mut raw = fs::read(&session.path).unwrap();
+            assert_eq!(raw.pop(), Some(b'\n'));
+            fs::write(&session.path, &raw).unwrap();
+            let before = snapshot_files(&dir);
+            // 输入刚好符合总预算，修复补 LF 后将超一字节：不得发布或备份。
+            assert_budget_error(
+                resume_with_limits(
+                    &session.header.id,
+                    ReadLimits {
+                        total_bytes: raw.len() as u64,
+                        ..exact
+                    },
+                )
+                .unwrap_err(),
+                "total",
+            );
+            assert_eq!(snapshot_files(&dir), before);
+
+            let resumed = resume_with_limits(&session.header.id, exact).unwrap();
+            assert_eq!(resumed.messages, session.messages);
+            assert_eq!(
+                fs::metadata(&session.path).unwrap().len(),
+                exact.total_bytes
+            );
+            assert_eq!(
+                resume_with_limits(&session.header.id, exact)
+                    .unwrap()
+                    .messages,
+                session.messages
+            );
+        }
+    }
+
+    #[test]
+    fn total_write_budget_rejects_arithmetic_overflow() {
+        let path = Path::new("overflow.jsonl");
+        assert_eq!(
+            checked_write_total(u64::MAX - 1, 1, path, u64::MAX).unwrap(),
+            u64::MAX
+        );
+        assert_budget_error(
+            checked_write_total(u64::MAX, 1, path, u64::MAX).unwrap_err(),
+            "total",
+        );
+    }
+
+    #[test]
+    fn salvaged_legacy_json_must_fit_after_serialization_adds_optional_fields() {
+        let (dir, _guard) = temp_data_dir();
+        let session = sample_session(&dir);
+        let message = msg(Role::User, BUDGET_TEXT);
+        let mut legacy = serde_json::to_value(&message).unwrap();
+        legacy.as_object_mut().unwrap().remove("usage");
+        let legacy_line = serde_json::to_string(&legacy).unwrap();
+        let raw = format!(
+            "{}\n{legacy_line}\ninvalid\n",
+            serde_json::to_string(&session.header).unwrap()
+        );
+        fs::write(&session.path, &raw).unwrap();
+        let before = snapshot_files(&dir);
+        let small = limits(1024, legacy_line.len(), 4096);
+        // 旧 JSON 能读入；坏尾部触发修复时补回 usage:null，消息行将超限。
+        assert_budget_error(
+            resume_with_limits(&session.header.id, small).unwrap_err(),
+            "line 2",
+        );
+        assert_eq!(snapshot_files(&dir), before);
+        let resumed = resume_with_limits(
+            &session.header.id,
+            ReadLimits {
+                line_bytes: serde_json::to_vec(&message).unwrap().len(),
+                ..small
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.messages, vec![message]);
+        let baks = backups_of(&dir, &session.header.id);
+        assert_eq!(baks.len(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SESSIONS_SUBDIR).join(&baks[0])).unwrap(),
+            raw
+        );
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            resumed.messages
+        );
     }
 
     fn salvage_from(raw: &[u8]) -> (Vec<Message>, usize, bool) {
@@ -1200,8 +1679,11 @@ mod tests {
         let (dir, _guard) = temp_data_dir();
         let mut session = sample_session(&dir);
         session.append(msg(Role::User, "one")).unwrap();
+        let before = fs::read(&session.path).unwrap();
+        let old_messages = session.messages.clone();
         // 用目录占住主文件路径：rename(文件 → 目录) 必然失败。
-        fs::remove_file(&session.path).unwrap();
+        let saved = dir.path().join("saved.jsonl");
+        fs::rename(&session.path, &saved).unwrap();
         fs::create_dir(&session.path).unwrap();
         let err = session
             .rewrite(vec![msg(Role::User, "new")])
@@ -1213,7 +1695,20 @@ mod tests {
             .filter(|n| n.ends_with(TMP_SUFFIX))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(session.messages, old_messages);
+        assert_eq!(fs::read(&saved).unwrap(), before);
         fs::remove_dir(&session.path).unwrap();
+        fs::rename(&saved, &session.path).unwrap();
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            old_messages
+        );
+        session.rewrite(vec![msg(Role::User, "new")]).unwrap();
+        session.append(msg(Role::Assistant, "ok")).unwrap();
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            session.messages
+        );
     }
 
     #[test]
@@ -1705,6 +2200,37 @@ mod tests {
             .append(Message::assistant(vec![Content::Text("ok".into())], None))
             .unwrap();
         assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            session.messages
+        );
+    }
+
+    #[test]
+    fn rewrite_invalid_messages_preserves_backups_and_allows_retry() {
+        let (dir, _guard) = temp_data_dir();
+        let mut session = sample_session(&dir);
+        session.append(msg(Role::User, "old")).unwrap();
+        session.rewrite(vec![msg(Role::User, "kept")]).unwrap();
+        let before = snapshot_files(&dir);
+        let old_messages = session.messages.clone();
+        let err = session
+            .rewrite_with_limits(
+                vec![msg(Role::User, "new"), msg(Role::User, BUDGET_TEXT)],
+                limits(1024, 1024, 4096),
+            )
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("invariant 1"), "{err}");
+        assert!(!err.contains("budget-private"), "{err}");
+        assert_eq!(snapshot_files(&dir), before);
+        assert_eq!(session.messages, old_messages);
+        session.rewrite(vec![msg(Role::User, "new")]).unwrap();
+        session.append(msg(Role::Assistant, "ok")).unwrap();
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            session.messages
+        );
     }
 
     #[test]
@@ -1776,6 +2302,71 @@ mod tests {
     }
 
     #[test]
+    fn partial_write_and_flush_failures_restore_file_before_retry_and_resume() {
+        struct FailingFile {
+            file: File,
+            bytes_left: Option<usize>,
+            fail_flush: bool,
+        }
+        impl AppendTarget for FailingFile {
+            fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+                let bytes = format!("{line}\n");
+                if let Some(left) = &mut self.bytes_left {
+                    if bytes.len() > *left {
+                        self.file.write_all(&bytes.as_bytes()[..*left])?;
+                        return Err(std::io::ErrorKind::WriteZero.into());
+                    }
+                    *left -= bytes.len();
+                }
+                self.file.write_all(bytes.as_bytes())
+            }
+            fn finish(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("injected flush failure"))
+                } else {
+                    self.file.flush()
+                }
+            }
+            fn rollback(&mut self, old_len: u64) -> std::io::Result<()> {
+                self.file.set_len(old_len)
+            }
+        }
+
+        let (dir, _guard) = temp_data_dir();
+        for fail_flush in [false, true] {
+            let mut session = sample_session(&dir);
+            session.append(msg(Role::User, "old")).unwrap();
+            let batch = vec![msg(Role::Assistant, "first"), msg(Role::User, BUDGET_TEXT)];
+            let lines: Vec<String> = batch
+                .iter()
+                .map(|message| serde_json::to_string(message).unwrap())
+                .collect();
+            let before = fs::read(&session.path).unwrap();
+            let old_messages = session.messages.clone();
+            let mut target = FailingFile {
+                file: OpenOptions::new().append(true).open(&session.path).unwrap(),
+                // 写完整的第一行，再在第二行中间失败；另一轮写完后 flush 失败。
+                bytes_left: (!fail_flush).then_some(lines[0].len() + 1 + 4),
+                fail_flush,
+            };
+            assert!(write_batch_to(&mut target, before.len() as u64, &lines).is_err());
+            drop(target);
+            assert_eq!(fs::read(&session.path).unwrap(), before);
+            assert_eq!(session.messages, old_messages);
+            assert_eq!(
+                Session::resume(&session.header.id).unwrap().messages,
+                old_messages
+            );
+
+            session.append_batch(batch).unwrap();
+            assert_eq!(
+                Session::resume(&session.header.id).unwrap().messages,
+                session.messages
+            );
+        }
+    }
+
+    #[test]
     fn append_rejects_symlinked_main_file() {
         let (dir, _guard) = temp_data_dir();
         let mut session = sample_session(&dir);
@@ -1802,8 +2393,11 @@ mod tests {
         let (dir, _guard) = temp_data_dir();
         let mut session = sample_session(&dir);
         session.append(msg(Role::User, "hi")).unwrap();
+        let before = fs::read(&session.path).unwrap();
+        let old_messages = session.messages.clone();
         // 主文件路径变成目录 → 追加打开失败：内存回退，无写入发生。
-        fs::remove_file(&session.path).unwrap();
+        let saved = dir.path().join("saved.jsonl");
+        fs::rename(&session.path, &saved).unwrap();
         fs::create_dir(&session.path).unwrap();
         assert!(session
             .append_batch(vec![Message::assistant(
@@ -1811,8 +2405,15 @@ mod tests {
                 None
             )])
             .is_err());
-        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages, old_messages);
+        assert_eq!(fs::read(&saved).unwrap(), before);
         fs::remove_dir(&session.path).unwrap();
+        fs::rename(&saved, &session.path).unwrap();
+        session.append(msg(Role::Assistant, "retry")).unwrap();
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            session.messages
+        );
     }
 
     // ---- todo 02：T3 临时文件与备份归属 ----
@@ -1827,7 +2428,10 @@ mod tests {
         let sessions = dir.path().join(SESSIONS_SUBDIR);
         let tmp_dir = sessions.join(format!("x.{}", Uuid::new_v4()));
         fs::create_dir(&tmp_dir).unwrap();
-        assert!(write_replacement(&tmp_dir, &session.header, &session.messages).is_err());
+        assert!(
+            write_replacement(&tmp_dir, &session.header, &session.messages, DEFAULT_LIMITS)
+                .is_err()
+        );
         fs::remove_dir(&tmp_dir).unwrap();
         // 主文件不受影响。
         assert_eq!(fs::read(&session.path).unwrap(), before);
@@ -1836,6 +2440,11 @@ mod tests {
             .filter(|n| n.ends_with(TMP_SUFFIX))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        session.rewrite(vec![msg(Role::User, "retry")]).unwrap();
+        assert_eq!(
+            Session::resume(&session.header.id).unwrap().messages,
+            session.messages
+        );
     }
 
     #[test]
