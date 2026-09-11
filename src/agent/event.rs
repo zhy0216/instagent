@@ -2,7 +2,7 @@
 //!
 //! channel 供调用方观察进度，调用方自行选择消费方式——及时 drain、
 //! 给足容量（近似 unbounded、事件不丢）、或不消费（事件在 [`EMIT_GRACE`]
-//! 宽限后被丢弃并计数，见 [`dropped_event_count`]）。loop 永不因接收端
+//! 宽限后被丢弃并计数，见 `dropped_event_count`）。loop 永不因接收端
 //! 落后或断开而无限期卡住。
 
 use std::sync::atomic::AtomicU64;
