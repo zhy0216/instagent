@@ -78,7 +78,8 @@ impl Agent {
             cancel: cancel.clone(),
         };
 
-        // 阶段 1：串行决策。
+        // 阶段 1：串行决策。取消 / 中断路径统一落 interrupted 槽。
+        let interrupted = |call: &ToolCall| Disposition::Finished(Content::interrupted(call));
         let mut dispositions: Vec<Disposition> = Vec::with_capacity(calls.len());
         for call in calls {
             if let Some(detail) = streamed.malformed.get(&call.id) {
@@ -91,7 +92,7 @@ impl Agent {
                 continue;
             }
             if streamed.cancelled || cancel.is_cancelled() {
-                dispositions.push(Disposition::Finished(Content::interrupted(call)));
+                dispositions.push(interrupted(call));
                 continue;
             }
             // hook 触发点：PreToolUse 在调用之前；阻止 → is_error 结果，工具不执行。
@@ -106,7 +107,7 @@ impl Agent {
                     decision = hooks.run(&hook_ctx) => Some(decision),
                 };
                 let Some(decision) = decision else {
-                    dispositions.push(Disposition::Finished(Content::interrupted(call)));
+                    dispositions.push(interrupted(call));
                     continue;
                 };
                 if let HookDecision::Block(reason) = decision {
@@ -133,7 +134,7 @@ impl Agent {
             let cap = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    dispositions.push(Disposition::Finished(Content::interrupted(call)));
+                    dispositions.push(interrupted(call));
                     continue;
                 }
                 cap = self.tools.capability(call) => cap,

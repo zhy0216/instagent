@@ -645,7 +645,6 @@ async fn plugin_install_list_show_disable_enable() {
         "version: 1.0.0",
         "enabled: true",
         "source: ",
-        "auto-update: false",
     ] {
         assert!(stdout.contains(expected), "show 缺 `{expected}`: {stdout}");
     }
@@ -1176,30 +1175,6 @@ async fn resume_bad_id_or_absent_last_fails_without_creating_a_session() {
         let result = terminal_json(&out, "failed", 1);
         assert!(result["session_id"].is_null());
     }
-}
-
-#[tokio::test]
-async fn run_does_not_auto_update_preinstalled_plugins() {
-    let sandbox = Sandbox::new();
-    let server = MockServer::start().await;
-    mount_chat_completions(&server).await;
-    sandbox.install_fake_provider(&server.uri());
-    let metadata = sandbox.agents.path().join("plugins/fakeprov/.install.json");
-    let before = serde_json::json!({
-        "source":"file:///nonexistent/headless-plugin-repository",
-        "commit":"0000000", "installed_at":1,
-        "last_update_check":null, "auto_update":true,
-    })
-    .to_string();
-    std::fs::write(&metadata, &before).unwrap();
-    let out = output(sandbox.cmd(&["run", "-t", "go", "--output", "json"])).await;
-    terminal_json(&out, "completed", 0);
-    assert_eq!(
-        std::fs::read_to_string(&metadata).unwrap(),
-        before,
-        "run must not even advance auto-update metadata"
-    );
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("auto-update"));
 }
 
 #[cfg(unix)]

@@ -186,6 +186,23 @@ pub fn config_dir() -> crate::Result<PathBuf> {
     Ok(strategy.config_dir().join("instagent"))
 }
 
+/// `~` 前缀展开（home 目录用 `std::env::home_dir`）+ 相对路径按 `cwd` 解析。
+/// config `plugins` 与 CLI `--plugin` 共用。
+pub fn expand_plugin_path(path: &str, cwd: &Path) -> PathBuf {
+    let expanded = if path == "~" {
+        std::env::home_dir()
+    } else {
+        path.strip_prefix("~/")
+            .and_then(|rest| std::env::home_dir().map(|home| home.join(rest)))
+    };
+    let path = expanded.unwrap_or_else(|| PathBuf::from(path));
+    if path.is_relative() {
+        cwd.join(path)
+    } else {
+        path
+    }
+}
+
 impl Config {
     /// 读用户级 config.yaml，做字段级校验（错误带来源文件、字段与建议值），
     /// 叠加环境变量覆盖，并把 `plugins` 路径展开（`~` 前缀 + 相对路径按
@@ -218,13 +235,7 @@ impl Config {
         non_empty_optional(&source, "shell", config.shell.clone())?;
         for plugin in &mut config.plugins {
             let raw = plugin.display().to_string();
-            let expanded = shellexpand::tilde(&raw);
-            let path = PathBuf::from(expanded.as_ref());
-            *plugin = if path.is_relative() {
-                cwd.join(path)
-            } else {
-                path
-            };
+            *plugin = expand_plugin_path(&raw, cwd);
         }
         config.validate_merged(&source)?;
         Ok(config)

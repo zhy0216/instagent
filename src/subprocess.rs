@@ -333,13 +333,14 @@ pub(crate) fn write_stdin(child: &mut ProcessGroupChild, payload: &[u8]) {
 /// 增量 UTF-8 解码器：跨 chunk 缓冲末尾的不完整多字节序列，
 /// 避免 chunk 边界把合法字符切成 replacement；真正坏掉的尾部在
 /// [`Utf8StreamDecoder::finish`] 时按 lossy 出 replacement。
+/// 子进程输出与 MCP stderr 共用（同形解码）。
 #[derive(Default)]
-struct Utf8StreamDecoder {
+pub(crate) struct Utf8StreamDecoder {
     pending: Vec<u8>,
 }
 
 impl Utf8StreamDecoder {
-    fn push(&mut self, chunk: &[u8]) -> String {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> String {
         let mut bytes = std::mem::take(&mut self.pending);
         bytes.extend_from_slice(chunk);
         let mut out = String::new();
@@ -372,7 +373,7 @@ impl Utf8StreamDecoder {
         out
     }
 
-    fn finish(&mut self) -> String {
+    pub(crate) fn finish(&mut self) -> String {
         let pending = std::mem::take(&mut self.pending);
         String::from_utf8_lossy(&pending).into_owned()
     }
@@ -474,6 +475,16 @@ async fn finish_pump(
     (output, timed_out)
 }
 
+/// 单路管道取出一侧流；未配 pipe 时返回带 pid 上下文的错误（不再 panic）。
+fn piped_stream<T>(name: &str, pid: Option<u32>, pipe: &mut Option<T>) -> io::Result<T> {
+    pipe.take().ok_or_else(|| {
+        io::Error::other(format!(
+            "subprocess (pid {pid:?}) was spawned without {name} piped; \
+             set `Stdio::piped()` on the Command before spawning"
+        ))
+    })
+}
+
 /// 带硬上限输出收集的统一编排：两路管道增量解码进 collector → 带取消/超时的等待 →
 /// 直接子进程退出 / 任一路上限越限 / 超时 / 取消都 drop [`ProcessGroupChild`] SIGKILL 整组 →
 /// 限时收尾两路输出。`cancel` 为 `None` 时不监听取消。
@@ -486,22 +497,9 @@ pub(crate) async fn run_bounded(
     timeout: Duration,
     cancel: Option<&CancellationToken>,
 ) -> io::Result<CollectedRun> {
-    let stdout_pipe = child.child_mut().stdout.take();
-    let Some(stdout_pipe) = stdout_pipe else {
-        return Err(io::Error::other(format!(
-            "subprocess (pid {:?}) was spawned without stdout piped; \
-             set `Stdio::piped()` on the Command before spawning",
-            child.id()
-        )));
-    };
-    let stderr_pipe = child.child_mut().stderr.take();
-    let Some(stderr_pipe) = stderr_pipe else {
-        return Err(io::Error::other(format!(
-            "subprocess (pid {:?}) was spawned without stderr piped; \
-             set `Stdio::piped()` on the Command before spawning",
-            child.id()
-        )));
-    };
+    let pid = child.id();
+    let stdout_pipe = piped_stream("stdout", pid, &mut child.child_mut().stdout)?;
+    let stderr_pipe = piped_stream("stderr", pid, &mut child.child_mut().stderr)?;
 
     let stdout_collector = Arc::new(Mutex::new(StreamCollector::new(max_bytes_per_stream)));
     let stderr_collector = Arc::new(Mutex::new(StreamCollector::new(max_bytes_per_stream)));

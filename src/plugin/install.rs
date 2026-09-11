@@ -7,9 +7,7 @@
 //! rename 替换，旧目录在替换成功前不动。
 //! `update`：按 `.install.json` 重新拉取；`commit` 为 `None` 即本地路径
 //! 安装，无法 update（goose 同款 `source_type != "git"` 拒绝，InstallInfo
-//! 字段由 `00` 锁定，不另存 source_type）。自动更新 24h 节流：
-//! [`auto_update_all`] 只处理 `auto_update` 且距 [`should_auto_update`]
-//! 到期的插件，失败也先记检查时间，避免每次启动重试（goose 同款）。
+//! 字段由 `00` 锁定，不另存 source_type）。
 //! list / show / enable / disable 为数据层，CLI 接线在 `18`。
 //! `PLUGIN_DATA`：[`plugin_data_dir`] = `<data_dir>/plugins/<name>/`，按需创建。
 //!
@@ -46,15 +44,10 @@ use replace::place;
 use staging::copy_tree;
 use staging::Staging;
 
-pub use update::auto_update_all;
-pub use update::should_auto_update;
 pub use update::update;
 
 /// `.install.json` 文件名（goose `.goose-plugin-install.json` 的对应物）。
 pub const INSTALL_METADATA: &str = ".install.json";
-
-/// 24h 自动更新节流间隔（goose `AUTO_UPDATE_INTERVAL_HOURS`）。
-pub const AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// `git clone` 整体超时：到点整组 SIGKILL，不留挂起进程。
 pub const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -69,11 +62,6 @@ pub enum InstallSource {
     Path(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct InstallOptions {
-    pub auto_update: bool,
-}
-
 /// `.install.json` 的内容（goose `.goose-plugin-install.json` 的对应物）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallInfo {
@@ -81,9 +69,6 @@ pub struct InstallInfo {
     pub commit: Option<String>,
     /// epoch 秒。
     pub installed_at: i64,
-    /// 24h 自动更新节流（goose 同款）用。
-    pub last_update_check: Option<i64>,
-    pub auto_update: bool,
 }
 
 /// 已安装插件的清单条目（list / show 数据层）。
@@ -94,13 +79,6 @@ pub struct InstalledPlugin {
     pub install_info: Option<InstallInfo>,
     /// 当前（cwd 三层合并后）settings 下的启用状态。
     pub enabled: bool,
-}
-
-/// [`auto_update_all`] 的单项结果。
-#[derive(Debug)]
-pub struct AutoUpdateResult {
-    pub name: String,
-    pub result: crate::Result<()>,
 }
 
 /// `<data_dir>`：`INSTAGENT_DATA_DIR` 优先，否则 etcetera（XDG）的
@@ -161,7 +139,7 @@ pub(crate) fn is_install_internal_dir(name: &std::ffi::OsStr) -> bool {
 
 /// clone / 复制 → 校验 → 写 `.install.json` → 放入用户目录。
 /// 同名插件重复 install 即覆盖更新。
-pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<Plugin> {
+pub fn install(source: &InstallSource) -> crate::Result<Plugin> {
     let now = crate::message::now_ts();
     let staging = Staging::for_source(match source {
         InstallSource::Path(path) => Some(path),
@@ -191,9 +169,6 @@ pub fn install(source: &InstallSource, opts: &InstallOptions) -> crate::Result<P
         },
         commit,
         installed_at: now,
-        // 自动更新的 24h 从安装时刻起算（goose 同款）。
-        last_update_check: opts.auto_update.then_some(now),
-        auto_update: opts.auto_update,
     };
     let plugin = place(staging, manifest, &info)?;
     Ok(plugin)
@@ -539,12 +514,6 @@ mod metadata {
         let path = dir.join(INSTALL_METADATA);
         crate::settings::write_private_atomic(&path, &serde_json::to_string_pretty(info)?)
     }
-
-    pub(super) fn mark_last_update_check(dir: &Path, now: i64) -> crate::Result<()> {
-        let mut info = read_install_info(dir)?;
-        info.last_update_check = Some(now);
-        write_install_info(dir, &info)
-    }
 }
 
 /// staging/copy：staging 目录（同盘 rename 前提）与本地复制树的 symlink 契约。
@@ -576,10 +545,6 @@ mod staging {
     }
 
     impl Staging {
-        pub(super) fn new() -> crate::Result<Self> {
-            Self::for_source(None)
-        }
-
         pub(super) fn for_source(source: Option<&Path>) -> crate::Result<Self> {
             let parent = resolve_directory(&agents_dir()?.join(STAGING_DIR_NAME))?;
             if let Some(source) = source {
@@ -811,76 +776,24 @@ mod replace {
     }
 }
 
-/// update / auto-update：手动 update 与 24h 节流的批量更新。
+/// update：按 `.install.json` 重新拉取（手动触发，无节流）。
 mod update {
     use anyhow::bail;
     use anyhow::Context;
 
     use super::acquire::fetch_git_commit;
     use super::acquire::remove_git_dir;
-    use super::is_install_internal_dir;
-    use super::metadata::mark_last_update_check;
     use super::metadata::read_install_info;
     use super::replace::place;
     use super::staging::Staging;
     use super::user_plugins_dir;
     use super::validate_plugin_name;
-    use super::AutoUpdateResult;
     use super::InstallInfo;
-    use super::AUTO_UPDATE_INTERVAL_SECS;
 
     use crate::plugin::manifest::read_manifest;
 
-    /// 按 `.install.json` 重新拉取（手动 update 不受节流限制）。
+    /// 按 `.install.json` 重新拉取。
     pub fn update(name: &str) -> crate::Result<()> {
-        update_at(name, crate::message::now_ts())
-    }
-
-    /// 24h 节流的纯时间判定（goose `should_auto_update`）。
-    pub fn should_auto_update(last_update_check: Option<i64>, now: i64) -> bool {
-        last_update_check.is_none_or(|checked| now - checked >= AUTO_UPDATE_INTERVAL_SECS)
-    }
-
-    /// 扫描用户插件目录，对 `auto_update` 的 git 来源做节流更新。
-    /// 失败也返回在结果里（调用方只 warn，goose 同款）。
-    pub fn auto_update_all(now: i64) -> crate::Result<Vec<AutoUpdateResult>> {
-        let root = user_plugins_dir()?;
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
-        };
-        let mut dirs: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .filter(|entry| !is_install_internal_dir(&entry.file_name()))
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .collect();
-        dirs.sort();
-        let mut results = Vec::new();
-        for dir in dirs {
-            let Ok(info) = read_install_info(&dir) else {
-                continue;
-            };
-            if !info.auto_update || info.commit.is_none() {
-                continue;
-            }
-            if !should_auto_update(info.last_update_check, now) {
-                continue;
-            }
-            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let name = name.to_string();
-            // 先记检查时间再更新：失败也不在每次启动重试。
-            let result = mark_last_update_check(&dir, now).and_then(|()| update_at(&name, now));
-            results.push(AutoUpdateResult { name, result });
-        }
-        Ok(results)
-    }
-
-    /// update 的带时刻实现：手动 update 用真实 now，节流测试注入假 now。
-    pub(super) fn update_at(name: &str, now: i64) -> crate::Result<()> {
         if name.trim().is_empty() {
             bail!("plugin name must not be empty");
         }
@@ -896,7 +809,7 @@ mod update {
                 old.source
             );
         }
-        let staging = Staging::new()?;
+        let staging = Staging::for_source(None)?;
         let commit = fetch_git_commit(&old.source, &staging.path)?;
         remove_git_dir(&staging.path)?;
         let manifest = read_manifest(&staging.path)
@@ -910,7 +823,6 @@ mod update {
         }
         let info = InstallInfo {
             commit: Some(commit),
-            last_update_check: Some(now),
             ..old
         };
         place(staging, manifest, &info)?;
@@ -1072,8 +984,6 @@ mod tests {
             source: "file:///missing/metadata-test-secret".into(),
             commit: Some("abc123".into()),
             installed_at: 1,
-            last_update_check: None,
-            auto_update: true,
         }
     }
 
@@ -1097,11 +1007,7 @@ mod tests {
             .unwrap();
         let before = tree_snapshot(&src);
 
-        let err = install(
-            &InstallSource::Path(src.clone()),
-            &InstallOptions::default(),
-        )
-        .unwrap_err();
+        let err = install(&InstallSource::Path(src.clone())).unwrap_err();
         assert!(
             err.to_string().contains("overlaps install staging"),
             "{err:#}"
@@ -1147,8 +1053,7 @@ mod tests {
             .unwrap();
         let before = tree_snapshot(env.agents.path());
         for source in [parent, source] {
-            let err =
-                install(&InstallSource::Path(source), &InstallOptions::default()).unwrap_err();
+            let err = install(&InstallSource::Path(source)).unwrap_err();
             assert!(
                 err.to_string().contains("overlaps install staging"),
                 "{err:#}"
@@ -1169,11 +1074,7 @@ mod tests {
         let nested_agents = src.join("missing/../agents");
         std::env::set_var("INSTAGENT_AGENTS_DIR", &nested_agents);
         let before = tree_snapshot(base.path());
-        let err = install(
-            &InstallSource::Path(src.clone()),
-            &InstallOptions::default(),
-        )
-        .unwrap_err();
+        let err = install(&InstallSource::Path(src.clone())).unwrap_err();
         assert!(
             err.to_string().contains("overlaps install staging"),
             "{err:#}"
@@ -1183,14 +1084,10 @@ mod tests {
         // 源和安装根是普通兄弟目录，组件名称共有前缀也不算祖先关系。
         let agents = relative.join("source-agents");
         std::env::set_var("INSTAGENT_AGENTS_DIR", &agents);
-        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let plugin = install(&InstallSource::Path(src)).unwrap();
         let installed_manifest = std::fs::read(plugin.root.join("plugin.json")).unwrap();
         // 顶层旧 metadata 不复制；重装从新选项生成 metadata。
-        let reinstalled = install(
-            &InstallSource::Path(plugin.root.clone()),
-            &InstallOptions { auto_update: true },
-        )
-        .unwrap();
+        let reinstalled = install(&InstallSource::Path(plugin.root.clone())).unwrap();
         assert_eq!(reinstalled.root, plugin.root);
         assert_eq!(
             std::fs::read(plugin.root.join("plugin.json")).unwrap(),
@@ -1198,7 +1095,6 @@ mod tests {
         );
         let info = read_install_info(&plugin.root).unwrap();
         assert_eq!(info.source, plugin.root.display().to_string());
-        assert!(info.auto_update);
         assert!(std::fs::read_dir(agents.join(".tmp-install"))
             .unwrap()
             .next()
@@ -1219,8 +1115,7 @@ mod tests {
             (src.clone(), alias.join("../agents")),
         ] {
             std::env::set_var("INSTAGENT_AGENTS_DIR", &agents);
-            let err =
-                install(&InstallSource::Path(source), &InstallOptions::default()).unwrap_err();
+            let err = install(&InstallSource::Path(source)).unwrap_err();
             assert!(
                 err.to_string().contains("overlaps install staging"),
                 "{err:#}"
@@ -1230,11 +1125,7 @@ mod tests {
         // 安装根在外部，但既存 staging 父目录链接回源，也必须拒绝。
         std::env::set_var("INSTAGENT_AGENTS_DIR", env.agents.path());
         std::os::unix::fs::symlink(&src, env.agents.path().join(".tmp-install")).unwrap();
-        let err = install(
-            &InstallSource::Path(src.clone()),
-            &InstallOptions::default(),
-        )
-        .unwrap_err();
+        let err = install(&InstallSource::Path(src.clone())).unwrap_err();
         assert!(
             err.to_string().contains("overlaps install staging"),
             "{err:#}"
@@ -1322,7 +1213,7 @@ mod tests {
     fn invalid_install_metadata_preserves_update_list_and_backup_behavior() {
         let env = isolated();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let plugin = install(&InstallSource::Path(src)).unwrap();
         let backup = env.agents.path().join("plugins/.replaced-other-recover");
         write_plugin(&backup, "other", "1.0.0");
         write_install_info(&backup, &sample_install_info()).unwrap();
@@ -1350,10 +1241,7 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             assert!(message.contains(&path.display().to_string()), "{message}");
             assert!(!message.contains("metadata-test-secret"), "{message}");
-            assert!(metadata::mark_last_update_check(&plugin.root, 100).is_err());
-            assert!(auto_update_all(AUTO_UPDATE_INTERVAL_SECS * 2)
-                .unwrap()
-                .is_empty());
+
             let items = list(env.agents.path()).unwrap();
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].plugin.manifest.name, "alpha");
@@ -1370,11 +1258,7 @@ mod tests {
     fn installs_local_path_without_git_or_metadata_leak() {
         let env = isolated();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        let plugin = install(
-            &InstallSource::Path(src.clone()),
-            &InstallOptions::default(),
-        )
-        .unwrap();
+        let plugin = install(&InstallSource::Path(src.clone())).unwrap();
 
         assert_eq!(plugin.manifest.name, "alpha");
         assert_eq!(plugin.source, PluginSource::User);
@@ -1388,13 +1272,11 @@ mod tests {
         let info = read_install_info(&plugin.root).unwrap();
         assert_eq!(info.source, src.display().to_string());
         assert_eq!(info.commit, None);
-        assert!(!info.auto_update);
-        assert_eq!(info.last_update_check, None);
         assert!(info.installed_at > 0);
 
         // 重复安装覆盖更新（携带新的 manifest 与 metadata）。
         write_plugin(&src, "alpha", "2.0.0");
-        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let plugin = install(&InstallSource::Path(src)).unwrap();
         assert_eq!(plugin.manifest.version, "2.0.0");
         assert_eq!(env.agents.path().join("plugins").join("alpha"), plugin.root);
     }
@@ -1404,11 +1286,7 @@ mod tests {
         let _env = isolated();
         let repo = TempDir::new().unwrap();
         let url = init_git_plugin(repo.path(), "git-plugin", "1.0.0");
-        let plugin = install(
-            &InstallSource::GitUrl(url.clone()),
-            &InstallOptions { auto_update: true },
-        )
-        .unwrap();
+        let plugin = install(&InstallSource::GitUrl(url.clone())).unwrap();
 
         assert_eq!(plugin.manifest.name, "git-plugin");
         assert!(!plugin.root.join(".git").exists());
@@ -1426,8 +1304,6 @@ mod tests {
         let info = read_install_info(&plugin.root).unwrap();
         assert_eq!(info.source, url);
         assert_eq!(info.commit.as_deref(), Some(expected.as_str()));
-        assert!(info.auto_update);
-        assert_eq!(info.last_update_check, Some(info.installed_at));
     }
 
     #[test]
@@ -1435,7 +1311,7 @@ mod tests {
         let _env = isolated();
         let repo = TempDir::new().unwrap();
         let url = init_git_plugin(repo.path(), "git-plugin", "1.0.0");
-        let plugin = install(&InstallSource::GitUrl(url), &InstallOptions::default()).unwrap();
+        let plugin = install(&InstallSource::GitUrl(url)).unwrap();
         let old = read_install_info(&plugin.root).unwrap();
 
         write_plugin(repo.path(), "git-plugin", "2.0.0");
@@ -1447,14 +1323,13 @@ mod tests {
         let info = read_install_info(&plugin.root).unwrap();
         assert_eq!(info.installed_at, old.installed_at);
         assert_ne!(info.commit, old.commit);
-        assert!(info.last_update_check.is_some());
     }
 
     #[test]
     fn update_rejects_local_path_and_unknown_names() {
         let env = isolated();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        install(&InstallSource::Path(src)).unwrap();
         let err = update("alpha").unwrap_err();
         assert!(err.to_string().contains("cannot be updated"), "{err}");
 
@@ -1463,73 +1338,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_update_throttles_at_24h() {
-        let env = isolated();
-        let repo = TempDir::new().unwrap();
-        let url = init_git_plugin(repo.path(), "git-plugin", "1.0.0");
-        let plugin = install(
-            &InstallSource::GitUrl(url),
-            &InstallOptions { auto_update: true },
-        )
-        .unwrap();
-        let installed_at = read_install_info(&plugin.root).unwrap().installed_at;
-        assert!(
-            installed_at > 0 && installed_at <= crate::message::now_ts(),
-            "just installed"
-        );
-
-        // 24h 内：节流，一条都不跑。
-        let results = auto_update_all(installed_at + 60 * 60).unwrap();
-        assert!(results.is_empty(), "{results:?}");
-
-        // 过期后：更新成功，检查时间前移。
-        write_plugin(repo.path(), "git-plugin", "2.0.0");
-        git_commit(repo.path(), "bump 2.0.0");
-        let late = installed_at + AUTO_UPDATE_INTERVAL_SECS;
-        let results = auto_update_all(late).unwrap();
-        assert_eq!(results.len(), 1);
-        results[0].result.as_ref().expect("auto update ok");
-        assert_eq!(results[0].name, "git-plugin");
-        let info = read_install_info(&plugin.root).unwrap();
-        assert_eq!(info.last_update_check, Some(late));
-        assert_eq!(
-            crate::plugin::manifest::read_manifest(&plugin.root)
-                .unwrap()
-                .version,
-            "2.0.0"
-        );
-
-        // 紧接着再跑：又被节流。
-        let results = auto_update_all(late + 60).unwrap();
-        assert!(results.is_empty());
-
-        // 非 git 来源与未开 auto_update 的插件被跳过。
-        let src = local_plugin(&env, "alpha", "1.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
-        let results = auto_update_all(late + 100 * AUTO_UPDATE_INTERVAL_SECS).unwrap();
-        assert!(results.iter().all(|r| r.name != "alpha"));
-    }
-
-    #[test]
-    fn should_auto_update_time_rule() {
-        assert!(should_auto_update(None, 100));
-        assert!(!should_auto_update(
-            Some(100),
-            100 + AUTO_UPDATE_INTERVAL_SECS - 1
-        ));
-        assert!(should_auto_update(
-            Some(100),
-            100 + AUTO_UPDATE_INTERVAL_SECS
-        ));
-    }
-
-    #[test]
     fn list_show_and_enable_disable_round_trip() {
         let env = isolated();
         let cwd = env.agents.path();
         for name in ["a", "b"] {
             let src = local_plugin(&env, name, "1.0.0");
-            install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+            install(&InstallSource::Path(src)).unwrap();
         }
 
         let items = list(cwd).unwrap();
@@ -1573,9 +1387,7 @@ mod tests {
             enabled_plugins: vec!["a".into(), "b".into()],
             ..Settings::default()
         };
-        settings
-            .save(cwd, crate::settings::SettingsLayer::User)
-            .unwrap();
+        settings.save_user().unwrap();
         assert!(enable("c").is_err()); // c 未安装。
         assert!(disable("c").is_err());
         disable("b").unwrap();
@@ -1609,7 +1421,7 @@ mod tests {
         let env = isolated();
         let cwd = env.agents.path();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        install(&InstallSource::Path(src)).unwrap();
 
         std::fs::write(
             env.config.path().join("settings.json"),
@@ -1643,7 +1455,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let env = isolated();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        let plugin = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        let plugin = install(&InstallSource::Path(src)).unwrap();
         disable("alpha").unwrap();
 
         for path in [
@@ -1670,19 +1482,11 @@ mod tests {
     #[test]
     fn install_rejects_invalid_sources() {
         let _env = isolated();
-        let err = install(
-            &InstallSource::GitUrl("  ".into()),
-            &InstallOptions::default(),
-        )
-        .unwrap_err();
+        let err = install(&InstallSource::GitUrl("  ".into())).unwrap_err();
         assert!(err.to_string().contains("must not be empty"), "{err}");
 
         let missing = TempDir::new().unwrap();
-        let err = install(
-            &InstallSource::Path(missing.path().join("nope")),
-            &InstallOptions::default(),
-        )
-        .unwrap_err();
+        let err = install(&InstallSource::Path(missing.path().join("nope"))).unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         // staging 用完即清，不残留。
         let tmp_root = agents_dir().unwrap().join(".tmp-install");
@@ -1695,10 +1499,9 @@ mod tests {
     #[test]
     fn git_clone_failure_leaves_no_staging_or_partial_target() {
         let env = isolated();
-        let err = install(
-            &InstallSource::GitUrl("file:///definitely-not-a-repo-42".into()),
-            &InstallOptions::default(),
-        )
+        let err = install(&InstallSource::GitUrl(
+            "file:///definitely-not-a-repo-42".into(),
+        ))
         .unwrap_err();
         assert!(err.to_string().contains("failed to clone"), "{err}");
         let tmp_root = agents_dir().unwrap().join(".tmp-install");
@@ -1753,7 +1556,7 @@ mod tests {
         write_plugin(&active, "beta", "1.0.0");
 
         let src = local_plugin(&env, "newplugin", "1.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        install(&InstallSource::Path(src)).unwrap();
 
         assert_eq!(
             std::fs::read(lost.join("recover-me")).unwrap(),
@@ -1771,18 +1574,14 @@ mod tests {
     fn successful_replace_removes_only_its_own_backup() {
         let env = isolated();
         let src = local_plugin(&env, "alpha", "1.0.0");
-        install(
-            &InstallSource::Path(src.clone()),
-            &InstallOptions::default(),
-        )
-        .unwrap();
+        install(&InstallSource::Path(src.clone())).unwrap();
         let root = env.agents.path().join("plugins");
         let foreign = root.join(format!("{REPLACED_PREFIX}other-deadbeef"));
         std::fs::create_dir_all(&foreign).unwrap();
         std::fs::write(foreign.join("keep"), b"keep").unwrap();
 
         write_plugin(&src, "alpha", "2.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        install(&InstallSource::Path(src)).unwrap();
 
         let leftovers: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
@@ -1804,9 +1603,9 @@ mod tests {
     fn internal_dirs_stay_out_of_list_and_auto_update() {
         let env = isolated();
         let src = local_plugin(&env, "alpha", "2.0.0");
-        install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+        install(&InstallSource::Path(src)).unwrap();
         let root = env.agents.path().join("plugins");
-        // 同名旧版本备份：带 auto-update 元数据，证明 auto_update 也不碰它。
+        // 同名旧版本备份：带安装元数据，证明扫描也不把它当插件。
         let backup = root.join(format!("{REPLACED_PREFIX}alpha-cafebabe"));
         write_plugin(&backup, "alpha", "1.0.0");
         write_install_info(
@@ -1815,8 +1614,6 @@ mod tests {
                 source: "file:///nonexistent/repo".into(),
                 commit: Some("0000000".into()),
                 installed_at: 1,
-                last_update_check: None,
-                auto_update: true,
             },
         )
         .unwrap();
@@ -1835,11 +1632,6 @@ mod tests {
         );
         assert_eq!(items[0].plugin.manifest.version, "2.0.0", "必须是活插件");
         assert_eq!(items[0].plugin.root, root.join("alpha"));
-
-        // 备份若被扫到，会因 file:// 源不可达产生失败结果；空结果即排除生效。
-        let results =
-            auto_update_all(crate::message::now_ts() + AUTO_UPDATE_INTERVAL_SECS).unwrap();
-        assert!(results.is_empty(), "{results:?}");
     }
 
     /// I01：显式 `enabledPlugins: []` 后 enable 写入白名单，且只启用它。
@@ -1849,7 +1641,7 @@ mod tests {
         let cwd = env.agents.path();
         for name in ["alpha", "beta"] {
             let src = local_plugin(&env, name, "1.0.0");
-            install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+            install(&InstallSource::Path(src)).unwrap();
         }
         std::fs::write(
             env.config.path().join("settings.json"),
@@ -1878,7 +1670,7 @@ mod tests {
         let cwd = env.agents.path();
         for name in ["alpha", "beta"] {
             let src = local_plugin(&env, name, "1.0.0");
-            install(&InstallSource::Path(src), &InstallOptions::default()).unwrap();
+            install(&InstallSource::Path(src)).unwrap();
         }
         std::fs::write(
             env.config.path().join("settings.json"),
@@ -1942,11 +1734,7 @@ mod tests {
             (env.config.path(), src.join("skills/dirlink")),
         ] {
             std::os::unix::fs::symlink(target, &link).unwrap();
-            let err = install(
-                &InstallSource::Path(src.clone()),
-                &InstallOptions::default(),
-            )
-            .unwrap_err();
+            let err = install(&InstallSource::Path(src.clone())).unwrap_err();
             let message = err.to_string();
             assert!(message.contains("symlink"), "{message}");
             assert!(message.contains(&link.display().to_string()), "{message}");
@@ -1965,7 +1753,7 @@ mod tests {
         let src = local_plugin(&env, "alpha", "1.0.0");
         let socket = src.join("socket");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let err = install(&InstallSource::Path(src), &InstallOptions::default()).unwrap_err();
+        let err = install(&InstallSource::Path(src)).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("non-regular file"), "{message}");
         assert!(message.contains(&socket.display().to_string()), "{message}");

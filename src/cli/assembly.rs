@@ -63,16 +63,7 @@ pub async fn build(opts: &AssemblyOpts) -> instagent::Result<Runtime> {
     let cli_plugins: Vec<PathBuf> = opts
         .cli_plugins
         .iter()
-        .map(|p| {
-            let raw = p.display().to_string();
-            let expanded = shellexpand::tilde(&raw);
-            let path = PathBuf::from(expanded.as_ref());
-            if path.is_relative() {
-                opts.cwd.join(path)
-            } else {
-                path
-            }
-        })
+        .map(|p| instagent::config::expand_plugin_path(&p.display().to_string(), &opts.cwd))
         .collect();
     let plugins = discover_with_bundled(&opts.cwd, &settings, &config.plugins, &cli_plugins)?;
     for skipped in &plugins.skipped {

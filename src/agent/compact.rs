@@ -81,33 +81,6 @@ pub fn should_compact(usage: &Usage, context_limit: u32, threshold: f32) -> bool
     f64::from(usage.input) >= (f64::from(context_limit) * f64::from(threshold)).floor()
 }
 
-/// 每轮开头的条件压缩；发生则返回 true 并发 Event::Compacted。
-///
-/// 兼容包装（取消语义见 [`maybe_cancelable`]）：用永不取消的 token 调用，
-/// 行为与旧 `maybe` 一致。`08` 接线 CLI 取消时请用 [`maybe_cancelable`]。
-pub async fn maybe(
-    agent: &Agent,
-    session: &mut Session,
-    events: &mpsc::Sender<Event>,
-) -> crate::Result<bool> {
-    maybe_cancelable(agent, session, events, &CancellationToken::new()).await
-}
-
-/// ContextOverflow / `/compact` 的强制压缩。
-///
-/// 兼容包装（取消语义见 [`force_cancelable`]）：用永不取消的 token 调用，
-/// 行为与旧 `force` 一致（摘要空/缺 Done 照样报错、不改会话）。
-/// `08` 接线 CLI 取消时请用 [`force_cancelable`]。
-pub async fn force(
-    agent: &Agent,
-    session: &mut Session,
-    events: &mpsc::Sender<Event>,
-) -> crate::Result<()> {
-    force_cancelable(agent, session, events, &CancellationToken::new())
-        .await
-        .map(|_| ())
-}
-
 /// 可取消的条件压缩（供 `08` 接线 CLI 取消）：
 /// - 取消时不改会话、不发事件，返回 `Ok(false)`；调用方应随后检查 token
 ///   并按 `Interrupted` 收尾（`run_turn` 已如此处理）；
@@ -456,10 +429,6 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
         async fn stream(
             &self,
             request: Request<'_>,
@@ -524,17 +493,10 @@ mod tests {
     enum Entry {
         Maybe,
         Force,
-        MaybeCancelable,
-        ForceCancelable,
     }
 
     impl Entry {
-        const ALL: [Self; 4] = [
-            Self::Maybe,
-            Self::Force,
-            Self::MaybeCancelable,
-            Self::ForceCancelable,
-        ];
+        const ALL: [Self; 2] = [Self::Maybe, Self::Force];
 
         async fn apply(
             self,
@@ -544,12 +506,10 @@ mod tests {
         ) -> crate::Result<()> {
             let token = CancellationToken::new();
             match self {
-                Self::Maybe => maybe(agent, session, tx).await.map(|_| ()),
-                Self::Force => force(agent, session, tx).await,
-                Self::MaybeCancelable => maybe_cancelable(agent, session, tx, &token)
+                Self::Maybe => maybe_cancelable(agent, session, tx, &token)
                     .await
                     .map(|_| ()),
-                Self::ForceCancelable => force_cancelable(agent, session, tx, &token)
+                Self::Force => force_cancelable(agent, session, tx, &token)
                     .await
                     .map(|_| ()),
             }
@@ -726,7 +686,11 @@ mod tests {
                 }));
                 assert_resumable(&session);
                 // 已替换的旧 usage 不应触发重复压缩。
-                assert!(!maybe(&agent, &mut session, &tx).await.unwrap());
+                assert!(
+                    !maybe_cancelable(&agent, &mut session, &tx, &CancellationToken::new())
+                        .await
+                        .unwrap()
+                );
                 assert_eq!(files(&session), written);
                 assert!(rx.try_recv().is_err());
                 let seen = provider.seen.lock().unwrap();

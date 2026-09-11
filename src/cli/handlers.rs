@@ -13,7 +13,7 @@ use instagent::agent::TurnResult;
 use instagent::hooks::{HookDecision, HookEvent};
 use instagent::message::{Content, Role, Usage};
 use instagent::plugin::install;
-use instagent::plugin::install::{InstallOptions, InstallSource};
+use instagent::plugin::install::InstallSource;
 use instagent::session::Session;
 
 use super::assembly::{self, AssemblyOpts};
@@ -379,17 +379,13 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
     let cwd = std::env::current_dir()?;
     let mut out = std::io::stdout();
     match action {
-        PluginAction::Install {
-            source,
-            auto_update,
-        } => {
+        PluginAction::Install { source } => {
             let src = if Path::new(&source).is_dir() {
                 InstallSource::Path(PathBuf::from(&source))
             } else {
                 InstallSource::GitUrl(source.clone())
             };
-            let plugin = install::install(&src, &InstallOptions { auto_update })
-                .with_context(|| format!("install {source}"))?;
+            let plugin = install::install(&src).with_context(|| format!("install {source}"))?;
             writeln!(
                 out,
                 "installed `{}` v{} at {}",
@@ -485,7 +481,6 @@ pub fn plugin(action: PluginAction) -> instagent::Result<()> {
                             .map(|c| c.chars().take(8).collect::<String>())
                             .unwrap_or_else(|| "-".into())
                     )?;
-                    writeln!(out, "auto-update: {}", info.auto_update)?;
                 }
                 None => writeln!(out, "source: (manual copy)")?,
             }

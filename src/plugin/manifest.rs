@@ -24,15 +24,14 @@
 //! （只读，commit 4ad43df）。
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{bail, Context};
 use regex::Regex;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::{Map, Value};
 
 /// 客户端不联网取 schema，只用该字符串选择本地校验规则。
@@ -43,8 +42,7 @@ pub const PLUGIN_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/plu
 /// 不把坏文件读进内存或错误日志。
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-/// 回显进错误消息里的用户输入的最大字符数，超出截断加省略号。
-const MAX_ECHO_CHARS: usize = 120;
+use super::brief;
 
 /// 规范 §5.2 的封闭顶层字段集；其余字段报告并忽略。
 const KNOWN_FIELDS: [&str; 10] = [
@@ -60,19 +58,8 @@ const KNOWN_FIELDS: [&str; 10] = [
     "extensions",
 ];
 
-/// 本客户端的扩展命名空间（§8.1：其内容规则由客户端自定）。
-const INSTAGENT_NAMESPACE: &str = "dev.instagent";
-
 /// 错误前缀的构造口径：来源文件 + 插件名。
 type Source<'a> = &'a dyn Fn() -> String;
-
-fn brief(value: &str) -> String {
-    let mut out: String = value.chars().take(MAX_ECHO_CHARS).collect();
-    if out.chars().count() < value.chars().count() {
-        out.push('…');
-    }
-    out
-}
 
 /// `类型 + 值摘要`：错误里说明“实际拿到了什么”，值部分有界。
 fn got(value: &Value) -> String {
@@ -109,14 +96,8 @@ fn namespace_regex() -> &'static Regex {
     })
 }
 
-/// `dev.instagent.minKernel` 之类的小版本号：点分数字（`1`、`0.1`、`0.1.0`）。
-fn dotted_version_regex() -> &'static Regex {
-    static VERSION: OnceLock<Regex> = OnceLock::new();
-    VERSION.get_or_init(|| Regex::new(r"^\d+(\.\d+)*$").expect("dotted version pattern is valid"))
-}
-
 /// `author` 允许纯字符串或对象（规范字段）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum Author {
     Name(String),
@@ -130,7 +111,7 @@ pub enum Author {
 }
 
 /// 规范顶层十个字段；未知字段报告后忽略（见模块文档的兼容策略）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PluginManifest {
     #[serde(rename = "$schema", default)]
     pub schema: Option<String>,
@@ -174,56 +155,7 @@ pub fn read_manifest(dir: &Path) -> crate::Result<PluginManifest> {
 
 /// metadata 只做预检；同一文件句柄的实际读取也限制到上限 + 1 字节。
 fn read_bounded(path: &Path) -> crate::Result<String> {
-    let file = fs::File::open(path).with_context(|| {
-        format!(
-            "Failed to read {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
-            path.display()
-        )
-    })?;
-    let size = file
-        .metadata()
-        .with_context(|| {
-            format!(
-                "Failed to stat {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
-                path.display()
-            )
-        })?
-        .len();
-    read_bounded_from(path, file, size)
-}
-
-fn read_bounded_from(path: &Path, reader: impl Read, metadata_size: u64) -> crate::Result<String> {
-    if metadata_size > MAX_MANIFEST_BYTES {
-        bail!(
-            "{}: plugin manifest is {metadata_size} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| {
-            format!(
-                "Failed to read {} (plugin manifest, {MAX_MANIFEST_BYTES} byte limit)",
-                path.display()
-            )
-        })?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        bail!(
-            "{}: plugin manifest is at least {} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
-            path.display(),
-            bytes.len()
-        );
-    }
-    String::from_utf8(bytes)
-        .map_err(|err| err.utf8_error())
-        .with_context(|| {
-            format!(
-                "{}: plugin manifest is not valid UTF-8 ({MAX_MANIFEST_BYTES} byte limit)",
-                path.display()
-            )
-        })
+    super::read_bounded(path, MAX_MANIFEST_BYTES, "plugin manifest")
 }
 
 /// 字段级校验（类型形状 + 跨字段约束），通过后产出类型化 manifest。
@@ -415,9 +347,6 @@ fn validate_extensions(fields: &mut Map<String, Value>, source: Source) -> crate
                         got(value)
                     );
                 }
-                if namespace == INSTAGENT_NAMESPACE {
-                    validate_instagent_extension(value, source)?;
-                }
             }
         }
         Some(other) => {
@@ -437,22 +366,6 @@ fn validate_extensions(fields: &mut Map<String, Value>, source: Source) -> crate
         );
     }
     Ok(())
-}
-
-/// 本客户端命名空间内已知的标志；其余键留给以后（前向兼容）。
-fn validate_instagent_extension(value: &Value, source: Source) -> crate::Result<()> {
-    let Some(min_kernel) = value.get("minKernel") else {
-        return Ok(());
-    };
-    match min_kernel {
-        Value::String(version) if dotted_version_regex().is_match(version) => Ok(()),
-        other => bail!(
-            "{}: field `extensions.{INSTAGENT_NAMESPACE}.minKernel` must be a dotted version \
-             string (suggested: `0.1`), got {}",
-            source(),
-            got(other)
-        ),
-    }
 }
 
 /// 可选字符串字段只做类型校验（§5.4：规范未加显式约束，空串合法）。
@@ -861,24 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn instagent_namespace_flags_are_typed() {
-        // 自己的命名空间：未知标志前向兼容，minKernel 有类型要求。
-        let m = load_json(&manifest_json(
-            r#""extensions":{"dev.instagent":{"minKernel":"0.1","futureFlag":true}}"#,
-        ))
-        .unwrap();
-        assert!(m.extensions.contains_key("dev.instagent"));
-
-        for bad in [r#"1"#, r#""latest""#, r#"{"a":1}"#, r#"null"#] {
-            let msg = error_of(&manifest_json(&format!(
-                r#""extensions":{{"dev.instagent":{{"minKernel":{bad}}}}}"#
-            )));
-            assert!(msg.contains("minKernel"), "{bad}: {msg}");
-            assert!(msg.contains("dotted version"), "{bad}: {msg}");
-        }
-    }
-
-    #[test]
     fn errors_carry_plugin_json_path_and_plugin_name() {
         let dir = plugin_dir("bad-version");
         let msg = read_manifest(dir.path()).unwrap_err().to_string();
@@ -916,7 +811,17 @@ mod tests {
     fn manifest_reader_limits_growth_after_metadata_precheck() {
         let path = Path::new("/plugins/demo/plugin.json");
         let text = manifest_json(r#""description":"增长🙂""#);
-        assert_eq!(read_bounded_from(path, text.as_bytes(), 0).unwrap(), text);
+        assert_eq!(
+            crate::plugin::read_bounded_from(
+                path,
+                text.as_bytes(),
+                0,
+                MAX_MANIFEST_BYTES,
+                "plugin manifest"
+            )
+            .unwrap(),
+            text
+        );
 
         let mut bytes = b"test-only-manifest-secret".to_vec();
         bytes.push(0xff);
@@ -927,7 +832,14 @@ mod tests {
             (MAX_MANIFEST_BYTES + 1, 0),
         ] {
             let mut reader = std::io::Cursor::new(&bytes);
-            let err = read_bounded_from(path, &mut reader, metadata_size).unwrap_err();
+            let err = crate::plugin::read_bounded_from(
+                path,
+                &mut reader,
+                metadata_size,
+                MAX_MANIFEST_BYTES,
+                "plugin manifest",
+            )
+            .unwrap_err();
             assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
             let msg = format!("{err:#}");
             assert!(msg.contains(&path.display().to_string()), "{msg}");

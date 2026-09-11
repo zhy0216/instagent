@@ -16,13 +16,12 @@
 //!   回显进错误里的用户输入（command 等）做截断，防坏配置放大日志。
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
-use serde::Serialize;
 
 use crate::plugin::Plugin;
 
@@ -30,18 +29,9 @@ use crate::plugin::Plugin;
 /// 不让坏文件把整坨内容读进内存或灌进错误日志。
 pub const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// 回显进错误消息里的用户输入的最大字符数，超出截断加省略号。
-const MAX_ECHO_CHARS: usize = 120;
+use super::brief;
 
-fn brief(value: &str) -> String {
-    let mut out: String = value.chars().take(MAX_ECHO_CHARS).collect();
-    if out.chars().count() < value.chars().count() {
-        out.push('…');
-    }
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum McpServerType {
     Stdio,
@@ -51,24 +41,18 @@ pub enum McpServerType {
 }
 
 /// 单个 MCP server 的运行时配置（已完成变量展开）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     /// 插件内的 server 名（工具前缀 `<server>__<tool>` 用）。
     pub name: String,
     pub r#type: McpServerType,
     /// stdio：单个可执行名或 `./` 开头的插件相对路径，不做变量展开。
-    #[serde(default)]
     pub command: Option<String>,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// streamable-http。`headers` 不承载凭据（规范规定，远程鉴权 v1 不做）。
-    #[serde(default)]
     pub url: Option<String>,
-    #[serde(default)]
     pub headers: BTreeMap<String, String>,
 }
 
@@ -137,56 +121,7 @@ pub fn load_servers(plugin: &Plugin, plugin_data: &Path) -> crate::Result<Vec<Mc
 
 /// metadata 只做预检；同一文件句柄的实际读取也限制到上限 + 1 字节。
 fn read_bounded(path: &Path) -> crate::Result<String> {
-    let file = fs::File::open(path).with_context(|| {
-        format!(
-            "Failed to read {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
-            path.display()
-        )
-    })?;
-    let size = file
-        .metadata()
-        .with_context(|| {
-            format!(
-                "Failed to stat {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
-                path.display()
-            )
-        })?
-        .len();
-    read_bounded_from(path, file, size)
-}
-
-fn read_bounded_from(path: &Path, reader: impl Read, metadata_size: u64) -> crate::Result<String> {
-    if metadata_size > MAX_MCP_CONFIG_BYTES {
-        bail!(
-            "{}: mcp config is {metadata_size} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_MCP_CONFIG_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| {
-            format!(
-                "Failed to read {} (mcp config, {MAX_MCP_CONFIG_BYTES} byte limit)",
-                path.display()
-            )
-        })?;
-    if bytes.len() as u64 > MAX_MCP_CONFIG_BYTES {
-        bail!(
-            "{}: mcp config is at least {} bytes, over the {MAX_MCP_CONFIG_BYTES} byte limit",
-            path.display(),
-            bytes.len()
-        );
-    }
-    String::from_utf8(bytes)
-        .map_err(|err| err.utf8_error())
-        .with_context(|| {
-            format!(
-                "{}: mcp config is not valid UTF-8 ({MAX_MCP_CONFIG_BYTES} byte limit)",
-                path.display()
-            )
-        })
+    super::read_bounded(path, MAX_MCP_CONFIG_BYTES, "mcp config")
 }
 
 /// 返回 (配置文件路径, 是否草案 `.mcp.json`)；两者都不存在时 `None`。
@@ -319,26 +254,9 @@ fn validate_command(path: &Path, name: &str, command: &str) -> crate::Result<()>
 
 /// 单次、非递归地展开 `${PLUGIN_ROOT}` / `${PLUGIN_DATA}`，其余 `${...}` 原样保留。
 fn expand_vars(value: &str, plugin_root: &Path, plugin_data: &Path) -> String {
-    const ROOT: &str = "${PLUGIN_ROOT}";
-    const DATA: &str = "${PLUGIN_DATA}";
-    let root = plugin_root.display().to_string();
-    let data = plugin_data.display().to_string();
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while !rest.is_empty() {
-        if let Some(tail) = rest.strip_prefix(ROOT) {
-            out.push_str(&root);
-            rest = tail;
-        } else if let Some(tail) = rest.strip_prefix(DATA) {
-            out.push_str(&data);
-            rest = tail;
-        } else {
-            let c = rest.chars().next().unwrap();
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
-        }
-    }
-    out
+    value
+        .replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
+        .replace("${PLUGIN_DATA}", &plugin_data.display().to_string())
 }
 
 #[cfg(test)]
@@ -625,7 +543,17 @@ mod tests {
     fn config_reader_limits_growth_after_metadata_precheck() {
         let path = Path::new("/plugins/demo/mcp.json");
         let text = r#"{"mcpServers":{},"description":"增长🙂"}"#;
-        assert_eq!(read_bounded_from(path, text.as_bytes(), 0).unwrap(), text);
+        assert_eq!(
+            crate::plugin::read_bounded_from(
+                path,
+                text.as_bytes(),
+                0,
+                MAX_MCP_CONFIG_BYTES,
+                "mcp config"
+            )
+            .unwrap(),
+            text
+        );
 
         let mut bytes = b"test-only-mcp-secret".to_vec();
         bytes.push(0xff);
@@ -636,7 +564,14 @@ mod tests {
             (MAX_MCP_CONFIG_BYTES + 1, 0),
         ] {
             let mut reader = std::io::Cursor::new(&bytes);
-            let err = read_bounded_from(path, &mut reader, metadata_size).unwrap_err();
+            let err = crate::plugin::read_bounded_from(
+                path,
+                &mut reader,
+                metadata_size,
+                MAX_MCP_CONFIG_BYTES,
+                "mcp config",
+            )
+            .unwrap_err();
             assert_eq!(reader.position(), expected_read, "metadata={metadata_size}");
             let msg = format!("{err:#}");
             assert!(msg.contains(&path.display().to_string()), "{msg}");

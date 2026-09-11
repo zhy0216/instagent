@@ -136,10 +136,6 @@ impl MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
-    fn name(&self) -> &str {
-        "mock"
-    }
-
     async fn stream(
         &self,
         _req: Request<'_>,
@@ -177,10 +173,6 @@ struct PendingStreamProvider {
 
 #[async_trait]
 impl Provider for PendingStreamProvider {
-    fn name(&self) -> &str {
-        "pending"
-    }
-
     async fn stream(
         &self,
         _req: Request<'_>,
@@ -198,10 +190,6 @@ struct HangFoldProvider {
 
 #[async_trait]
 impl Provider for HangFoldProvider {
-    fn name(&self) -> &str {
-        "hang-fold"
-    }
-
     async fn stream(
         &self,
         _req: Request<'_>,
@@ -1356,7 +1344,14 @@ async fn manual_compact_then_next_turn_continues() {
     assert_eq!(result.unwrap(), TurnResult::Done);
 
     let (tx, mut rx) = mpsc::channel(8);
-    compact::force(&agent, &mut session, &tx).await.unwrap();
+    compact::force_cancelable(
+        &agent,
+        &mut session,
+        &tx,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert!(drain(&mut rx)
         .iter()
         .any(|e| matches!(e, Event::Compacted { .. })));
@@ -1687,7 +1682,14 @@ async fn failed_summary_keeps_session_file_intact() {
         let mut session = compactable_session(dir.path());
         let before = file_bytes(&session);
         let (tx, mut rx) = mpsc::channel(8);
-        let err = compact::force(&agent, &mut session, &tx).await.unwrap_err();
+        let err = compact::force_cancelable(
+            &agent,
+            &mut session,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("empty"), "{err:#}");
         assert_eq!(file_bytes(&session), before, "空摘要不得改文件");
         assert_eq!(session.messages.len(), 2);
@@ -1708,7 +1710,14 @@ async fn failed_summary_keeps_session_file_intact() {
         let mut session = compactable_session(dir.path());
         let before = file_bytes(&session);
         let (tx, mut rx) = mpsc::channel(8);
-        let err = compact::force(&agent, &mut session, &tx).await.unwrap_err();
+        let err = compact::force_cancelable(
+            &agent,
+            &mut session,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("without Done"), "{err:#}");
         assert_eq!(file_bytes(&session), before, "缺 Done 不得改文件");
         assert!(
@@ -1727,7 +1736,14 @@ async fn failed_summary_keeps_session_file_intact() {
         let mut session = compactable_session(dir.path());
         let before = file_bytes(&session);
         let (tx, _) = mpsc::channel(8);
-        assert!(compact::force(&agent, &mut session, &tx).await.is_err());
+        assert!(compact::force_cancelable(
+            &agent,
+            &mut session,
+            &tx,
+            &tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_err());
         assert_eq!(file_bytes(&session), before, "提供方错误不得改文件");
     }
 }

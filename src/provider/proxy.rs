@@ -147,10 +147,6 @@ impl ProxyProvider {
 
 #[async_trait]
 impl Provider for ProxyProvider {
-    fn name(&self) -> &str {
-        &self.def.name
-    }
-
     async fn stream(
         &self,
         req: Request<'_>,
@@ -398,8 +394,6 @@ mod tests {
         ProviderDef {
             name: "px".to_string(),
             engine: EngineKind::Proxy,
-            display_name: None,
-            description: None,
             api_key_env: None,
             base_url: None,
             headers: BTreeMap::from([("x-target-port".to_string(), "${PORT}".to_string())]),

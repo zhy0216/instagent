@@ -63,7 +63,6 @@ rmcp = { version = "3.0.0", features = [
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-shellexpand = "3"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 # 只用 CancellationToken，默认 feature 即可（原 "full" 是多余的）。

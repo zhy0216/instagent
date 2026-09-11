@@ -31,17 +31,10 @@ pub const MAX_FUNCTION_NAME_LENGTH: usize = 64;
 /// （goose formats/openai.rs:1918 sanitize_function_name 的规则，长度取 64）。
 /// 幂等：sanitize(sanitize(x)) == sanitize(x)。
 pub fn sanitize_function_name(name: &str) -> String {
-    let sanitized: String = name
+    let sanitized = crate::tools::sanitize_name_chars(name)
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
         .take(MAX_FUNCTION_NAME_LENGTH)
-        .collect();
+        .collect::<String>();
     if sanitized.is_empty() {
         // 空名同样不合法（{1,64}），给一个稳定的占位名。
         "tool".to_string()
@@ -99,22 +92,14 @@ pub struct PendingCall {
 // 引擎只声明 EngineKind 与补充鉴权头。
 // ---------------------------------------------------------------------------
 
-/// 引擎种类名（小写，错误文案用）。
-fn engine_kind_name(kind: EngineKind) -> &'static str {
-    match kind {
-        EngineKind::Openai => "openai",
-        EngineKind::Proxy => "proxy",
-    }
-}
-
-/// 共享构造骨架：校验 engine 种类与 base_url、按 `api_key_env` 读非空白密钥、
-/// 按 `timeout_seconds` 建 client。合法密钥保留原值，未声明变量则支持无密钥。
-pub fn engine_parts(def: &ProviderDef, kind: EngineKind) -> crate::Result<(String, HttpClient)> {
+/// 共享构造骨架：校验 engine 种类（openai 引擎专用）与 base_url、按
+/// `api_key_env` 读非空白密钥、按 `timeout_seconds` 建 client。合法密钥保留
+/// 原值，未声明变量则支持无密钥。
+pub fn engine_parts(def: &ProviderDef) -> crate::Result<(String, HttpClient)> {
     anyhow::ensure!(
-        def.engine == kind,
-        "provider {} is not an {} engine",
-        def.name,
-        engine_kind_name(kind)
+        def.engine == EngineKind::Openai,
+        "provider {} is not an openai engine",
+        def.name
     );
     anyhow::ensure!(
         def.base_url.as_deref().is_some_and(|u| !u.is_empty()),
@@ -172,10 +157,11 @@ pub struct StreamState {
 }
 
 /// 引擎侧「事件 → 状态」回调 + 收尾钩子；驱动器负责弹队列、查 ended、
-/// 传输错误转发与断流收尾。
+/// 传输错误转发与断流收尾。引擎内部可携带超出 [`StreamState`] 的额外字段，
+/// 经 [`StreamEngine::state`] 把输出队列 / ended 标记交给驱动器。
 pub trait StreamEngine: Send {
-    fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>>;
-    fn ended(&mut self) -> &mut bool;
+    /// 驱动器的输出入口：`out` 队列 + `ended` 标记。
+    fn state(&mut self) -> &mut StreamState;
     /// 处理一条 SSE 事件；`Err` 以该错误终止流。
     fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError>;
     /// `[DONE]` / EOF 收尾：`Ok` = 有完成信息（`[DONE]` 或非空
@@ -216,30 +202,30 @@ pub fn sse_to_stream_events<E: StreamEngine + 'static>(
     }
     stream::unfold(Driver { events, engine }, |mut d| async move {
         loop {
-            if let Some(item) = d.engine.out().pop_front() {
+            if let Some(item) = d.engine.state().out.pop_front() {
                 return Some((item, d));
             }
-            if *d.engine.ended() {
+            if d.engine.state().ended {
                 return None;
             }
             match d.events.next().await {
                 Some(Ok(ev)) => {
                     if let Err(err) = d.engine.apply(&ev) {
-                        d.engine.out().push_back(Err(err));
-                        *d.engine.ended() = true;
+                        d.engine.state().out.push_back(Err(err));
+                        d.engine.state().ended = true;
                     }
                 }
                 Some(Err(err)) => {
-                    d.engine.out().push_back(Err(to_provider_error(err)));
-                    *d.engine.ended() = true;
+                    d.engine.state().out.push_back(Err(to_provider_error(err)));
+                    d.engine.state().ended = true;
                 }
                 // EOF 收尾：finalize 返回 Err = 断流（无完成信息），
                 // 把错误交给消费者；正常完成时引擎已自行置 ended。
                 None => {
                     if let Err(err) = d.engine.finalize() {
-                        d.engine.out().push_back(Err(err));
+                        d.engine.state().out.push_back(Err(err));
                     }
-                    *d.engine.ended() = true;
+                    d.engine.state().ended = true;
                 }
             }
         }
@@ -269,12 +255,8 @@ mod tests {
     }
 
     impl StreamEngine for MockEngine {
-        fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>> {
-            &mut self.st.out
-        }
-
-        fn ended(&mut self) -> &mut bool {
-            &mut self.st.ended
+        fn state(&mut self) -> &mut StreamState {
+            &mut self.st
         }
 
         fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
@@ -454,8 +436,6 @@ pub mod testutil {
         ProviderDef {
             name: name.into(),
             engine,
-            display_name: None,
-            description: None,
             api_key_env: None,
             base_url: base_url.map(str::to_string),
             headers: BTreeMap::new(),

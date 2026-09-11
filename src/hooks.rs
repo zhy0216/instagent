@@ -215,7 +215,7 @@ pub struct RegisteredHook {
     pub plugin_root: PathBuf,
     pub event: HookEvent,
     pub matcher: Option<Regex>,
-    pub group: HookMatcherGroup,
+    pub hooks: Vec<HookDef>,
 }
 
 /// 决策：退出码 2 → Block(stderr)；stdout `{"decision":"block"}` → Block；
@@ -281,7 +281,7 @@ impl Hooks {
                 .get(&entry.plugin)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            for hook in &entry.group.hooks {
+            for hook in &entry.hooks {
                 let decision = run_hook(
                     hook,
                     &entry.plugin,
@@ -452,10 +452,7 @@ fn register_event_groups(
             plugin_root: plugin.root.clone(),
             event,
             matcher,
-            group: HookMatcherGroup {
-                matcher: matcher_src,
-                hooks,
-            },
+            hooks,
         });
     }
 }

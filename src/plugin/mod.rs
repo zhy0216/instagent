@@ -58,6 +58,83 @@ pub(crate) fn located(path: &Path) -> String {
     abs.display().to_string()
 }
 
+/// 回显进错误消息里的用户输入的最大字符数，超出截断加省略号。
+pub(crate) fn brief(value: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 120;
+    let mut out: String = value.chars().take(MAX_ECHO_CHARS).collect();
+    if out.chars().count() < value.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+/// 有界读取：metadata 预检 + `take(limit+1)` 兜住预检与读取之间的增长竞态，
+/// 超限 / 非 UTF-8 / IO 错误都带 `path` 与 `label` 报可诊断错误（不静默截断）。
+pub(crate) fn read_bounded(path: &Path, limit: u64, label: &str) -> crate::Result<String> {
+    use anyhow::Context as _;
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to read {} ({label}, {limit} byte limit)",
+            path.display()
+        )
+    })?;
+    let size = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "Failed to stat {} ({label}, {limit} byte limit)",
+                path.display()
+            )
+        })?
+        .len();
+    read_bounded_from(path, file, size, limit, label)
+}
+
+/// [`read_bounded`] 的 reader 原语：不能只信打开后取得的 metadata 长度，
+/// Reader 层仍限制实际字节数（测试用它注入增长竞态）。
+pub(crate) fn read_bounded_from(
+    path: &Path,
+    reader: impl std::io::Read,
+    metadata_size: u64,
+    limit: u64,
+    label: &str,
+) -> crate::Result<String> {
+    use anyhow::bail;
+    use anyhow::Context as _;
+    use std::io::Read as _;
+    if metadata_size > limit {
+        bail!(
+            "{}: {label} is {metadata_size} bytes, over the {limit} byte limit",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "Failed to read {} ({label}, {limit} byte limit)",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > limit {
+        bail!(
+            "{}: {label} is at least {} bytes, over the {limit} byte limit",
+            path.display(),
+            bytes.len()
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| err.utf8_error())
+        .with_context(|| {
+            format!(
+                "{}: {label} is not valid UTF-8 ({limit} byte limit)",
+                path.display()
+            )
+        })
+}
+
 /// 单个插件名的启用判定（第三版 §2.10 + ADR 0003 D5）。白名单（含显式 `[]`
 /// = 禁用全部）说了算；从未表态才看 `disabledPlugins`。discovery 与 bundled
 /// 共用，避免两处各自 `is_empty()` 把终值 `[]` 读成"全启用"。

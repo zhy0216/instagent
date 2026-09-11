@@ -12,8 +12,9 @@
 //! 路径）与 provider stream 折叠（`stream_assistant`）。工具执行（三段式
 //! 并行、图片预算、取消回收，契约见私有模块 `exec`）、事件契约与背压
 //! sink（[`event`]）、自动压缩（[`compact`]）、系统提示（[`prompt`]）
-//! 各自独立成单元。[`PARALLEL_TOOL_LIMIT`]、[`SESSION_IMAGE_BUDGET`]、
-//! [`EMIT_GRACE`]、[`dropped_event_count`] 经 re-export 保持原公开路径。
+//! 各自独立成单元。`PARALLEL_TOOL_LIMIT`、`SESSION_IMAGE_BUDGET`、
+//! `EMIT_GRACE`、`dropped_event_count` 定义见各自的私有单元，此处
+//! `pub(crate)` re-export 供模块内引用。
 //!
 //! 残缺 provider stream（todo 11 / A3）：`ToolUseEnd` 前 EOF 的 tool-use
 //! 保留已收集片段、按 malformed 提升（loop 给它补 is_error ToolResult，
@@ -55,11 +56,7 @@ use crate::session::Session;
 use crate::tools::Registry;
 use crate::ProviderError;
 
-pub use event::dropped_event_count;
 pub use event::Event;
-pub use event::EMIT_GRACE;
-pub use exec::PARALLEL_TOOL_LIMIT;
-pub use exec::SESSION_IMAGE_BUDGET;
 
 /// loop 的行为参数（从 `01` Config 装配而来）。
 #[derive(Debug, Clone)]
@@ -256,8 +253,7 @@ impl Agent {
                         }
                         continue;
                     }
-                    event::emit(&events, Event::Error(e.to_string())).await;
-                    return Err(e);
+                    return Err(fail_with(&events, e).await);
                 }
             };
 
@@ -269,8 +265,7 @@ impl Agent {
             // 的 malformed 块能通过校验，走已有 ToolResult 流程。
             if !streamed.message.content.is_empty() {
                 if let Err(err) = validate_assistant(session, &streamed.message) {
-                    event::emit(&events, Event::Error(err.to_string())).await;
-                    return Err(err);
+                    return Err(fail_with(&events, err).await);
                 }
             }
 
@@ -298,7 +293,7 @@ impl Agent {
                     &streamed,
                     &cancel,
                     &events,
-                    SESSION_IMAGE_BUDGET,
+                    exec::SESSION_IMAGE_BUDGET,
                 )
                 .await
             };
@@ -326,9 +321,11 @@ impl Agent {
             }
             if calls.is_empty() {
                 if last_assistant.trim().is_empty() {
-                    let err = anyhow::anyhow!("provider returned an empty final answer");
-                    event::emit(&events, Event::Error(err.to_string())).await;
-                    return Err(err);
+                    return Err(fail_with(
+                        &events,
+                        anyhow::anyhow!("provider returned an empty final answer"),
+                    )
+                    .await);
                 }
                 // Stop 被阻止 → 注入提醒 user 消息、本轮继续跑（§2.7）。
                 let blocked = match self
@@ -336,10 +333,7 @@ impl Agent {
                     .await
                 {
                     Ok(blocked) => blocked,
-                    Err(err) => {
-                        event::emit(&events, Event::Error(err.to_string())).await;
-                        return Err(err);
-                    }
+                    Err(err) => return Err(fail_with(&events, err).await),
                 };
                 if blocked {
                     continue;
@@ -556,6 +550,12 @@ fn hook_ctx(session: &Session, event: HookEvent) -> HookContext {
     HookContext::new(event, session.header.id.clone()).with_working_dir(session.header.cwd.clone())
 }
 
+/// 事件层上报错误后原样回传，给 `return Err(...)` / `bail!` 的公共退出路径。
+async fn fail_with(events: &mpsc::Sender<Event>, err: anyhow::Error) -> anyhow::Error {
+    event::emit(events, Event::Error(err.to_string())).await;
+    err
+}
+
 /// assistant 消息的全部文本拼接（Stop hook 的 last message）。
 fn assistant_text(message: &Message) -> String {
     message
@@ -639,6 +639,8 @@ fn finish_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::event::dropped_event_count;
+    use super::exec::PARALLEL_TOOL_LIMIT;
     use super::*;
     use crate::agent::compact::COMPACTION_PROMPT;
     use crate::message::INTERRUPTED_TEXT;
@@ -737,10 +739,6 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
         async fn stream(
             &self,
             req: Request<'_>,

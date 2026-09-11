@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use anyhow::bail;
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -45,19 +44,14 @@ pub const MAX_DESCRIPTION_CHARS: usize = 1024;
 /// 发现阶段则跳过该 skill（warn 日志）。
 pub const MAX_SKILL_FILE_BYTES: u64 = 1024 * 1024;
 
-/// SKILL.md frontmatter（Agent Skills 规范）。`allowed-tools` 等未知字段忽略。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// SKILL.md frontmatter（Agent Skills 规范）。`license`、`allowed-tools`
+/// 等未知字段忽略。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SkillFrontmatter {
     /// 必需，1~64，小写字母数字和 `-`，必须等于目录名。
     pub name: String,
     /// 必需，非空，≤1024。
     pub description: String,
-    #[serde(default)]
-    pub license: Option<String>,
-    #[serde(default)]
-    pub compatibility: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<Value>,
 }
 
 /// 一个已发现 skill 的元信息（进系统提示的那一行）。
@@ -687,8 +681,6 @@ mod tests {
         let (fm, body) = parse_frontmatter::<SkillFrontmatter>(text, false).unwrap();
         assert_eq!(fm.name, "my-skill");
         assert_eq!(fm.description, "does things");
-        assert_eq!(fm.license.as_deref(), Some("MIT"));
-        assert_eq!(fm.metadata, Some(json!({"x": 1})));
         assert_eq!(body, "Do it.");
     }
 

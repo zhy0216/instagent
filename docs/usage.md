@@ -378,8 +378,7 @@ instagent plugin update my-plugin    # 只更新一个
 ```
 
 `run` 只加载现有插件，不进行自动更新。部署流程在执行任务前显式运行
-`plugin update`。安装参数 `--auto-update` 和已有安装元数据为兼容旧格式保留，
-不会使 headless 任务启动时自动拉取代码。
+`plugin update`。
 
 本地复制前解析源路径和安装 staging 的目录关系（含既存符号链接）：源包含
 staging、位于 staging 内或两者相同都会明确拒绝，避免递归复制及清理源目录。

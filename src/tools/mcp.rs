@@ -56,6 +56,7 @@ use crate::plugin::mcp_config::McpServerType;
 use crate::plugin::Plugin;
 use crate::subprocess::spawn_long_lived_mcp_subprocess;
 use crate::subprocess::McpProcess;
+use crate::subprocess::Utf8StreamDecoder as StderrUtf8Decoder;
 use crate::tools::ToolCtx;
 use crate::tools::ToolOutput;
 use crate::tools::ToolSource;
@@ -327,50 +328,6 @@ pub const STDERR_MAX_LOGS_PER_WINDOW: usize = 20;
 pub const STDERR_LOG_WINDOW: Duration = Duration::from_secs(10);
 /// 单次读取块大小。
 const STDERR_READ_CHUNK_BYTES: usize = 8192;
-
-/// 增量 UTF-8 解码器：跨块缓冲末尾不完整序列，避免切分损坏合法字符；
-/// 真坏尾在 `finish` 时按 lossy 出 replacement（与 subprocess 的解码同形，本文件内最小实现）。
-#[derive(Default)]
-struct StderrUtf8Decoder {
-    pending: Vec<u8>,
-}
-
-impl StderrUtf8Decoder {
-    fn push(&mut self, chunk: &[u8]) -> String {
-        let mut bytes = std::mem::take(&mut self.pending);
-        bytes.extend_from_slice(chunk);
-        let mut out = String::new();
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            match std::str::from_utf8(&bytes[offset..]) {
-                Ok(valid) => {
-                    out.push_str(valid);
-                    break;
-                }
-                Err(err) => {
-                    let valid_upto = offset + err.valid_up_to();
-                    out.push_str(&String::from_utf8_lossy(&bytes[offset..valid_upto]));
-                    match err.error_len() {
-                        Some(len) => {
-                            out.push(char::REPLACEMENT_CHARACTER);
-                            offset = valid_upto + len;
-                        }
-                        None => {
-                            self.pending.extend_from_slice(&bytes[valid_upto..]);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn finish(&mut self) -> String {
-        let pending = std::mem::take(&mut self.pending);
-        String::from_utf8_lossy(&pending).into_owned()
-    }
-}
 
 /// 采样窗口限速器：窗口内至多 `max_logs` 条，超限计数；`now` 由调用方传入，
 /// 测试可注入时间，不用 sleep。

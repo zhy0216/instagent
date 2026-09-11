@@ -18,8 +18,6 @@ pub mod skills;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -165,12 +163,6 @@ struct Route {
     name: String,
 }
 
-/// 双向映射表：visible → route，(source, real) → visible。
-#[derive(Default, Clone)]
-struct Routes {
-    forward: HashMap<String, Route>,
-}
-
 /// 失败来源的重试状态：下一次重试时机有界退避（note 在快照 errors 里可见）。
 #[derive(Debug, Clone)]
 struct FailureState {
@@ -182,7 +174,7 @@ struct FailureState {
 #[derive(Clone, Default)]
 struct Snapshot {
     specs: Vec<ToolSpec>,
-    routes: Routes,
+    routes: HashMap<String, Route>,
     errors: Vec<String>,
     failures: HashMap<String, FailureState>,
 }
@@ -212,7 +204,6 @@ pub struct Registry {
     state: Mutex<State>,
     /// 异步刷新单飞：同时只允许一个在途枚举，其余合并等待同一快照。
     refresh: tokio::sync::Mutex<()>,
-    generation: AtomicU64,
 }
 
 impl Default for Registry {
@@ -221,7 +212,6 @@ impl Default for Registry {
             sources: Vec::new(),
             state: Mutex::new(State::default()),
             refresh: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
         }
     }
 }
@@ -240,9 +230,8 @@ impl Registry {
     /// 时由装配层调用；会话内新建的 Registry 天然不会命中旧清单。
     /// 递增代次：在途旧枚举完成后不得覆盖新一代快照。
     pub fn invalidate(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
         let mut state = self.state.lock().expect("registry state lock");
-        state.generation = self.generation.load(Ordering::SeqCst);
+        state.generation += 1;
         state.snapshot = None;
     }
 
@@ -339,12 +328,12 @@ impl Registry {
         prev: &HashMap<String, FailureState>,
     ) -> (
         Vec<ToolSpec>,
-        Routes,
+        HashMap<String, Route>,
         Vec<String>,
         HashMap<String, FailureState>,
     ) {
         let mut specs = Vec::new();
-        let mut routes = Routes::default();
+        let mut routes = HashMap::new();
         let mut errors = Vec::new();
         let mut failures = HashMap::new();
 
@@ -386,10 +375,9 @@ impl Registry {
                 let mut retry = 0usize;
                 let visible = loop {
                     let visible = model_visible_name(&candidate);
-                    let taken = routes
-                        .forward
-                        .get(&visible)
-                        .is_some_and(|route| !(route.source == idx && route.name == spec.name));
+                    let taken = routes.get(&visible).is_some_and(|route: &Route| {
+                        !(route.source == idx && route.name == spec.name)
+                    });
                     if !taken {
                         break visible;
                     }
@@ -400,7 +388,7 @@ impl Registry {
                         format!("{prefix}{NAME_SEP}{}{NAME_SEP}{retry}", spec.name)
                     };
                 };
-                routes.forward.insert(
+                routes.insert(
                     visible.clone(),
                     Route {
                         source: idx,
@@ -456,13 +444,7 @@ impl Registry {
 
     fn lookup_cached(&self, visible: &str) -> Option<Route> {
         let state = self.state.lock().expect("registry state lock");
-        state
-            .snapshot
-            .as_ref()?
-            .routes
-            .forward
-            .get(visible)
-            .cloned()
+        state.snapshot.as_ref()?.routes.get(visible).cloned()
     }
 
     pub async fn shutdown(&self) {
@@ -494,21 +476,24 @@ fn conflict_prefix(id: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
-/// FNV-1a 64 位取低 24 位，输出 6 位十六进制（不加依赖的最小稳定哈希）。
-fn short_hash(input: &str) -> String {
+/// FNV-1a 64 位（不加依赖的最小稳定哈希）；调用方自取需要的位宽。
+pub(crate) fn fnv1a64(bytes: impl Iterator<Item = u8>) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
+    for byte in bytes {
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{:06x}", hash & 0x00ff_ffff)
+    hash
 }
 
-/// OpenAI 函数名只允许 `[A-Za-z0-9_-]{1,64}`：非法字符替换成 `_`，超长截断到
-/// 58 字符再接原名的 6 位哈希（共 64）。纯函数、确定性，映射表由 Registry 维护。
-pub fn model_visible_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
+/// FNV-1a 64 位取低 24 位，输出 6 位十六进制（不加依赖的最小稳定哈希）。
+fn short_hash(input: &str) -> String {
+    format!("{:06x}", fnv1a64(input.bytes()) & 0x00ff_ffff)
+}
+
+/// 名字字符清洗：非法字符替换成 `_`（OpenAI 函数名规则的核心循环）。
+pub(crate) fn sanitize_name_chars(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
@@ -516,7 +501,13 @@ pub fn model_visible_name(name: &str) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// OpenAI 函数名只允许 `[A-Za-z0-9_-]{1,64}`：非法字符替换成 `_`，超长截断到
+/// 58 字符再接原名的 6 位哈希（共 64）。纯函数、确定性，映射表由 Registry 维护。
+pub fn model_visible_name(name: &str) -> String {
+    let sanitized = sanitize_name_chars(name);
 
     if sanitized.len() > 64 {
         let mut truncated: String = sanitized.chars().take(58).collect();

@@ -44,9 +44,10 @@ pub const EMIT_GRACE: Duration = Duration::from_millis(250);
 // 分开记账，再把计数挪进调用方自选的 sink。
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// 进程启动以来因接收端断开 / 背压超宽限而被丢弃的事件总数（A2 消费契约的
-/// 计数面；drop 明细见 tracing debug）。
-pub fn dropped_event_count() -> u64 {
+/// 进程启动以来因接收端断开 / 背压超宽限而被丢弃的事件总数（drop 明细见
+/// tracing debug；drop 契约测试的观察面）。
+#[cfg(test)]
+pub(crate) fn dropped_event_count() -> u64 {
     DROPPED_EVENTS.load(Ordering::Relaxed)
 }
 

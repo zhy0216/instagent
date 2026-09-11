@@ -182,11 +182,6 @@ impl ProviderRegistry {
         Ok(&self.resolve(name)?.def)
     }
 
-    /// 定义该 provider 的插件名。
-    pub fn provider_plugin(&self, name: &str) -> Result<String> {
-        Ok(self.resolve(name)?.plugin.clone())
-    }
-
     /// 全部可用名（错误提示 / 补全用）；重名的裸名同时给出 `plugin/name` 形态。
     pub fn names(&self) -> Vec<String> {
         let mut names: BTreeSet<String> = self.entries.iter().map(|e| e.def.name.clone()).collect();
@@ -649,9 +644,6 @@ mod tests {
         );
         let registry = registry(&env, &[p]);
 
-        let provider = registry.get("oai").await.unwrap();
-        assert_eq!(provider.name(), "oai");
-
         let err = format!("{:#}", registry.get("px").await.map(drop).unwrap_err());
         assert!(
             err.contains("spawn proxy command") && err.contains("no-such-proxy-binary-42"),
@@ -889,15 +881,9 @@ mod tests {
             ),
             (262144, vec![])
         );
-        // 新形状字段（display_name / description / model max_tokens，S9）：
+        // 模型字段（max_tokens / context_limit，S9）：
         // bundled JSON 携带它们，装载后可读且校验通过。
         let openai = registry.lookup("openai").unwrap();
-        assert_eq!(openai.display_name.as_deref(), Some("OpenAI"));
-        assert!(openai
-            .description
-            .as_deref()
-            .unwrap()
-            .contains("Chat Completions"));
         let gpt5 = openai.models.iter().find(|m| m.name == "gpt-5").unwrap();
         assert_eq!(gpt5.context_limit, Some(400000));
         assert_eq!(gpt5.max_tokens, Some(32000));

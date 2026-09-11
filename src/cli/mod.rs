@@ -103,8 +103,6 @@ pub enum PluginAction {
     /// git-url 或本地路径
     Install {
         source: String,
-        #[arg(long)]
-        auto_update: bool,
     },
     List,
     Update {

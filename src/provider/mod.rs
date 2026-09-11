@@ -67,7 +67,6 @@ pub struct Request<'a> {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    fn name(&self) -> &str;
     async fn stream(
         &self,
         req: Request<'_>,
@@ -134,8 +133,6 @@ mod tests {
         ProviderDef {
             name: "acme".to_string(),
             engine: EngineKind::Openai,
-            display_name: Some("Acme".to_string()),
-            description: Some("Acme inference".to_string()),
             api_key_env: Some("ACME_API_KEY".to_string()),
             base_url: Some("https://acme.test/v1".to_string()),
             headers: BTreeMap::new(),
@@ -151,9 +148,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_new_shape_and_old_shape_absent_fields() {
-        // 新形状（display_name / description / model max_tokens 齐全）。
         valid_def().validate().unwrap();
-        // 旧形状：展示字段与 model max_tokens 缺省（转换脚本旧产物口径）。
+        // 旧形状：字段缺省（转换脚本旧产物口径）。
         serde_json::from_str::<ProviderDef>(
             r#"{"name":"old","engine":"openai","base_url":"https://old.test/v1"}"#,
         )
@@ -165,20 +161,6 @@ mod tests {
     #[test]
     fn validate_rejects_bad_fields_with_provider_and_field_names() {
         let cases: Vec<(ProviderDef, &str)> = vec![
-            (
-                ProviderDef {
-                    display_name: Some("  ".into()),
-                    ..valid_def()
-                },
-                "display_name",
-            ),
-            (
-                ProviderDef {
-                    description: Some("".into()),
-                    ..valid_def()
-                },
-                "description",
-            ),
             (
                 ProviderDef {
                     api_key_env: Some(" ".into()),
@@ -308,19 +290,10 @@ mod tests {
 
 /// `dev.instagent/providers/*.json` 的形状（第三版 §2.4；沿用 goose
 /// DeclarativeProviderConfig，去 setup 向导字段，加 `proxy`）。
-///
-/// `display_name` / `description` 是展示字段（转换脚本产物携带，加载期校验，
-/// 运行时不参与请求）；字段级校验见 [`ProviderDef::validate`]（todo 08 / S9）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderDef {
     pub name: String,
     pub engine: EngineKind,
-    /// 展示名（缺省时用 `name`）。
-    #[serde(default)]
-    pub display_name: Option<String>,
-    /// 一句话描述（展示用，可缺省）。
-    #[serde(default)]
-    pub description: Option<String>,
     /// 密钥唯一来源（ADR 0003 D1）：指向环境变量名；密钥本身永不入文件/日志。
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -388,20 +361,6 @@ impl ProviderDef {
             !p.is_empty() && !p.contains('/'),
             "provider name `{p}` is empty or contains `/`"
         );
-        if let Some(display_name) = &self.display_name {
-            anyhow::ensure!(
-                !display_name.trim().is_empty(),
-                "provider `{p}`: field `display_name` must be non-empty when present \
-                 (suggested: remove the field)"
-            );
-        }
-        if let Some(description) = &self.description {
-            anyhow::ensure!(
-                !description.trim().is_empty(),
-                "provider `{p}`: field `description` must be non-empty when present \
-                 (suggested: remove the field)"
-            );
-        }
         if let Some(var) = &self.api_key_env {
             anyhow::ensure!(
                 !var.trim().is_empty(),

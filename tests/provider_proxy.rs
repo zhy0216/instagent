@@ -37,8 +37,6 @@ fn proxy_def(args: Vec<String>, env: BTreeMap<String, String>, timeout_secs: u64
     ProviderDef {
         name: "fake".to_string(),
         engine: EngineKind::Proxy,
-        display_name: None,
-        description: None,
         api_key_env: None,
         base_url: None,
         headers: BTreeMap::from([("x-target-port".to_string(), "${PORT}".to_string())]),
@@ -618,7 +616,6 @@ async fn registry_proxy_engine_starts_fake_provider_end_to_end() {
     };
     let registry = ProviderRegistry::from_plugins(&set).expect("load registry");
     let provider = registry.get("px").await.expect("proxy engine starts");
-    assert_eq!(provider.name(), "px");
     let messages = vec![Message::user_text("ping".to_string())];
     let mut stream = provider.stream(request(&messages)).await.unwrap();
     let mut text = String::new();

@@ -58,7 +58,7 @@ pub fn render_event(
         }
         Event::ToolStart { name, input, .. } => {
             close_text(state, out);
-            let _ = writeln!(diag, "▶ {name}  {}", call_summary(name, input));
+            let _ = writeln!(diag, "▶ {name}  {}", call_summary(input));
         }
         Event::ToolDone {
             preview,
@@ -110,19 +110,9 @@ fn close_text(state: &mut RenderState, out: &mut dyn Write) {
 }
 
 /// 工具调用一行摘要：已知意图字段优先，其余压缩 JSON（≤100 字符）。
-pub fn call_summary(_name: &str, input: &Value) -> String {
+pub fn call_summary(input: &Value) -> String {
     if let Value::Object(map) = input {
-        for key in [
-            "command",
-            "path",
-            "file_path",
-            "url",
-            "pattern",
-            "glob",
-            "skill",
-            "query",
-            "text",
-        ] {
+        for key in ["command", "path", "name", "text"] {
             if let Some(value) = map.get(key).and_then(Value::as_str) {
                 return truncate_one_line(value);
             }
@@ -148,14 +138,11 @@ mod tests {
 
     #[test]
     fn call_summary_prefers_intent_fields() {
-        assert_eq!(
-            call_summary("shell", &json!({"command": "ls -la"})),
-            "ls -la"
-        );
-        assert_eq!(call_summary("cmd__x", &json!({"a": 1})), r#"{"a":1}"#);
+        assert_eq!(call_summary(&json!({"command": "ls -la"})), "ls -la");
+        assert_eq!(call_summary(&json!({"a": 1})), r#"{"a":1}"#);
         let long = "x".repeat(300);
         assert_eq!(
-            call_summary("t", &json!({"text": long})).chars().count(),
+            call_summary(&json!({"text": long})).chars().count(),
             101 // 100 + 省略号
         );
     }

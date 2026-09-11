@@ -221,8 +221,7 @@ const ARGUMENTS: &str = "$ARGUMENTS";
 const MAX_EXPANDED_TASK_BYTES: usize = 1024 * 1024;
 
 /// 模板正文 + 调用参数 → 一条任务消息文本。
-/// 保留原有无界调用方式；生产任务输入应使用 [`expand_bounded`]。
-pub fn expand(cmd: &TaskTemplate, args: &str) -> String {
+fn expand(cmd: &TaskTemplate, args: &str) -> String {
     let args = args.trim();
     if cmd.template.contains(ARGUMENTS) {
         cmd.template.replace(ARGUMENTS, args)
@@ -233,39 +232,16 @@ pub fn expand(cmd: &TaskTemplate, args: &str) -> String {
     }
 }
 
-/// 展开前校验 UTF-8 字节预算，结果至多 1 MiB；超限不分配展开文本或裁剪任务。
+/// 展开 + 校验 UTF-8 字节预算，结果至多 1 MiB；超限报错不回显任务参数。
 pub fn expand_bounded(cmd: &TaskTemplate, args: &str) -> crate::Result<String> {
-    expand_with_limit(cmd, args, MAX_EXPANDED_TASK_BYTES)
-}
-
-fn expand_with_limit(cmd: &TaskTemplate, args: &str, max_bytes: usize) -> crate::Result<String> {
-    let args = args.trim();
-    let placeholders = cmd.template.matches(ARGUMENTS).count();
-    let bytes = expanded_len(cmd.template.len(), placeholders, args.len()).ok_or_else(|| {
-        anyhow::anyhow!("expanded task size overflow (input budget: {max_bytes} bytes)")
-    })?;
-    if bytes > max_bytes {
+    let out = expand(cmd, args);
+    if out.len() > MAX_EXPANDED_TASK_BYTES {
         anyhow::bail!(
-            "expanded task would be {bytes} bytes, exceeding the {max_bytes} byte input budget"
+            "expanded task would be {} bytes, exceeding the {MAX_EXPANDED_TASK_BYTES} byte input budget",
+            out.len()
         );
     }
-    // The original expansion only runs after its complete output fits the budget.
-    Ok(expand(cmd, args))
-}
-
-/// Pure byte accounting also lets tests exercise usize boundaries without huge strings.
-fn expanded_len(template_bytes: usize, placeholders: usize, args_bytes: usize) -> Option<usize> {
-    if placeholders == 0 {
-        if args_bytes == 0 {
-            Some(template_bytes)
-        } else {
-            template_bytes.checked_add(2)?.checked_add(args_bytes)
-        }
-    } else {
-        let literal_bytes =
-            template_bytes.checked_sub(placeholders.checked_mul(ARGUMENTS.len())?)?;
-        literal_bytes.checked_add(placeholders.checked_mul(args_bytes)?)
-    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -305,6 +281,22 @@ mod tests {
         }
     }
 
+    /// 测试注入小预算的展开 + 超限检查（与 `expand_bounded` 同口径）。
+    fn expanded_with_limit(
+        cmd: &TaskTemplate,
+        args: &str,
+        max_bytes: usize,
+    ) -> crate::Result<String> {
+        let out = expand(cmd, args);
+        if out.len() > max_bytes {
+            anyhow::bail!(
+                "expanded task would be {} bytes, exceeding the {max_bytes} byte input budget",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
     #[test]
     fn bounded_expansion_preserves_replacement_append_utf8_and_newlines() {
         for (body, args, expected) in [
@@ -332,11 +324,11 @@ mod tests {
             assert_eq!(expand(&cmd, args), expected);
             assert_eq!(expand_bounded(&cmd, args).unwrap(), expected);
             assert_eq!(
-                expand_with_limit(&cmd, args, expected.len()).unwrap(),
+                expanded_with_limit(&cmd, args, expected.len()).unwrap(),
                 expected
             );
             if !expected.is_empty() {
-                assert!(expand_with_limit(&cmd, args, expected.len() - 1).is_err());
+                assert!(expanded_with_limit(&cmd, args, expected.len() - 1).is_err());
             }
         }
     }
@@ -363,31 +355,12 @@ mod tests {
     fn small_expansion_budget_rejects_amplification_without_echoing_arguments() {
         let cmd = template(&format!("x{}", ARGUMENTS.repeat(64)));
         let args = "PRIVATE_TEMPLATE_ARGUMENTS";
-        let error = expand_with_limit(&cmd, args, 32).unwrap_err().to_string();
+        let error = expanded_with_limit(&cmd, args, 32).unwrap_err().to_string();
         assert!(error.contains("32 byte input budget"), "{error}");
         assert!(!error.contains(args));
         // Count the final output: a large template can shrink below the budget.
-        assert_eq!(expand_with_limit(&cmd, " \t", 1).unwrap(), "x");
-        assert!(expand_with_limit(&cmd, "", 0).is_err());
-    }
-
-    #[test]
-    fn expansion_byte_accounting_checks_integer_boundaries() {
-        let marker_bytes = ARGUMENTS.len();
-        assert_eq!(expanded_len(usize::MAX, 0, 0), Some(usize::MAX));
-        assert_eq!(expanded_len(usize::MAX - 3, 0, 1), Some(usize::MAX));
-        assert_eq!(expanded_len(marker_bytes, 1, usize::MAX), Some(usize::MAX));
-        assert_eq!(expanded_len(2 * marker_bytes, 2, 0), Some(0));
-        // Both append additions, replacement multiplication/addition, and marker accounting.
-        assert_eq!(expanded_len(usize::MAX - 1, 0, 1), None);
-        assert_eq!(expanded_len(usize::MAX - 2, 0, 1), None);
-        assert_eq!(expanded_len(2 * marker_bytes, 2, usize::MAX / 2 + 1), None);
-        assert_eq!(expanded_len(marker_bytes + 1, 1, usize::MAX), None);
-        assert_eq!(
-            expanded_len(usize::MAX, usize::MAX / marker_bytes + 1, 0),
-            None
-        );
-        assert_eq!(expanded_len(marker_bytes - 1, 1, 0), None);
+        assert_eq!(expanded_with_limit(&cmd, " \t", 1).unwrap(), "x");
+        assert!(expanded_with_limit(&cmd, "", 0).is_err());
     }
 
     #[test]

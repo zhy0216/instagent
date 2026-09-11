@@ -134,15 +134,6 @@ impl Settings {
         let local = read_layer(&project_settings_path(cwd, SettingsLayer::Local))?;
         Ok(merge_layers([user, project, local]))
     }
-
-    /// 写回指定层（`18` 的 enable/disable 用）。
-    pub fn save(&self, cwd: &Path, layer: SettingsLayer) -> crate::Result<()> {
-        let path = match layer {
-            SettingsLayer::User => crate::config::config_dir()?.join("settings.json"),
-            SettingsLayer::Project | SettingsLayer::Local => project_settings_path(cwd, layer),
-        };
-        write_layer(&path, self)
-    }
 }
 
 /// 建父目录后原子私有写入一层 settings。
@@ -374,13 +365,17 @@ mod tests {
             disabled_plugins: vec!["y".into()],
             ..Settings::default()
         };
-        for layer in [
-            SettingsLayer::User,
-            SettingsLayer::Project,
-            SettingsLayer::Local,
-        ] {
-            settings.save(project.path(), layer).unwrap();
-        }
+        settings.save_user().unwrap();
+        write_layer(
+            &project_settings_path(project.path(), SettingsLayer::Project),
+            &settings,
+        )
+        .unwrap();
+        write_layer(
+            &project_settings_path(project.path(), SettingsLayer::Local),
+            &settings,
+        )
+        .unwrap();
         assert_eq!(
             read_json(user.path().join("settings.json")),
             read_json(project_settings_path(project.path(), SettingsLayer::Local))
@@ -699,7 +694,7 @@ mod tests {
         };
         settings.save_user().unwrap();
         for layer in [SettingsLayer::Project, SettingsLayer::Local] {
-            settings.save(project.path(), layer).unwrap();
+            write_layer(&project_settings_path(project.path(), layer), &settings).unwrap();
         }
         let paths = [
             user.path().join("settings.json"),

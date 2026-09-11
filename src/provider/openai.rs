@@ -27,13 +27,12 @@
 //! 图片请求预算（todo 13 / S15 最小行为）：每次请求对历史图片先去重
 //! （相同内容只内嵌首次出现），解码字节总和仍超 [`REQUEST_IMAGE_BUDGET`]
 //! 时从最旧开始淘汰（生命周期淘汰、保留最新），被淘汰 / 去重的位置替换为
-//! 可操作的重读提示。会话侧的新图拒绝见 [`crate::agent::SESSION_IMAGE_BUDGET`]；
+//! 可操作的重读提示。会话侧的新图拒绝见 agent 模块的 `SESSION_IMAGE_BUDGET`；
 //! 不做 RM2 的 blob/reference 存储，不引入新 decoder。
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -59,7 +58,6 @@ use crate::provider::shared::to_provider_error;
 use crate::provider::shared::PendingCall;
 use crate::provider::shared::StreamEngine;
 use crate::provider::shared::StreamState;
-use crate::provider::EngineKind;
 use crate::provider::Provider;
 use crate::provider::ProviderDef;
 use crate::provider::Request;
@@ -96,7 +94,7 @@ impl OpenAiProvider {
     /// 校验 def（engine=openai、base_url 必填），按 `api_key_env` 读密钥，
     /// 按 `timeout_seconds` 建 client（构造骨架在共享层 `engine_parts`）。
     pub fn new(def: &ProviderDef) -> crate::Result<Self> {
-        let (api_key, http) = engine_parts(def, EngineKind::Openai)?;
+        let (api_key, http) = engine_parts(def)?;
         Ok(Self {
             def: def.clone(),
             api_key,
@@ -118,10 +116,6 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
-    fn name(&self) -> &str {
-        &self.def.name
-    }
-
     async fn stream(
         &self,
         req: Request<'_>,
@@ -162,7 +156,7 @@ fn clamp_max_tokens(def: &ProviderDef, req: &mut Request<'_>) {
 
 /// 单请求图片总字节预算（todo 13 / S15）：一次请求内嵌全部图片的解码字节
 /// 上限；先对重复图片去重，超限按生命周期淘汰（最旧优先）。会话侧预算见
-/// [`crate::agent::SESSION_IMAGE_BUDGET`]。
+/// agent 模块的 `SESSION_IMAGE_BUDGET`。
 pub const REQUEST_IMAGE_BUDGET: u64 = 32 * 1024 * 1024;
 
 fn build_request_body(req: &Request<'_>) -> crate::Result<Value> {
@@ -204,18 +198,15 @@ enum ImagePlan {
 /// 去重指纹：FNV-1a 64（media_type + data）。碰撞只影响去重判定（概率极
 /// 低），不影响字节记账，也不触碰会话数据。
 fn image_fingerprint(image: &crate::tools::ImageData) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = image
-        .media_type
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0u8))
-        .chain(image.data.as_bytes());
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    crate::tools::fnv1a64(
+        image
+            .media_type
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&0u8))
+            .chain(image.data.as_bytes())
+            .copied(),
+    )
 }
 
 /// 图片预算规划（todo 13 / S15 最小行为）：相同内容只内嵌首次出现（去重）；
@@ -485,12 +476,8 @@ impl OpenAiStreamState {
 }
 
 impl StreamEngine for OpenAiStreamState {
-    fn out(&mut self) -> &mut VecDeque<Result<StreamEvent, ProviderError>> {
-        &mut self.st.out
-    }
-
-    fn ended(&mut self) -> &mut bool {
-        &mut self.st.ended
+    fn state(&mut self) -> &mut StreamState {
+        &mut self.st
     }
 
     fn apply(&mut self, ev: &SseEvent) -> Result<(), ProviderError> {
@@ -659,6 +646,7 @@ fn usage_from_chunk(chunk: &Value) -> Option<Usage> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::EngineKind;
     use super::*;
     use crate::provider::http::SseParser;
     use crate::provider::shared::testutil as tu;
@@ -1842,7 +1830,6 @@ mod tests {
         with_key.api_key_env = Some(ApiKeyEnv::VAR.to_string());
         let provider = OpenAiProvider::new(&with_key).unwrap();
         assert_eq!(provider.api_key, KEY);
-        assert_eq!(provider.name(), "test-openai");
         assert_eq!(
             provider.request_headers()["authorization"],
             format!("Bearer {KEY}")
