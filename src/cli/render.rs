@@ -7,7 +7,8 @@
 //! text 模式 stdout 写失败（如 EPIPE）一律忽略、不改退出码；失败退出由 `main` 保证
 //! 非零退出码且 stderr 末行 `error: {message}`。
 //!
-//! 两个流都以 `&mut dyn Write` 注入，路由规则可纯逻辑断言（T5）。
+//! 两个流都以 `&mut dyn Write` 注入；CLI 使用有界队列写入器，管道背压
+//! 不阻塞任务执行。路由规则可纯逻辑断言（T5）。
 
 use std::io::Write;
 
@@ -19,13 +20,13 @@ use instagent::message::Usage;
 /// Drain progress continuously; JSON mode obtains its answer from the session.
 pub async fn print_events(mut rx: tokio::sync::mpsc::Receiver<Event>, format: super::OutputFormat) {
     let mut state = RenderState::default();
-    let mut stdout = std::io::stdout();
+    let mut stdout = super::output::stdout();
     let mut discard = std::io::sink();
     let out: &mut dyn Write = match format {
         super::OutputFormat::Text => &mut stdout,
         super::OutputFormat::Json => &mut discard,
     };
-    let mut diag = std::io::stderr();
+    let mut diag = super::output::stderr();
     while let Some(event) = rx.recv().await {
         render_event(&event, &mut state, out, &mut diag);
     }
@@ -49,6 +50,9 @@ pub fn render_event(
     diag: &mut dyn Write,
 ) {
     match event {
+        Event::SessionStarted { id } => {
+            let _ = writeln!(diag, "session {id}");
+        }
         Event::TextDelta(delta) => {
             if !delta.is_empty() {
                 state.text_open = true;

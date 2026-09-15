@@ -94,6 +94,61 @@ async fn connect_sets_id_and_stores_instructions() {
     source.shutdown().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn connections_are_bounded_concurrent_and_return_in_name_order() {
+    use std::os::unix::fs::PermissionsExt;
+    let servers: serde_json::Map<String, serde_json::Value> = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                json!({"type":"stdio","command":"./gate.sh","args":[name]}),
+            )
+        })
+        .collect();
+    let (root, plugin) = plugin_with_mcp_json(&json!({"mcpServers":servers}).to_string());
+    let script = root.path().join("gate.sh");
+    std::fs::write(&script, "#!/bin/sh\ntouch \"$PLUGIN_ROOT/started-$1\"\nwhile [ ! -f \"$PLUGIN_ROOT/release-$1\" ]; do sleep 0.01; done\nexec \"$PLUGIN_ROOT/mcp-fixture-server\"\n").unwrap();
+    std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let gates = async {
+        while !["a", "b", "c", "d"]
+            .iter()
+            .all(|name| root.path().join(format!("started-{name}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !root.path().join("started-e").exists(),
+            "at most four handshakes may run"
+        );
+        std::fs::write(root.path().join("release-a"), "").unwrap();
+        while !root.path().join("started-e").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for name in ["e", "d", "c", "b"] {
+            std::fs::write(root.path().join(format!("release-{name}")), "").unwrap();
+        }
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(connect_plugin(&plugin, root.path()), gates)
+    })
+    .await
+    .expect("four connections must start before any gate is released");
+    let outcome = outcome.unwrap();
+    assert_eq!(
+        outcome
+            .sources
+            .iter()
+            .map(|s| s.server.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c", "d", "e"]
+    );
+    for source in outcome.sources {
+        source.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn sse_server_is_skipped_with_unsupported_note() {
     let (_tmp, plugin) = plugin_with_mcp_json(

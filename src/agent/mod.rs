@@ -27,6 +27,7 @@
 pub mod compact;
 pub mod event;
 pub mod prompt;
+pub mod task;
 
 mod exec;
 

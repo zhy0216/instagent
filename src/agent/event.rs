@@ -16,6 +16,9 @@ use crate::message::Usage;
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    SessionStarted {
+        id: String,
+    },
     TextDelta(String),
     ToolStart {
         id: String,

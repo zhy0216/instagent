@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientCapabilities;
@@ -68,6 +69,8 @@ pub const CALL_TIMEOUT_SECS: u64 = 300;
 
 /// connect（spawn + initialize 握手）硬超时（`10`）。
 pub const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Shared across all plugins in a task; completion order never changes routing.
+pub const CONNECT_CONCURRENCY: usize = 4;
 
 /// list inventory 单次请求硬超时（`10`）。
 pub const LIST_TIMEOUT_SECS: u64 = 30;
@@ -532,26 +535,58 @@ pub fn ignored_headers_note(plugin: &str, server: &McpServerConfig) -> Option<St
 /// 报错（装配策略）。`plugin_data` 是 `${PLUGIN_DATA}` 目录
 /// （`<data_dir>/plugins/<name>/`，创建归 `07`，本函数只透传给展开逻辑）。
 pub async fn connect_plugin(plugin: &Plugin, plugin_data: &Path) -> crate::Result<McpLoadOutcome> {
+    connect_plugin_with_limiter(
+        plugin,
+        plugin_data,
+        Arc::new(tokio::sync::Semaphore::new(CONNECT_CONCURRENCY)),
+    )
+    .await
+}
+
+pub(crate) async fn connect_plugin_with_limiter(
+    plugin: &Plugin,
+    plugin_data: &Path,
+    limiter: Arc<tokio::sync::Semaphore>,
+) -> crate::Result<McpLoadOutcome> {
     let mut outcome = McpLoadOutcome::default();
     let mut connect_failures = 0usize;
-    for server in load_servers(plugin, plugin_data)? {
-        if let Some(note) = unsupported_server_note(&plugin.manifest.name, &server) {
-            tracing::warn!("{note}");
-            outcome.notes.push(note);
+    let connections = stream::iter(load_servers(plugin, plugin_data)?)
+        .map(|server| {
+            let limiter = limiter.clone();
+            async move {
+                let mut notes = Vec::new();
+                if let Some(note) = unsupported_server_note(&plugin.manifest.name, &server) {
+                    tracing::warn!("{note}");
+                    return (vec![note], None);
+                }
+                if let Some(note) = ignored_headers_note(&plugin.manifest.name, &server) {
+                    tracing::warn!("{note}");
+                    notes.push(note);
+                }
+                let _permit = limiter
+                    .acquire()
+                    .await
+                    .expect("MCP connection limiter remains open");
+                let result = McpSource::connect(plugin, &server).await.map_err(|err| {
+                    format!(
+                        "MCP server `{}` of plugin `{}` failed: {err:#}",
+                        server.name, plugin.manifest.name
+                    )
+                });
+                (notes, Some(result))
+            }
+        })
+        .buffered(CONNECT_CONCURRENCY);
+    tokio::pin!(connections);
+    while let Some((notes, result)) = connections.next().await {
+        outcome.notes.extend(notes);
+        let Some(result) = result else {
             continue;
-        }
-        if let Some(note) = ignored_headers_note(&plugin.manifest.name, &server) {
-            tracing::warn!("{note}");
-            outcome.notes.push(note);
-        }
-        match McpSource::connect(plugin, &server).await {
+        };
+        match result {
             Ok(source) => outcome.sources.push(source),
-            Err(err) => {
+            Err(note) => {
                 connect_failures += 1;
-                let note = format!(
-                    "MCP server `{}` of plugin `{}` failed: {err:#}",
-                    server.name, plugin.manifest.name
-                );
                 tracing::warn!("{note}");
                 outcome.notes.push(note);
             }

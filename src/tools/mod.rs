@@ -24,6 +24,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -190,6 +191,12 @@ struct State {
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
+async fn inventory_of(
+    (index, source): (usize, Arc<dyn ToolSource>),
+) -> (usize, Result<Vec<ToolSpec>, String>) {
+    (index, source.inventory().await)
+}
+
 fn retry_delay(attempts: u32) -> Duration {
     let shift = attempts.saturating_sub(1).min(4);
     RETRY_BASE.saturating_mul(1 << shift).min(RETRY_MAX)
@@ -201,6 +208,7 @@ fn retry_delay(attempts: u32) -> Duration {
 /// 缓存外调用名未命中时的自动重建）令缓存作废。
 pub struct Registry {
     pub sources: Vec<Arc<dyn ToolSource>>,
+    allowed: Option<HashSet<String>>,
     state: Mutex<State>,
     /// 异步刷新单飞：同时只允许一个在途枚举，其余合并等待同一快照。
     refresh: tokio::sync::Mutex<()>,
@@ -210,6 +218,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             sources: Vec::new(),
+            allowed: None,
             state: Mutex::new(State::default()),
             refresh: tokio::sync::Mutex::new(()),
         }
@@ -224,6 +233,13 @@ impl Registry {
     pub fn register(&mut self, source: Arc<dyn ToolSource>) {
         self.invalidate();
         self.sources.push(source);
+    }
+
+    /// Narrow both advertised tools and actual dispatch. Names are the final
+    /// model-visible names, after deterministic collision resolution.
+    pub fn restrict_to(&mut self, names: impl IntoIterator<Item = String>) {
+        self.allowed = Some(names.into_iter().collect());
+        self.invalidate();
     }
 
     /// 令工具清单缓存作废（下一次 [`Self::list`] 重新枚举）。连接或配置变化
@@ -337,9 +353,19 @@ impl Registry {
         let mut errors = Vec::new();
         let mut failures = HashMap::new();
 
-        for (idx, source) in self.sources.iter().enumerate() {
+        let pending: Vec<_> = self
+            .sources
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(inventory_of)
+            .collect();
+        let inventories = stream::iter(pending).buffered(4);
+        tokio::pin!(inventories);
+        while let Some((idx, inventory)) = inventories.next().await {
+            let source = &self.sources[idx];
             let prefix = conflict_prefix(source.id());
-            let listed = match source.inventory().await {
+            let listed = match inventory {
                 Ok(specs) => specs,
                 Err(note) => {
                     tracing::warn!("{note}");
@@ -401,11 +427,22 @@ impl Registry {
             }
         }
 
+        if let Some(allowed) = &self.allowed {
+            specs.retain(|spec| allowed.contains(&spec.name));
+            routes.retain(|name, _| allowed.contains(name));
+        }
         (specs, routes, errors, failures)
     }
 
     /// 按映射表路由回真实 (source, name)；未命中时先重建一次映射再试。
     pub async fn call(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolOutput {
+        if self
+            .allowed
+            .as_ref()
+            .is_some_and(|names| !names.contains(&call.name))
+        {
+            return ToolOutput::err(format!("tool excluded by task capabilities: {}", call.name));
+        }
         let route = self.lookup(&call.name).await;
         match route {
             Some(route) => {

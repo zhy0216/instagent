@@ -8,7 +8,7 @@ instagent 是无人值守的 headless agent。调用者一次提交完整任务�
 
 | 模块 | 职责 |
 |---|---|
-| `src/agent/` | agent loop：`assemble` / `run_turn` / 流式输出、压缩（`compact.rs`）、hooks 触发点 |
+| `src/agent/` | `task::run` 完整任务入口、插件装配、期限与清理；agent loop、流式输出、压缩和 hooks |
 | `src/provider/` | provider **引擎**层：`openai.rs` / `proxy.rs` 两种引擎 + 共享 SSE 流驱动（`shared.rs`）+ `registry.rs` |
 | `src/tools/` | `ToolSource` trait + Registry；唯一内置内容 = 6 个工具 `shell` `read` `write` `edit` `tree` `read_image`（`builtin/`） |
 | `src/plugin/` | 插件加载器：manifest 校验、五层发现（`--plugin` > 配置 `plugins` 额外路径 > 项目 > 用户 > bundled，同名高优先级覆盖）、install / enable |
@@ -16,12 +16,14 @@ instagent 是无人值守的 headless agent。调用者一次提交完整任务�
 | `src/commands.rs` | 任务模板加载与参数展开（`dev.instagent/commands/*.md`，按 `plugin:name` 选择） |
 | `src/session.rs` `src/message.rs` | 会话 JSONL 持久化、消息模型 |
 | `src/config.rs` `src/settings.rs` | 配置（yaml）、插件启用/禁用状态（settings 三层合并） |
-| `src/cli/` `src/subprocess.rs` | 批处理 CLI、结果输出、取消与超时、子进程管理（进程组 + kill_on_drop） |
+| `src/cli/` `src/subprocess.rs` | CLI 参数、信号适配、有界输出队列；子进程管理（进程组 + kill_on_drop） |
 
 ## 执行生命周期
 
 1. `run` 校验 `--task` / `--task-file` / `--command` 唯一输入，加载预先配置的
    provider、model、插件与 settings。任务期限同时约束初始化和执行。
+   `--only-plugin` 先限定已启用插件，MCP 跨插件最多并发 4 路初始化；`--tool` /
+   `--no-tools` 限定工具清单与实际调用，`--require-tool` 在请求模型前检查必需能力。
 2. 创建会话，或通过 `--resume ID|last` 恢复并追加本次任务；触发生命周期 hooks。
 3. agent loop 调用 provider、执行工具、按需加载 skills、自动压缩历史。系统提示明确
    无人值守约束；必要条件不足时在结果中说明，执行过程不等待用户回答或审批。
@@ -34,7 +36,14 @@ instagent 是无人值守的 headless agent。调用者一次提交完整任务�
 生命周期由调用方负责；插件 Stop hook 可以执行确定性验收。运行期间不自动更新插件，
 部署方显式调用 `plugin update`。
 所选 provider、model 和所需密钥缺失会失败；可选 MCP 等组件继续沿用诊断后跳过的
-降级策略。业务必需能力由调用方或 Stop hook 验证，运行不等待交互修复。
+降级策略。必需工具可通过任务预检确认可用，业务结果由调用方或 Stop hook 验证，
+运行不等待交互修复。
+
+CLI 与库共用 `agent::task::run`，输入 `RunRequest`、调用方的取消令牌与可选消费的
+事件通道，返回 `RunReport`。能力装载/预检诊断以 `code/source/message` 保留在报告里。
+库不安装全局信号处理器，日志交给宿主 tracing；目录配置继续使用现有环境变量约定。
+CLI 的 stdout/stderr 分别由独立 OS 线程写入，有界队列不会阻塞运行器；输出结束等待
+最多 1 秒，最后诊断排空最多 250 ms，JSON 交付超时或写失败退出 1。
 
 ## 完整性与资源边界
 
@@ -58,8 +67,10 @@ instagent 是无人值守的 headless agent。调用者一次提交完整任务�
   metadata 预检加实际有界读取；各组件保留原有加载失败/跳过策略。
   hooks 默认 fail-open 仅用于脚本运行，不适用于文件加载错误。
   本地安装在创建/清理 staging 前拒绝源与 staging 重叠，普通已安装目录重装仍兼容。
+- `minKernel` 在 manifest 加载时检查，支持 `MAJOR.MINOR[.PATCH]` 最低发布版本；
+  不兼容插件不会被加载。单任务选择不会修改持久化 settings。
 - CLI 模板文件限 256 KiB，展开结果限 1 MiB；`expand_bounded` 在分配展开结果前
-  受检计算字节数，CLI 使用此入口，原 `expand` 库接口保留兼容。
+  受检计算字节数，CLI 与库任务入口共用此检查。
   provider 显式声明的 `api_key_env` 缺失、不可读、为空或纯空白时构造失败；
   未声明时支持 keyless，合法值不改写。
 - 工具图片先校验再原子预留会话 64 MiB 解码字节预算；非法图片不挤占后续额度。

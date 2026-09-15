@@ -1,8 +1,10 @@
 //! Headless CLI: execute a complete task, manage persisted sessions and plugins.
-//! Runtime setup lives in [`assembly`]; no terminal input or REPL is provided.
+//! Runtime setup lives in `instagent::agent::task`; no terminal input or REPL is provided.
 
-pub mod assembly;
+#[cfg(test)]
+mod assembly;
 pub mod handlers;
+pub mod output;
 pub mod render;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -19,7 +21,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Execute an unattended task and exit
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Manage persisted sessions
     Sessions {
         #[command(subcommand)]
@@ -65,6 +67,18 @@ pub struct RunArgs {
     pub model: Option<String>,
     #[arg(long = "plugin")]
     pub plugin: Vec<PathBuf>,
+    /// Use only these already-enabled plugins (repeatable; include the provider plugin)
+    #[arg(long = "only-plugin")]
+    pub only_plugin: Option<Vec<String>>,
+    /// Expose and allow only these model-visible tools (repeatable)
+    #[arg(long = "tool", conflicts_with = "no_tools")]
+    pub tool: Option<Vec<String>>,
+    /// Run without tools
+    #[arg(long)]
+    pub no_tools: bool,
+    /// Fail before invoking the model if a tool is unavailable or excluded
+    #[arg(long = "require-tool")]
+    pub require_tool: Vec<String>,
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
     /// Run deadline in seconds, followed by at most five seconds for cleanup
@@ -83,6 +97,10 @@ impl Default for RunArgs {
             cwd: None,
             model: None,
             plugin: Vec::new(),
+            only_plugin: None,
+            tool: None,
+            no_tools: false,
+            require_tool: Vec::new(),
             output: OutputFormat::Text,
             timeout: 600,
         }
@@ -123,7 +141,7 @@ pub enum PluginAction {
 pub async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(args) => handlers::run(args).await,
+        Commands::Run(args) => handlers::run(*args).await,
         Commands::Sessions { action } => {
             handlers::sessions(action)?;
             Ok(ExitCode::SUCCESS)
@@ -145,7 +163,7 @@ pub fn init_logging() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let registry = tracing_subscriber::registry().with(filter).with(
         tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(output::stderr)
             .with_target(false),
     );
     let _ = registry.try_init();

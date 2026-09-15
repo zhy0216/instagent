@@ -178,7 +178,7 @@ impl Session {
                                 newest = Some((modified, header));
                             }
                         }
-                        Err(err) => eprintln!("warning: {err:#}, skipping"),
+                        Err(err) => tracing::warn!("warning: {err:#}, skipping"),
                     }
                 }
                 match newest {
@@ -254,7 +254,7 @@ impl Session {
         for path in session_files(&dir)? {
             match load_header(&path) {
                 Ok(header) => headers.push(header),
-                Err(err) => eprintln!("warning: {err:#}, skipping"),
+                Err(err) => tracing::warn!("warning: {err:#}, skipping"),
             }
         }
         headers.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
@@ -503,7 +503,7 @@ fn resume_with_limits(id: &str, limits: ReadLimits) -> crate::Result<Session> {
     if dropped > 0 {
         atomic_replace(&path, &header, &messages, limits)
             .with_context(|| format!("repair salvaged session {}", path.display()))?;
-        eprintln!(
+        tracing::warn!(
             "warning: session {}: dropped {dropped} unrecoverable line(s), kept {} message(s)",
             path.display(),
             messages.len()
@@ -511,7 +511,7 @@ fn resume_with_limits(id: &str, limits: ReadLimits) -> crate::Result<Session> {
     } else if !header_terminated || unterminated {
         atomic_replace(&path, &header, &messages, limits)
             .with_context(|| format!("repair salvaged session {}", path.display()))?;
-        eprintln!(
+        tracing::warn!(
             "warning: session {}: normalized missing trailing newline before further appends",
             path.display()
         );

@@ -50,6 +50,8 @@ Rust 整仓一起编译，所以**第一个任务 `00` 必须串行先做**：�
 
 ## 优先级
 
+审查修复：[21-headless-runtime-review.md](21-headless-runtime-review.md) ✅（含验证记录）。
+
 | 优先级 | 文件 | 说明 |
 |---|---|---|
 | P0 | done/00-skeleton.md ✅ | Cargo 工程 + 完整模块树空壳 + 依赖锁定 |

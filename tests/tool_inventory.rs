@@ -166,6 +166,65 @@ fn call_named(name: &str) -> ToolCall {
 }
 
 #[tokio::test]
+async fn task_allowlist_filters_inventory_and_dispatch_after_refresh() {
+    let first = CountingSource::new("cmd:first", &["shared", "hidden"]);
+    let second = CountingSource::new("cmd:second", &["shared"]);
+    let mut registry = Registry::new();
+    registry.register(first.clone());
+    registry.register(second);
+    registry.restrict_to(["second__shared".to_string()]);
+    for _ in 0..2 {
+        let specs = registry.list().await;
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["second__shared"]
+        );
+        let allowed = registry.call(&call_named("second__shared"), &ctx()).await;
+        assert_eq!(allowed.text, "cmd:second::shared");
+        let before = first.enumerations.load(Ordering::SeqCst);
+        for name in ["shared", "hidden", "unknown"] {
+            let denied = registry.call(&call_named(name), &ctx()).await;
+            assert!(denied.is_error && denied.text.contains("excluded"));
+        }
+        assert_eq!(first.enumerations.load(Ordering::SeqCst), before);
+        registry.invalidate();
+    }
+    registry.restrict_to([]);
+    assert!(registry.list().await.is_empty());
+    assert!(
+        registry
+            .call(&call_named("second__shared"), &ctx())
+            .await
+            .is_error
+    );
+}
+
+#[tokio::test]
+async fn inventories_run_concurrently_but_keep_registration_order() {
+    let first = GatedSource::new("first", &["one"]);
+    let second = GatedSource::new("second", &["two"]);
+    let mut registry = Registry::new();
+    registry.register(first.clone());
+    registry.register(second.clone());
+    let listing = registry.list();
+    let release = async {
+        first.entered.notified().await;
+        second.entered.notified().await;
+        second.release.notify_one();
+        first.release.notify_one();
+    };
+    let (specs, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(listing, release)
+    })
+    .await
+    .expect("independent inventories must both start");
+    assert_eq!(
+        specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+}
+
+#[tokio::test]
 async fn concurrent_lists_merge_into_single_refresh() {
     let source = CountingSource::new("mcp:p/srv", &["tool_a"]);
     let mut registry = Registry::new();

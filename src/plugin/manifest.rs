@@ -400,7 +400,45 @@ fn validate_manifest(manifest: PluginManifest, path: &Path) -> crate::Result<Plu
         bail!("{}: {err}", source());
     }
 
+    if let Some(minimum) = manifest
+        .extensions
+        .get(super::NAMESPACE)
+        .and_then(|ns| ns.get("minKernel"))
+    {
+        let required = minimum.as_str().and_then(kernel_version).with_context(|| {
+            format!("{}: field `dev.instagent.minKernel` must be MAJOR.MINOR or MAJOR.MINOR.PATCH (non-negative integers)", source())
+        })?;
+        let current = kernel_version(env!("CARGO_PKG_VERSION"))
+            .context("kernel package version must be MAJOR.MINOR.PATCH")?;
+        if current < required {
+            bail!(
+                "{}: requires minKernel {}, running kernel is {}",
+                source(),
+                brief(minimum.as_str().unwrap()),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+
     Ok(manifest)
+}
+
+/// Deliberately a minimum release version, not a range expression or prerelease.
+fn kernel_version(text: &str) -> Option<[u64; 3]> {
+    let mut version = [0; 3];
+    let mut count = 0;
+    for (index, part) in text.split('.').enumerate() {
+        if index >= 3
+            || part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        version[index] = part.parse().ok()?;
+        count += 1;
+    }
+    (count >= 2).then_some(version)
 }
 
 /// name：1~64 字符，小写字母数字与 `-` `.`，首尾字母数字，不含 `--` `..`。
@@ -489,6 +527,36 @@ mod tests {
 
     fn error_of(json: &str) -> String {
         load_json(json).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn minimum_kernel_version_is_enforced_at_manifest_loading() {
+        for minimum in ["0.0", "0.1", env!("CARGO_PKG_VERSION")] {
+            let json = manifest_json(&format!(
+                r#""extensions":{{"dev.instagent":{{"minKernel":"{minimum}"}}}}"#
+            ));
+            assert!(load_json(&json).is_ok(), "{minimum}");
+        }
+        let json = manifest_json(r#""extensions":{"dev.instagent":{"minKernel":"999.0"}}"#);
+        let error = error_of(&json);
+        assert!(error.contains("requires minKernel 999.0"), "{error}");
+        assert!(error.contains("plugin.json") && error.contains("demo"));
+        for minimum in [
+            "null",
+            "4",
+            "[]",
+            "\"1\"",
+            "\"01.0\"",
+            "\"1.0.0.0\"",
+            "\"1.0-beta\"",
+            "\">=0.1\"",
+            "\"18446744073709551616.0\"",
+        ] {
+            let json = manifest_json(&format!(
+                r#""extensions":{{"dev.instagent":{{"minKernel":{minimum}}}}}"#
+            ));
+            assert!(error_of(&json).contains("minKernel"), "{minimum}");
+        }
     }
 
     #[test]

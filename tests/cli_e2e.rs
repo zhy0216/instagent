@@ -288,7 +288,18 @@ fn terminal_json(out: &Output, status: &str, exit_code: i32) -> serde_json::Valu
         )
     });
     let object = value.as_object().expect("terminal object");
-    assert_eq!(object.len(), 6, "{value}");
+    assert_eq!(
+        object.len(),
+        if object.contains_key("diagnostics") {
+            7
+        } else {
+            6
+        },
+        "{value}"
+    );
+    if let Some(notes) = object.get("diagnostics") {
+        assert!(notes.is_array(), "{value}");
+    }
     for key in [
         "schema_version",
         "status",
@@ -313,6 +324,231 @@ fn terminal_json(out: &Output, status: &str, exit_code: i32) -> serde_json::Valu
         );
     }
     value
+}
+
+#[cfg(unix)]
+async fn stalled_stdout_does_not_block_task_termination(signal_name: Option<&str>) {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    sandbox.install_fake_provider(&server.uri());
+    let intro = serde_json::json!({"choices":[{"delta":{"content":"x".repeat(256*1024)},"finish_reason":null}]});
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"blocked-call","type":"function","function":{"name":"shell","arguments":serde_json::json!({"command":"sleep 120 & echo $! > blocked.pid; wait"}).to_string()}}]},"finish_reason":null}]});
+    let body = format!("data: {intro}\n\ndata: {call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+    let timeout = if signal_name.is_some() { "60" } else { "3" };
+    let mut command = sandbox.cmd(&["run", "-t", "go", "--timeout", timeout]);
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = instagent::subprocess::ProcessGroupChild::spawn(&mut command).unwrap();
+    // Never drain stdout: the tool must still start, then be cancelled/reaped.
+    let grandchild = wait_pid_file(&sandbox.cwd.path().join("blocked.pid")).await;
+    if let Some(name) = signal_name {
+        signal(child.id().unwrap(), name).await;
+    }
+    let status = tokio::time::timeout(Duration::from_secs(10), child.child_mut().wait())
+        .await
+        .expect("stdout backpressure must not block termination")
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(if signal_name.is_some() { 130 } else { 124 })
+    );
+    eventually_dead(grandchild).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdout_backpressure_preserves_deadline_and_process_cleanup() {
+    stalled_stdout_does_not_block_task_termination(None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdout_backpressure_preserves_sigterm_and_process_cleanup() {
+    stalled_stdout_does_not_block_task_termination(Some("-TERM")).await;
+}
+
+#[tokio::test]
+async fn blocked_json_delivery_exits_with_error() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    sandbox.install_fake_provider(&server.uri());
+    let frame = serde_json::json!({"choices":[{"delta":{"content":"x".repeat(256*1024)},"finish_reason":"stop"}]});
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n")),
+        )
+        .mount(&server)
+        .await;
+    let mut command = sandbox.cmd(&["run", "-t", "go", "--output", "json"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = instagent::subprocess::ProcessGroupChild::spawn(&mut command).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(8), child.child_mut().wait())
+        .await
+        .expect("JSON delivery must have a deadline")
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stderr_backpressure_does_not_block_mcp_or_deadline() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    sandbox.install_fake_provider(&server.uri());
+    Mock::given(method("POST"))
+        .respond_with(sse_body().set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let plugin = sandbox.agents.path().join("plugins/flood");
+    write_minimal_plugin_source(&plugin, "flood");
+    std::fs::write(plugin.join("mcp.json"), serde_json::json!({"mcpServers":{"flood":{"type":"stdio","command":env!("CARGO_BIN_EXE_mcp-fixture-server"),"env":{"MCP_FIXTURE_STDERR_FLOOD":"1"}}}}).to_string()).unwrap();
+    let mut child =
+        spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json", "--timeout", "3"]));
+    // Keep stderr unread until after process exit; the first long MCP log fills it.
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("stderr must not block the executor")
+        .unwrap();
+    let out = finish_run(child).await;
+    terminal_json(&out, "timed_out", 124);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn amplified_template_fails_before_allocating_in_a_small_sandbox() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_provider("http://127.0.0.1:9");
+    let commands = sandbox
+        .agents
+        .path()
+        .join("plugins/fakeprov/dev.instagent/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("large.md"), "$ARGUMENTS".repeat(24_000)).unwrap();
+    let mut command = sandbox.cmd(&[
+        "run",
+        "--command",
+        "fakeprov:large",
+        "--args",
+        &"x".repeat(60_000),
+        "--output",
+        "json",
+    ]);
+    #[repr(C)]
+    struct Limit {
+        current: u64,
+        maximum: u64,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+    }
+    unsafe {
+        command.pre_exec(|| {
+            let core = Limit {
+                current: 0,
+                maximum: 0,
+            };
+            if setrlimit(4, &core) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let memory = Limit {
+                current: 256 * 1024 * 1024,
+                maximum: 256 * 1024 * 1024,
+            };
+            if setrlimit(9, &memory) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = output(command).await;
+    let report = terminal_json(&out, "failed", 1);
+    assert!(report["error"].as_str().unwrap().contains("1440000000"));
+}
+
+#[tokio::test]
+async fn task_capabilities_select_plugins_tools_and_preflight_requirements() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    sandbox.install_fake_provider(&server.uri());
+    mount_chat_completions(&server).await;
+    // A broken optional plugin must not affect a task that excludes it.
+    let broken = sandbox.agents.path().join("plugins/broken");
+    write_minimal_plugin_source(&broken, "broken");
+    std::fs::create_dir_all(broken.join("dev.instagent/providers")).unwrap();
+    std::fs::write(broken.join("dev.instagent/providers/invalid.json"), "{").unwrap();
+    let base = [
+        "run",
+        "-t",
+        "go",
+        "--output",
+        "json",
+        "--only-plugin",
+        "fakeprov",
+    ];
+    let mut selected = base.to_vec();
+    selected.extend(["--tool", "read", "--tool", "tree", "--require-tool", "read"]);
+    terminal_json(&output(sandbox.cmd(&selected)).await, "completed", 0);
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let names: Vec<_> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["read", "tree"]);
+    let mut unavailable = base.to_vec();
+    unavailable.extend(["--no-tools", "--require-tool", "shell"]);
+    let report = terminal_json(&output(sandbox.cmd(&unavailable)).await, "failed", 1);
+    assert!(report["session_id"].is_null());
+    assert!(report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "required_tool_missing" && d["source"] == "shell"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let mut no_tools = base.to_vec();
+    no_tools.push("--no-tools");
+    terminal_json(&output(sandbox.cmd(&no_tools)).await, "completed", 0);
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(body.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn incompatible_selected_plugin_is_rejected_with_diagnostics() {
+    let sandbox = Sandbox::new();
+    let server = MockServer::start().await;
+    sandbox.install_fake_provider(&server.uri());
+    let manifest = sandbox.agents.path().join("plugins/fakeprov/plugin.json");
+    std::fs::write(manifest, serde_json::json!({"$schema":PLUGIN_SCHEMA_URL,"name":"fakeprov","version":"1.0.0","extensions":{"dev.instagent":{"minKernel":"999.0"}}}).to_string()).unwrap();
+    let out = output(sandbox.cmd(&[
+        "run",
+        "-t",
+        "go",
+        "--only-plugin",
+        "fakeprov",
+        "--output",
+        "json",
+    ]))
+    .await;
+    let report = terminal_json(&out, "failed", 1);
+    assert!(report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["message"].as_str().unwrap().contains("minKernel 999.0")));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 fn assert_request_task(request: &wiremock::Request, task: &str) {
@@ -1281,8 +1517,7 @@ async fn cancelled_multi_server_startup_reaps_connected_and_pending_groups() {
     .unwrap();
     let child = spawn_run(sandbox.cmd(&["run", "-t", "go", "--output", "json"]));
     let ready_grandchild = wait_pid_file(&plugin.join("ready.sh.pid")).await;
-    // Servers connect in name order. The second process starts only after the
-    // fixture server's successful initialize response has been consumed.
+    // Both connections may be in flight; cancellation must reclaim every group.
     let pending_grandchild = wait_pid_file(&plugin.join("pending.sh.pid")).await;
     signal(ready_grandchild, "-0").await;
     signal(child.id().unwrap(), "-TERM").await;

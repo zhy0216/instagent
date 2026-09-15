@@ -67,6 +67,16 @@ JSON 文档，包含 `status`、`session_id`、`output`、`usage` 和 `error`（
 SIGINT / SIGTERM 取消 `130`。`completed` 表示执行流程正常结束；业务结果由调用方
 或插件 Stop hook 验收。完整契约见[使用说明](docs/usage.md#3-命令参考)。
 
+单任务可用 `--only-plugin NAME` 限定已启用插件、`--tool NAME` 限定工具，
+或 `--no-tools` 使用空工具集；`--require-tool NAME` 在请求模型前检查必需能力。
+这些选项不修改 settings。插件 `minKernel` 会在加载时验证，MCP 初始化最多并发 4 路。
+Rust 宿主可直接调用 [`agent::task::run`](src/agent/task.rs)，共享输入、恢复、期限、
+hooks、清理和结构化结果；使用示例见[库接口](docs/usage.md#12-rust-库接口)。
+
+stdout/stderr 使用有界队列，管道堵塞不会阻塞任务取消；进度或诊断在背压下可能丢弃。
+任务与资源清理结束后，输出收尾最多 1 秒、最后诊断排空最多 250 ms；JSON 交付
+必须确认写入成功，超时或写失败退出 `1`。
+
 ### 配置与环境变量
 
 | 位置 | 内容 |

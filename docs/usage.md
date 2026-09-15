@@ -30,6 +30,7 @@ instagent 运行在 sandbox 内，工具直接执行，安全边界由 sandbox �
 9. [Provider 详解](#9-provider-详解)
 10. [文件位置速查](#10-文件位置速查)
 11. [故障排查](#11-故障排查)
+12. [Rust 库接口](#12-rust-库接口)
 
 ---
 
@@ -115,6 +116,10 @@ instagent run --command my-plugin:review --args "当前 diff" [选项]
 | `--cwd PATH` | 工作目录（不存在会创建），影响工具相对路径与项目级 settings/skills 发现；恢复时须与原目录一致 |
 | `-m, --model MODEL` | 覆盖配置里的 `model` |
 | `--plugin PATH` | 临时加载一个插件目录（可多次），不安装、不落盘，开发调试用 |
+| `--only-plugin NAME` | 仅使用这些已启用插件，可多次；须包含 provider 所属插件，缺失或不兼容时失败 |
+| `--tool NAME` | 仅暴露并允许调用这些最终模型可见名称，可多次；不与 `--no-tools` 同用 |
+| `--no-tools` | 使用空工具集 |
+| `--require-tool NAME` | 必需工具，可多次；缺失、加载失败或被排除时在请求模型前失败 |
 | `--args TEXT` | 模板参数，仅与 `--command plugin:name` 配合使用；省略为空串 |
 | `--output text\|json` | 默认 `text`；`json` 输出一个终态文档 |
 | `--timeout SECONDS` | `1`–`604800` 秒（最多 7 天），默认 `600`；覆盖初始化和任务执行，清理额外最多 5 秒 |
@@ -122,6 +127,9 @@ instagent run --command my-plugin:review --args "当前 diff" [选项]
 **文本输出**：默认 stdout 流式输出模型文本，可能包含工具调用前的说明或失败前的
 部分输出。工具事件、预览、`usage:`、`session <id>`、装配提示与 tracing 日志都走
 stderr。stdout 提前关闭（例如 EPIPE）不改变任务退出码。
+两路输出使用独立线程与每路最多 1 MiB 的进度队列；消费者过慢时进度/诊断可能丢失，
+任务的取消、期限和资源清理继续生效。执行与资源清理后，文本收尾或 JSON 交付
+最多再等 1 秒，最后诊断排空最多 250 ms；JSON 写入/flush 失败或交付超时退出 1。
 
 **JSON 输出**：`--output json` 的 stdout 只写一个 JSON 文档，不混入文本流或日志：
 
@@ -144,6 +152,7 @@ stderr。stdout 提前关闭（例如 EPIPE）不改变任务退出码。
 | `output` | 仅 `completed` 填入本次执行最终助手消息的文本，保留原文且不额外添加换行；其他状态为空串 |
 | `usage` | 仅 `completed` 提供最近记录的助手响应用量；未提供用量或其他状态为 `null`，不是本次任务的累计计费 |
 | `error` | `completed` 为 `null`；其他状态为错误原因字符串 |
+| `diagnostics` | 可选数组，每项含 `code`、`source`、`message`，记录能力装载/预检与生命周期诊断；无诊断时省略 |
 
 JSON 结果从会话数据提取，不依赖展示事件。恢复历史不会把上一任务的答案作为
 本次结果；非完成状态的中间工作可通过 `session_id` 对应的会话记录查看。
@@ -368,6 +377,18 @@ manifest 校验失败的目录记警告跳过，不中断启动；settings 里�
 剩余能力继续运行。启动不会为此询问用户或等待用户补配置；调用方需要把业务必需的
 工具能力纳入预检或 Stop hook 验收，不能仅凭 `completed` 推断全部插件都已可用。
 
+任务可以缩小能力集合，无需修改 settings：
+
+```bash
+instagent run -t "检查源代码" --only-plugin bundled --only-plugin review \
+  --tool read --tool tree --tool review__lint --require-tool review__lint --output json
+```
+
+上述示例假设已配置 bundled 提供的 provider，并启用了提供 `review__lint` 的 review 插件。
+`--only-plugin` 排除的插件不会启动 MCP 或加载 hooks/provider 定义；`--tool` 按已装配
+工具的最终名称过滤清单与调用，不单独改变 MCP 启动集合。预检只检查可用性，业务正确性
+仍通过 Stop hook 验收。MCP 初始化跨插件最多并发 4 路，清单枚举最多并发 4 路，注册顺序稳定。
+
 ### 7.2 安装 / 更新
 
 ```bash
@@ -442,6 +463,10 @@ groq-and-review/
 
 `extensions.dev.instagent.env` 声明该插件的 hooks 需要透传的环境变量名
 （§8.5，白名单机制）。
+
+`minKernel` 可省略；声明时为 `MAJOR.MINOR` 或 `MAJOR.MINOR.PATCH`，各段为无前导零的
+非负整数，缺省 patch 为 0。不支持范围表达式和预发布标签。要求高于当前内核或格式错误
+会拒绝该插件：安装报错，发现时诊断后跳过；若本次 `--only-plugin` 指定了它，任务失败。
 
 ### 8.2 `mcp.json`
 
@@ -795,3 +820,39 @@ bash scripts/ci.sh    # fmt / clippy / cargo test / python 回归 / rustdoc / re
 真实模型用例。显式在线命令为 `cargo test --test live_e2e -- --ignored`，要求提前注入
 非空白凭据，否则立即失败。CLI/live 的 liveplug 输出各在独占临时副本中。
 实际执行数、ignored 数及在线验证状态分开记录，见[发布与校验记录](release.md)。
+
+---
+
+## 12. Rust 库接口
+
+`instagent::agent::task::run` 执行完整任务，CLI 也调用这个入口。调用方提供
+`RunRequest`、`CancellationToken` 和进度事件通道，直接获得 `RunReport`：
+
+```rust
+use instagent::agent::task::{self, RunReport, RunRequest, TaskInput};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+async fn execute_task(cancel: CancellationToken) -> RunReport {
+    let mut request = RunRequest::new(TaskInput::Text("检查当前目录的文件".into()));
+    request.timeout_secs = 60;
+    request.capabilities.tools = Some(vec!["read".into(), "tree".into()]);
+    request.capabilities.required_tools = vec!["read".into()];
+    let (events, progress) = mpsc::channel(128);
+    drop(progress); // 不需要进度时可直接丢弃；终态结果仍然完整。
+    task::run(request, cancel, events).await
+}
+```
+
+- `TaskInput` 支持直接文本、普通文件和插件任务模板，与 CLI 共用输入预算。
+- `RunRequest` 支持恢复会话、工作目录、provider/model 覆盖、临时插件路径和
+  单任务能力选择。`Capabilities` 中 `None` 沿用已启用能力，`Some(vec![])`
+  选择空集合；工具名称使用冲突消解后的模型可见名称。
+- `RunReport` 的状态、结果、诊断与 JSON 输出共用结构；`status.exit_code()`
+  提供 CLI 退出码。任务失败以报告返回，进度事件不是终态结果的来源。
+- `run` 的 future 可跨线程调度。调用方取消令牌后应继续等待报告，让会话结束
+  hooks 和工具清理完成；任务自身超时不会取消调用方的令牌。需要进度时并行消费
+  通道，事件可能因背压丢失，不应用于可靠审计。
+- 库不安装信号处理器、不初始化 tracing、不写终端；这些由宿主处理。配置、
+  插件和会话目录仍遵循 §10 的进程环境变量约定，应在宿主启动时配置；
+  `RunRequest` 不提供独立的存储根目录，同一会话仍需要独占访问。

@@ -1,117 +1,78 @@
-//! Noninteractive task execution, session management and plugin management.
+//! CLI adaptation of the library task runner, plus session/plugin management.
 
-use std::io::{Read, Write};
+use super::{output, render, OutputFormat, PluginAction, RunArgs, SessionsAction};
+use anyhow::Context;
+use instagent::agent::task::{self, Capabilities, RunRequest, TaskInput};
+use instagent::plugin::install::{self, InstallSource};
+use instagent::session::Session;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
-
-use anyhow::Context;
-use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use instagent::agent::TurnResult;
-use instagent::hooks::{HookDecision, HookEvent};
-use instagent::message::{Content, Role, Usage};
-use instagent::plugin::install;
-use instagent::plugin::install::InstallSource;
-use instagent::session::Session;
-
-use super::assembly::{self, AssemblyOpts};
-use super::{render, OutputFormat, PluginAction, RunArgs, SessionsAction};
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RunStatus {
-    Completed,
-    Failed,
-    MaxTurns,
-    TimedOut,
-    Cancelled,
-}
-
-impl RunStatus {
-    fn exit_code(self) -> ExitCode {
-        ExitCode::from(match self {
-            Self::Completed => 0,
-            Self::Failed => 1,
-            Self::MaxTurns => 3,
-            Self::TimedOut => 124,
-            Self::Cancelled => 130,
-        })
-    }
-}
-
-/// One terminal result. Only a completed invocation has an answer; partial work
-/// stays in the session, so failed resumes can never return an older answer.
-#[derive(Serialize)]
-struct RunReport {
-    schema_version: u32,
-    status: RunStatus,
-    session_id: Option<String>,
-    output: String,
-    usage: Option<Usage>,
-    error: Option<String>,
-}
-
 pub async fn run(args: RunArgs) -> instagent::Result<ExitCode> {
-    let mut report = RunReport {
-        schema_version: 1,
-        status: RunStatus::Failed,
-        session_id: None,
-        output: String::new(),
-        usage: None,
-        error: None,
+    let input = match (args.task, args.task_file, args.command) {
+        (Some(text), None, None) => TaskInput::Text(text),
+        (None, Some(path), None) => TaskInput::File(path),
+        (None, None, Some(name)) => TaskInput::Command {
+            name,
+            args: args.args.unwrap_or_default(),
+        },
+        _ => anyhow::bail!("exactly one task input is required"),
+    };
+    let request = RunRequest {
+        input,
+        resume: args.resume,
+        cwd: args.cwd,
+        provider: None,
+        model: args.model,
+        plugin_paths: args.plugin,
+        timeout_secs: args.timeout,
+        capabilities: Capabilities {
+            plugins: args.only_plugin,
+            tools: if args.no_tools {
+                Some(Vec::new())
+            } else {
+                args.tool
+            },
+            required_tools: args.require_tool,
+        },
     };
     let cancel = CancellationToken::new();
-    let mut interruption = None;
-    let result = {
-        let execution = execute(&args, &mut report, &cancel);
-        tokio::pin!(execution);
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let execution = task::run(request, cancel.clone(), tx);
+    tokio::pin!(execution);
+    let runner = async {
         tokio::select! {
             biased;
             signal = wait_for_signal() => {
-                interruption = Some(match signal {
-                    Ok(()) => (RunStatus::Cancelled, "run cancelled".to_string()),
-                    Err(err) => (RunStatus::Failed, format!("install signal handler: {err:#}")),
-                });
+                // Signal registration is polled before any initialization.
                 cancel.cancel();
-                tokio::time::timeout(Duration::from_secs(5), &mut execution)
-                    .await.unwrap_or_else(|_| Err(anyhow::anyhow!("cleanup timed out")))
+                let report = (&mut execution).await;
+                signal.context("install signal handler")?;
+                Ok::<_, anyhow::Error>(report)
             }
-            _ = tokio::time::sleep(Duration::from_secs(args.timeout)) => {
-                interruption = Some((RunStatus::TimedOut, format!("run timed out after {} seconds", args.timeout)));
-                cancel.cancel();
-                tokio::time::timeout(Duration::from_secs(5), &mut execution)
-                    .await.unwrap_or_else(|_| Err(anyhow::anyhow!("cleanup timed out")))
-            }
-            result = &mut execution => result,
+            report = &mut execution => Ok(report),
         }
     };
-    let (status, error) = match interruption {
-        Some((status, error)) => (status, Some(error)),
-        None => match result {
-            Ok(TurnResult::Done) => (RunStatus::Completed, None),
-            Ok(TurnResult::Interrupted) => (RunStatus::Cancelled, Some("run cancelled".into())),
-            Ok(TurnResult::MaxTurns) => (RunStatus::MaxTurns, Some("max turns reached".into())),
-            Err(err) => (RunStatus::Failed, Some(format!("{err:#}"))),
-        },
-    };
-    report.status = status;
-    report.error = error;
-    if !matches!(status, RunStatus::Completed) {
-        report.output.clear();
-        report.usage = None;
+    let (report, ()) = tokio::join!(runner, render::print_events(rx, args.output));
+    let report: task::RunReport = report?;
+    for note in &report.diagnostics {
+        let _ = writeln!(output::stderr(), "note: {}", note.message);
     }
     if let Some(error) = &report.error {
-        eprintln!("error: {error}");
+        let _ = writeln!(output::stderr(), "error: {error}");
     }
+    let code = ExitCode::from(report.status.exit_code());
     if args.output == OutputFormat::Json {
-        let mut stdout = std::io::stdout().lock();
-        serde_json::to_writer(&mut stdout, &report).context("write JSON result")?;
-        writeln!(stdout).context("finish JSON result")?;
-        stdout.flush().context("flush JSON result")?;
+        output::stdout()
+            .report(report)
+            .await
+            .context("write JSON result")?;
+    } else {
+        let _ = output::stdout().finish(output::DELIVERY_TIMEOUT).await;
     }
-    Ok(status.exit_code())
+    Ok(code)
 }
 
 /// Register before execution is first polled, including during plugin startup.
@@ -129,209 +90,6 @@ async fn wait_for_signal() -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
-}
-
-async fn execute(
-    args: &RunArgs,
-    report: &mut RunReport,
-    cancel: &CancellationToken,
-) -> instagent::Result<TurnResult> {
-    // Resolve input before any provider or plugin process is started.
-    let input = read_task(args)?;
-    let mut resumed = match args.resume.as_deref() {
-        None => None,
-        Some(id) => {
-            if id == "last" && Session::list()?.is_empty() {
-                anyhow::bail!("no session to resume");
-            }
-            Some(Session::open_or_resume(
-                Some(id),
-                &std::env::current_dir()?,
-                "",
-                "",
-            )?)
-        }
-    };
-    let cwd = if let Some(session) = &resumed {
-        report.session_id = Some(session.header.id.clone());
-        let original = session
-            .header
-            .cwd
-            .canonicalize()
-            .context("resolve saved session cwd")?;
-        if let Some(cwd) = &args.cwd {
-            if cwd.canonicalize().context("resolve --cwd")? != original {
-                anyhow::bail!("--cwd differs from the resumed session working directory");
-            }
-        }
-        original
-    } else {
-        resolve_cwd(args.cwd.clone())?
-    };
-    let opts = AssemblyOpts {
-        cwd: cwd.clone(),
-        model: args
-            .model
-            .clone()
-            .or_else(|| resumed.as_ref().map(|s| s.header.model.clone())),
-        provider: resumed.as_ref().map(|s| s.header.provider.clone()),
-        cli_plugins: args.plugin.clone(),
-    };
-    let rt = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Ok(TurnResult::Interrupted),
-        result = assembly::build(&opts) => result?,
-    };
-    print_notes(&rt.notes, &mut std::io::stderr());
-
-    let result = async {
-        let task = match input {
-            Some(task) => task,
-            None => {
-                let name = args.command.as_deref().context("task input is required")?;
-                let template = rt.task_templates.iter().find(|template| template.name == name)
-                    .with_context(|| format!("unknown task template `{name}`; use plugin:name from an enabled plugin"))?;
-                instagent::commands::expand_bounded(template, args.args.as_deref().unwrap_or(""))?
-            }
-        };
-        if task.trim().is_empty() {
-            anyhow::bail!("task must not be empty or whitespace");
-        }
-        let mut session = match resumed.take() {
-            Some(session) => session,
-            None => Session::create(&cwd, &rt.provider_name, &rt.model)?,
-        };
-        report.session_id = Some(session.header.id.clone());
-        eprintln!("session {}", session.header.id);
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {},
-            result = rt.agent.run_session_event(HookEvent::SessionStart, &session) => {
-                report_session_hook(HookEvent::SessionStart, result, &mut std::io::stderr());
-            }
-        }
-        let result = run_one_turn(&rt.agent, &mut session, task, cancel.clone(), args.output).await;
-        if matches!(&result, Ok(TurnResult::Done)) {
-            // The loop guarantees Done follows a new, nonempty terminal answer.
-            if let Some(message) = session.messages.last().filter(|m| m.role == Role::Assistant) {
-                report.output = message.content.iter().filter_map(|content| match content {
-                    Content::Text(text) => Some(text.as_str()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("");
-                report.usage = message.usage;
-            }
-        }
-        // Normal hooks remain deadline-bound by the outer runner. After a
-        // cancellation give lifecycle hooks a small, explicit cleanup budget.
-        let end = rt.agent.run_session_event(HookEvent::SessionEnd, &session);
-        tokio::pin!(end);
-        let end_result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => tokio::time::timeout(Duration::from_secs(2), &mut end)
-                .await.map_err(anyhow::Error::from).and_then(|result| result),
-            result = &mut end => result,
-        };
-        report_session_hook(HookEvent::SessionEnd, end_result, &mut std::io::stderr());
-        result
-    }.await;
-    if tokio::time::timeout(Duration::from_secs(3), rt.agent.tools.shutdown())
-        .await
-        .is_err()
-    {
-        eprintln!("warning: tool shutdown timed out");
-    }
-    result
-}
-
-fn read_task(args: &RunArgs) -> instagent::Result<Option<String>> {
-    const MAX_TASK_BYTES: u64 = 1024 * 1024;
-    let count = usize::from(args.task.is_some())
-        + usize::from(args.task_file.is_some())
-        + usize::from(args.command.is_some());
-    if count != 1 {
-        anyhow::bail!("exactly one task input is required");
-    }
-    let task = if let Some(path) = &args.task_file {
-        if !std::fs::metadata(path)
-            .with_context(|| format!("read task file {}", path.display()))?
-            .is_file()
-        {
-            anyhow::bail!("task file must be a regular UTF-8 file");
-        }
-        let file = std::fs::File::open(path).context("open task file")?;
-        let mut text = String::new();
-        file.take(MAX_TASK_BYTES + 1)
-            .read_to_string(&mut text)
-            .context("read UTF-8 task file")?;
-        Some(text)
-    } else {
-        args.task.clone()
-    };
-    if let Some(task) = &task {
-        if task.trim().is_empty() {
-            anyhow::bail!("task must not be empty or whitespace");
-        }
-        if task.len() as u64 > MAX_TASK_BYTES {
-            anyhow::bail!("task exceeds the 1 MiB input limit");
-        }
-    }
-    Ok(task)
-}
-
-async fn run_one_turn(
-    agent: &instagent::agent::Agent,
-    session: &mut Session,
-    task: String,
-    cancel: CancellationToken,
-    output: OutputFormat,
-) -> instagent::Result<TurnResult> {
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
-    // Both futures are owned by this invocation; cancellation cannot detach a
-    // printer that might write after the terminal JSON result.
-    let (result, ()) = tokio::join!(
-        agent.run_turn(session, task, cancel, tx),
-        render::print_events(rx, output),
-    );
-    result
-}
-
-/// SessionStart / SessionEnd hook 结果处理（todo 11 / A4，ADR 0003 D3）：
-/// 失败只输出一行含事件（阶段）与来源（错误链上下文）的 stderr warning，
-/// 不改退出码、不打断会话——保持默认兼容。hook 执行内部失败（spawn /
-/// 超时 / 输出超限 / 无决策）已由 `hooks.rs` 按 D3 逐条产出带插件与命令的
-/// warning；不可阻止的会话事件若仍带回 Block/None 决策，同样按 fail-open
-/// 放行并 warning。纯函数，便于稳定断言。
-fn report_session_hook(
-    event: HookEvent,
-    result: instagent::Result<HookDecision>,
-    out: &mut dyn Write,
-) {
-    let warning = match result {
-        Ok(HookDecision::Allow) => return,
-        Ok(decision) => format!(
-            "warning: {event} hook returned {decision:?} on a non-blockable event; \
-             ignored (fail-open)"
-        ),
-        Err(err) => format!("warning: {event} hook failed: {err:#}"),
-    };
-    let _ = writeln!(out, "{warning}");
-}
-
-fn resolve_cwd(cwd: Option<PathBuf>) -> instagent::Result<PathBuf> {
-    match cwd {
-        Some(dir) => {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create cwd {}", dir.display()))?;
-            Ok(dir.canonicalize()?)
-        }
-        None => Ok(std::env::current_dir()?),
-    }
-}
-
-fn print_notes(notes: &[String], out: &mut dyn Write) {
-    for note in notes {
-        let _ = writeln!(out, "note: {note}");
-    }
 }
 
 /// `instagent sessions list | rm <id>`。
@@ -495,21 +253,6 @@ mod tests {
     use crate::cli::fixtures::Env;
 
     #[test]
-    fn direct_task_byte_limit_is_inclusive_and_preserves_original_text() {
-        // Exercise --task in process: OS argv limits can be smaller than 1 MiB.
-        let task = format!(" {} ", "é".repeat((1024 * 1024 - 2) / 2));
-        let mut args = RunArgs {
-            task: Some(task.clone()),
-            ..RunArgs::default()
-        };
-        assert_eq!(read_task(&args).unwrap().as_deref(), Some(task.as_str()));
-        args.task.as_mut().unwrap().push('x');
-        let error = read_task(&args).unwrap_err().to_string();
-        assert!(error.contains("1 MiB input limit"), "{error}");
-        assert!(!error.contains(&task));
-    }
-
-    #[test]
     fn sessions_list_rows_and_rm() {
         let env = Env::new();
         assert_eq!(sessions_list_rows().unwrap(), vec!["(no sessions)"]);
@@ -534,43 +277,5 @@ mod tests {
             .iter()
             .all(|r| !r.contains(&b.header.id)));
         assert!(sessions(SessionsAction::Rm { id: "nope".into() }).is_err());
-    }
-
-    // ---- session hook 失败可见性（todo 11 / A4，ADR 0003 D3） ----
-
-    #[test]
-    fn session_hook_allow_is_silent() {
-        let mut out = Vec::new();
-        report_session_hook(HookEvent::SessionStart, Ok(HookDecision::Allow), &mut out);
-        assert!(out.is_empty(), "正常 session 默认零输出（兼容性不变）");
-    }
-
-    #[test]
-    fn session_hook_error_warns_with_phase_and_source() {
-        let err = anyhow::anyhow!("failed to spawn: no such file")
-            .context("SessionStart hook of plugin brokenplug");
-        let mut out = Vec::new();
-        report_session_hook(HookEvent::SessionStart, Err(err), &mut out);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "warning: SessionStart hook failed: SessionStart hook of plugin brokenplug: \
-             failed to spawn: no such file\n"
-        );
-    }
-
-    #[test]
-    fn session_hook_unexpected_decision_warns_but_passes() {
-        // 会话事件不可阻止：Block/None 决策按 fail-open 放行，但必须可见。
-        let mut out = Vec::new();
-        report_session_hook(
-            HookEvent::SessionEnd,
-            Ok(HookDecision::Block("policy".into())),
-            &mut out,
-        );
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "warning: SessionEnd hook returned Block(\"policy\") on a non-blockable event; \
-             ignored (fail-open)\n"
-        );
     }
 }

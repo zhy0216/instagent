@@ -232,16 +232,35 @@ fn expand(cmd: &TaskTemplate, args: &str) -> String {
     }
 }
 
-/// 展开 + 校验 UTF-8 字节预算，结果至多 1 MiB；超限报错不回显任务参数。
+/// 展开前校验 UTF-8 字节预算，结果至多 1 MiB；超限不分配结果、不回显参数。
 pub fn expand_bounded(cmd: &TaskTemplate, args: &str) -> crate::Result<String> {
-    let out = expand(cmd, args);
-    if out.len() > MAX_EXPANDED_TASK_BYTES {
+    expand_with_limit(cmd, args, MAX_EXPANDED_TASK_BYTES)
+}
+
+fn expand_with_limit(cmd: &TaskTemplate, args: &str, limit: usize) -> crate::Result<String> {
+    let args = args.trim();
+    let markers = cmd.template.matches(ARGUMENTS).count();
+    let bytes = expanded_len(cmd.template.len(), markers, args.len()).ok_or_else(|| {
+        anyhow::anyhow!("expanded task size overflow (input budget: {limit} bytes)")
+    })?;
+    if bytes > limit {
         anyhow::bail!(
-            "expanded task would be {} bytes, exceeding the {MAX_EXPANDED_TASK_BYTES} byte input budget",
-            out.len()
+            "expanded task would be {bytes} bytes, exceeding the {limit} byte input budget"
         );
     }
-    Ok(out)
+    Ok(expand(cmd, args))
+}
+
+fn expanded_len(template_bytes: usize, markers: usize, args_bytes: usize) -> Option<usize> {
+    if markers > 0 {
+        template_bytes
+            .checked_sub(markers.checked_mul(ARGUMENTS.len())?)?
+            .checked_add(markers.checked_mul(args_bytes)?)
+    } else if args_bytes > 0 {
+        template_bytes.checked_add(2)?.checked_add(args_bytes)
+    } else {
+        Some(template_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -281,22 +300,6 @@ mod tests {
         }
     }
 
-    /// 测试注入小预算的展开 + 超限检查（与 `expand_bounded` 同口径）。
-    fn expanded_with_limit(
-        cmd: &TaskTemplate,
-        args: &str,
-        max_bytes: usize,
-    ) -> crate::Result<String> {
-        let out = expand(cmd, args);
-        if out.len() > max_bytes {
-            anyhow::bail!(
-                "expanded task would be {} bytes, exceeding the {max_bytes} byte input budget",
-                out.len()
-            );
-        }
-        Ok(out)
-    }
-
     #[test]
     fn bounded_expansion_preserves_replacement_append_utf8_and_newlines() {
         for (body, args, expected) in [
@@ -324,11 +327,11 @@ mod tests {
             assert_eq!(expand(&cmd, args), expected);
             assert_eq!(expand_bounded(&cmd, args).unwrap(), expected);
             assert_eq!(
-                expanded_with_limit(&cmd, args, expected.len()).unwrap(),
+                expand_with_limit(&cmd, args, expected.len()).unwrap(),
                 expected
             );
             if !expected.is_empty() {
-                assert!(expanded_with_limit(&cmd, args, expected.len() - 1).is_err());
+                assert!(expand_with_limit(&cmd, args, expected.len() - 1).is_err());
             }
         }
     }
@@ -355,12 +358,23 @@ mod tests {
     fn small_expansion_budget_rejects_amplification_without_echoing_arguments() {
         let cmd = template(&format!("x{}", ARGUMENTS.repeat(64)));
         let args = "PRIVATE_TEMPLATE_ARGUMENTS";
-        let error = expanded_with_limit(&cmd, args, 32).unwrap_err().to_string();
+        let error = expand_with_limit(&cmd, args, 32).unwrap_err().to_string();
         assert!(error.contains("32 byte input budget"), "{error}");
         assert!(!error.contains(args));
         // Count the final output: a large template can shrink below the budget.
-        assert_eq!(expanded_with_limit(&cmd, " \t", 1).unwrap(), "x");
-        assert!(expanded_with_limit(&cmd, "", 0).is_err());
+        assert_eq!(expand_with_limit(&cmd, " \t", 1).unwrap(), "x");
+        assert!(expand_with_limit(&cmd, "", 0).is_err());
+    }
+
+    #[test]
+    fn expansion_accounting_rejects_overflow_without_allocating() {
+        assert_eq!(expanded_len(usize::MAX, 0, 0), Some(usize::MAX));
+        assert_eq!(expanded_len(usize::MAX - 3, 0, 1), Some(usize::MAX));
+        assert_eq!(expanded_len(usize::MAX - 1, 0, 1), None);
+        assert_eq!(expanded_len(20, 2, usize::MAX / 2 + 1), None);
+        assert_eq!(expanded_len(11, 1, usize::MAX), None);
+        assert_eq!(expanded_len(0, usize::MAX, 1), None);
+        assert_eq!(expanded_len(9, 1, 0), None);
     }
 
     #[test]

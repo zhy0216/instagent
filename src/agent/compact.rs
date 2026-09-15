@@ -31,10 +31,10 @@ use crate::session::Session;
 /// pending_tasks / current_work 等）；仅把"goose 输出 JSON 再由模板渲染"改成
 /// "直接输出 markdown"（第二版 §2.7：v1 不做 JSON + 模板层）。
 pub const COMPACTION_PROMPT: &str = r##"## Task Context
-- An llm context limit was reached when a user was in a working session with an agent (you)
+- An llm context limit was reached while you were executing an unattended task
 - Distill the conversation below into a structured summary with only the most verbose parts removed
 - Include user requests, your responses, all technical content, and as much of the original context as possible
-- This will be used to let the user continue the working session
+- This will let an agent continue the task without waiting for user input
 - The summary will be read by an agent (you) on a next exchange to allow for continuation of the session
 
 **Conversation History:**
@@ -66,7 +66,7 @@ Rules for the summary:
   blocks, complete code snippets, exact user wording
 - Do not exclude any information that might be important to continuing a session
   working with you
-- No new ideas unless user confirmed
+- Preserve the task's authorization, constraints, and material assumptions; do not invent new approval requirements
 "##;
 
 /// [`COMPACTION_PROMPT`] 里历史文本的占位符（goose 模板同名）。
